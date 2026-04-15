@@ -38,6 +38,19 @@ for d in (UPLOADS_DIR, OUTPUT_DIR):
 if not MEMORY_FILE.exists():
     MEMORY_FILE.write_text("{}")
 
+
+def _verify_token(token: str) -> str:
+    import hmac, hashlib, time
+    if not token: return ""
+    parts = token.split(":")
+    if len(parts) != 3: return ""
+    u, ts, sig = parts
+    try:
+        if int(time.time()) - int(ts) > 43200: return ""
+    except: return ""
+    secret = os.environ.get("SECRET_KEY","dev-secret")
+    expected = hmac.new(secret.encode(), f"{u}:{ts}".encode(), hashlib.sha256).hexdigest()
+    return u if hmac.compare_digest(sig, expected) else ""
 def load_users() -> dict:
     default_user = os.environ.get("APP_USERNAME", "admin")
     default_pw = os.environ.get("APP_PASSWORD", "changeme")
