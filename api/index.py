@@ -56,6 +56,15 @@ def verify_password(plain: str, hashed: str) -> bool:
 def require_auth(request: Request) -> str:
     user = request.session.get("user")
     if not user:
+        import hmac, hashlib, time
+        token = request.cookies.get("auth_token","")
+        if token and len(token.split(":")) == 3:
+            u, ts, sig = token.split(":")
+            secret = os.environ.get("SECRET_KEY","dev-secret-change-me")
+            expected = hmac.new(secret.encode(), f"{u}:{ts}".encode(), hashlib.sha256).hexdigest()
+            if hmac.compare_digest(sig, expected) and int(time.time()) - int(ts) < 43200:
+                user = u
+    if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
     return user
 
@@ -365,7 +374,15 @@ async def api_login(request: Request, body: dict = {}):
         raise HTTPException(status_code=401, detail="Invalid username or password")
     request.session["user"] = username
     request.session["role"] = entry.get("role","user")
-    return {"ok":True,"user":username,"role":entry.get("role","user")}
+    import hmac, hashlib, time
+    secret = os.environ.get("SECRET_KEY","dev-secret-change-me")
+    ts = str(int(time.time()))
+    sig = hmac.new(secret.encode(), f"{username}:{ts}".encode(), hashlib.sha256).hexdigest()
+    token = f"{username}:{ts}:{sig}"
+    from fastapi.responses import JSONResponse
+    resp = JSONResponse({"ok":True,"user":username,"role":entry.get("role","user")})
+    resp.set_cookie("auth_token", token, max_age=60*60*12, httponly=False, samesite="none", secure=True)
+    return resp
 
 @app.post("/api/logout")
 async def api_logout(request: Request):
@@ -375,6 +392,15 @@ async def api_logout(request: Request):
 @app.get("/api/me")
 async def api_me(request: Request):
     user = request.session.get("user")
+    if not user:
+        import hmac, hashlib, time
+        token = request.cookies.get("auth_token","")
+        if token and len(token.split(":")) == 3:
+            u, ts, sig = token.split(":")
+            secret = os.environ.get("SECRET_KEY","dev-secret-change-me")
+            expected = hmac.new(secret.encode(), f"{u}:{ts}".encode(), hashlib.sha256).hexdigest()
+            if hmac.compare_digest(sig, expected) and int(time.time()) - int(ts) < 43200:
+                user = u
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
     return {"user":user,"role":request.session.get("role","user")}
