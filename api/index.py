@@ -42,21 +42,14 @@ if not MEMORY_FILE.exists():
 _pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 def load_users() -> dict:
-    if USERS_FILE.exists():
-        try:
-            return json.loads(USERS_FILE.read_text())
-        except Exception:
-            pass
     default_pw = os.environ.get("APP_PASSWORD", "changeme")
     default_user = os.environ.get("APP_USERNAME", "admin")
-    users = {
+    return {
         default_user: {
             "password_hash": _pwd_ctx.hash(default_pw),
             "role": "admin",
         }
     }
-    USERS_FILE.write_text(json.dumps(users, indent=2))
-    return users
 
 def save_users(users: dict):
     USERS_FILE.write_text(json.dumps(users, indent=2))
