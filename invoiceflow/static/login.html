@@ -184,6 +184,7 @@
         });
         const data = await res.json();
         if (res.ok && data.ok) {
+          if (data.token) localStorage.setItem('auth_token', data.token);
           window.location.href = '/';
         } else {
           err.textContent = data.detail || 'Invalid username or password.';
