@@ -1,4 +1,4 @@
-"""
+h"""
 Invoice Sorter — FastAPI backend
 Processes supplier invoices (PDF/JPG/DOCX) via Claude API,
 runs dual-verification, looks up UK Trade Tariff, exports to Excel.
@@ -71,7 +71,7 @@ def load_users() -> dict:
     # First-run: seed default admin from .env
     default_pw = os.environ.get("APP_PASSWORD", "changeme")
     users = {
-        "admin": {
+                os.environ.get("APP_USERNAME", "admin"): {
             "password_hash": _pwd_ctx.hash(default_pw),
             "role": "admin",
         }
