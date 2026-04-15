@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>InvoiceFlow — Sign in</title>
+  <title>InvoiceFlow â Sign in</title>
   <style>
     *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
     body {
@@ -154,7 +154,7 @@
     </div>
     <div class="field">
       <label>Password</label>
-      <input type="password" id="password" placeholder="••••••••" autocomplete="current-password" />
+      <input type="password" id="password" placeholder="â¢â¢â¢â¢â¢â¢â¢â¢" autocomplete="current-password" />
     </div>
     <div id="error-msg"></div>
     <button class="btn-login" onclick="doLogin()">Sign in &rarr;</button>
@@ -182,10 +182,10 @@
           body: JSON.stringify({ username, password })
         });
         const data = await res.json();
-        if (res.ok && data.success) {
-          window.location.href = data.redirect || '/';
+        if (res.ok && data.ok) {
+          window.location.href = '/';
         } else {
-          err.textContent = data.message || 'Invalid username or password.';
+          err.textContent = data.detail || 'Invalid username or password.';
           err.style.display = 'block';
           btn.disabled = false;
           btn.innerHTML = 'Sign in &rarr;';
