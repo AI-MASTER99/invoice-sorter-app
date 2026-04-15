@@ -346,7 +346,7 @@ def _run_pipeline(job_id, file_path, original_name, mime):
         loop.close()
 
 app = FastAPI(title="Invoice Sorter")
-app.add_middleware(SessionMiddleware,secret_key=os.environ.get("SECRET_KEY","dev-secret-change-me"),session_cookie="is_session",max_age=60*60*12,https_only=False)
+app.add_middleware(SessionMiddleware,secret_key=os.environ.get("SECRET_KEY","dev-secret-change-me"),session_cookie="is_session",max_age=60*60*12,https_only=True,same_site="none")
 app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_methods=["*"],allow_headers=["*"],allow_credentials=True)
 MIME_MAP = {".pdf":"application/pdf",".jpg":"image/jpeg",".jpeg":"image/jpeg",".png":"image/png",".docx":"application/vnd.openxmlformats-officedocument.wordprocessingml.document"}
 
