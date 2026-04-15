@@ -400,7 +400,11 @@ async def api_login(request: Request, body: dict = {}):
 @app.post("/api/logout")
 async def api_logout(request: Request):
     request.session.clear()
-    return {"ok":True}
+    import hmac as _h, hashlib as _hs, time as _t
+    _sec = os.environ.get("SECRET_KEY","dev-secret-change-me")
+    _ts = str(int(_t.time()))
+    _sig = _h.new(_sec.encode(), f"{username}:{_ts}".encode(), _hs.sha256).hexdigest()
+    return {"ok":True,"user":username,"role":entry.get("role","user"),"token":f"{username}:{_ts}:{_sig}"}
 
 @app.get("/api/me")
 async def api_me(request: Request):
