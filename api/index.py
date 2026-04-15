@@ -21,7 +21,6 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.staticfiles import StaticFiles
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
-from passlib.context import CryptContext
 from starlette.middleware.sessions import SessionMiddleware
 
 BASE_DIR = Path(__file__).parent.parent / "invoiceflow"
@@ -39,27 +38,20 @@ for d in (UPLOADS_DIR, OUTPUT_DIR):
 if not MEMORY_FILE.exists():
     MEMORY_FILE.write_text("{}")
 
-_pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
 def load_users() -> dict:
     default_user = os.environ.get("APP_USERNAME", "admin")
-    # Use pre-hashed password if available (faster on serverless)
-    pw_hash = os.environ.get("APP_PASSWORD_HASH", "")
-    if not pw_hash:
-        default_pw = os.environ.get("APP_PASSWORD", "changeme")
-        pw_hash = _pwd_ctx.hash(default_pw)
+    default_pw = os.environ.get("APP_PASSWORD", "changeme")
     return {
         default_user: {
-            "password_hash": pw_hash,
+            "password": default_pw,
             "role": "admin",
         }
     }
-
 def save_users(users: dict):
     USERS_FILE.write_text(json.dumps(users, indent=2))
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return _pwd_ctx.verify(plain, hashed)
+    return plain == hashed
 
 def require_auth(request: Request) -> str:
     user = request.session.get("user")
@@ -369,7 +361,7 @@ async def api_login(request: Request, body: dict = {}):
     password = body.get("password") or ""
     users = load_users()
     entry = users.get(username)
-    if not entry or not verify_password(password, entry["password_hash"]):
+    if not entry or not verify_password(password, entry["password"]):
         raise HTTPException(status_code=401, detail="Invalid username or password")
     request.session["user"] = username
     request.session["role"] = entry.get("role","user")
