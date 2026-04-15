@@ -42,11 +42,15 @@ if not MEMORY_FILE.exists():
 _pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 def load_users() -> dict:
-    default_pw = os.environ.get("APP_PASSWORD", "changeme")
     default_user = os.environ.get("APP_USERNAME", "admin")
+    # Use pre-hashed password if available (faster on serverless)
+    pw_hash = os.environ.get("APP_PASSWORD_HASH", "")
+    if not pw_hash:
+        default_pw = os.environ.get("APP_PASSWORD", "changeme")
+        pw_hash = _pwd_ctx.hash(default_pw)
     return {
         default_user: {
-            "password_hash": _pwd_ctx.hash(default_pw),
+            "password_hash": pw_hash,
             "role": "admin",
         }
     }
