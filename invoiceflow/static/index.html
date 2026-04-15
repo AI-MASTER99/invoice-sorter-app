@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Invoice Sorter</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/style.css?v=3" />
+</head>
+<body>
+
+<div class="layout">
+
+  <!-- ════════════════════════════════════════════
+       SIDEBAR
+  ════════════════════════════════════════════ -->
+  <aside class="sidebar">
+
+    <div class="sidebar-logo">
+      <div class="logo-icon">⚡</div>
+      <div><div class="logo-text">Invoice Sorter</div></div>
+      <span class="beta-pill">beta</span>
+    </div>
+
+    <nav class="sidebar-nav">
+      <div class="nav-section-label">Main</div>
+
+      <div class="nav-item active" data-page="dashboard">
+        <span class="icon">🏠</span>
+        <span>Dashboard</span>
+      </div>
+      <div class="nav-item" data-page="invoices">
+        <span class="icon">📄</span>
+        <span>Invoices</span>
+        <span class="nav-badge" id="nav-badge-invoices" style="display:none"></span>
+      </div>
+
+      <div class="nav-section-label" style="margin-top:12px">Tools</div>
+
+      <div class="nav-item" data-page="memory">
+        <span class="icon">🧠</span>
+        <span>Product memory</span>
+        <span class="nav-badge amber" id="nav-badge-memory" style="display:none"></span>
+      </div>
+      <div class="nav-item" data-page="tariff">
+        <span class="icon">🔍</span>
+        <span>UK Tariff lookup</span>
+      </div>
+      <div class="nav-item" data-page="settings">
+        <span class="icon">⚙</span>
+        <span>Settings</span>
+      </div>
+    </nav>
+
+    <div class="sidebar-footer">
+      <div class="sidebar-footer-top">
+        <div class="pulse-dot"></div>
+        <span>Claude API connected</span>
+      </div>
+      <div class="sidebar-user" id="sidebar-user">
+        <span class="sidebar-user-icon">👤</span>
+        <span id="sidebar-username">—</span>
+        <button class="btn-logout" id="btn-logout" title="Sign out">↩</button>
+      </div>
+    </div>
+
+  </aside>
+
+  <!-- ════════════════════════════════════════════
+       MAIN AREA
+  ════════════════════════════════════════════ -->
+  <div class="main-area">
+
+    <!-- TOPBAR -->
+    <header class="topbar">
+      <div>
+        <div class="topbar-title" id="topbar-title">Dashboard</div>
+        <div class="topbar-sub" id="topbar-date"></div>
+      </div>
+      <button class="btn-primary" id="btn-upload-topbar">
+        <span>＋</span> Upload invoice
+      </button>
+    </header>
+
+    <!-- ══════════════════════════════
+         PAGE: DASHBOARD
+    ══════════════════════════════ -->
+    <main class="content page-content" id="page-dashboard">
+
+      <!-- DROP ZONE -->
+      <div class="drop-zone" id="drop-zone">
+        <div class="drop-icon">📂</div>
+        <div class="drop-main">
+          <div class="drop-heading">Drop invoice files here</div>
+          <div class="drop-sub">Drag &amp; drop or choose files to extract and process</div>
+          <div class="format-pills">
+            <span class="fmt-pill">PDF</span>
+            <span class="fmt-pill">JPG / PNG</span>
+            <span class="fmt-pill">Word</span>
+          </div>
+        </div>
+        <button class="btn-choose" id="btn-choose">Choose files</button>
+      </div>
+
+      <input type="file" id="file-input" multiple accept=".pdf,.jpg,.jpeg,.png,.docx" style="display:none" />
+
+      <!-- STATS ROW -->
+      <div class="stats-row">
+        <div class="stat-card">
+          <div class="stat-label">Processed today</div>
+          <div class="stat-value accent" id="stat-processed">0</div>
+          <div class="stat-meta">invoices handled</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Verification rate</div>
+          <div class="stat-value green" id="stat-rate">0%</div>
+          <div class="progress-bar-track">
+            <div class="progress-bar-fill" id="stat-rate-bar" style="width:0%"></div>
+          </div>
+          <div class="stat-meta">dual-extraction match</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Product memory</div>
+          <div class="stat-value accent" id="stat-memory">0</div>
+          <span class="pending-badge" id="stat-pending" style="display:none">0 pending</span>
+          <div class="stat-meta">learned products</div>
+        </div>
+      </div>
+
+      <!-- IN PROGRESS -->
+      <section class="jobs-section card" id="jobs-section">
+        <div class="section-title">In progress</div>
+        <div id="jobs-container"></div>
+      </section>
+
+      <!-- RECENT INVOICES (dashboard preview) -->
+      <section class="card invoices-card">
+        <div class="invoices-header">
+          <div class="invoices-title">Recent invoices</div>
+          <button class="btn-view-all" onclick="navigateTo('invoices')">View all →</button>
+        </div>
+        <div class="invoices-table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Supplier / Invoice</th>
+                <th>Date</th>
+                <th>Value</th>
+                <th>Status</th>
+                <th>Export</th>
+              </tr>
+            </thead>
+            <tbody id="invoices-tbody">
+              <tr><td colspan="5">
+                <div class="empty-state">
+                  <div class="empty-icon">📄</div>
+                  No invoices yet. Upload one to get started.
+                </div>
+              </td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+    </main><!-- /page-dashboard -->
+
+    <!-- ══════════════════════════════
+         PAGE: INVOICES
+    ══════════════════════════════ -->
+    <main class="content page-content hidden" id="page-invoices">
+
+      <!-- Tab bar -->
+      <div class="tab-bar">
+        <button class="tab-btn active" data-tab="verified"  onclick="switchTab('verified')">
+          <span class="tab-dot green"></span> Verified
+          <span class="tab-count" id="tab-count-verified">0</span>
+        </button>
+        <button class="tab-btn" data-tab="subcode_needed" onclick="switchTab('subcode_needed')">
+          <span class="tab-dot amber"></span> Needs review
+          <span class="tab-count amber" id="tab-count-subcode">0</span>
+        </button>
+        <button class="tab-btn" data-tab="failed" onclick="switchTab('failed')">
+          <span class="tab-dot red"></span> Failed
+          <span class="tab-count red" id="tab-count-failed">0</span>
+        </button>
+      </div>
+
+      <!-- Verified tab -->
+      <section class="tab-pane card invoices-card" id="pane-verified">
+        <div class="invoices-table-wrap">
+          <table>
+            <thead><tr>
+              <th>Supplier / Invoice</th><th>Date</th><th>Value</th><th>Status</th><th>Export</th>
+            </tr></thead>
+            <tbody id="tbody-verified">
+              <tr><td colspan="5"><div class="empty-state"><div class="empty-icon">✅</div>No verified invoices yet.</div></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Subcode needed tab -->
+      <section class="tab-pane card invoices-card hidden" id="pane-subcode_needed">
+        <div class="invoices-table-wrap">
+          <table>
+            <thead><tr>
+              <th>Supplier / Invoice</th><th>Date</th><th>Value</th><th>Status</th><th>Actions</th>
+            </tr></thead>
+            <tbody id="tbody-subcode_needed">
+              <tr><td colspan="5"><div class="empty-state"><div class="empty-icon">⚠️</div>No invoices need review.</div></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Failed tab -->
+      <section class="tab-pane card invoices-card hidden" id="pane-failed">
+        <div class="invoices-table-wrap">
+          <table>
+            <thead><tr>
+              <th>Supplier / Invoice</th><th>Date</th><th>Value</th><th>Status</th><th>Actions</th>
+            </tr></thead>
+            <tbody id="tbody-failed">
+              <tr><td colspan="5"><div class="empty-state"><div class="empty-icon">❌</div>No failed invoices.</div></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+    </main><!-- /page-invoices -->
+
+    <!-- ══════════════════════════════
+         PAGE: MEMORY
+    ══════════════════════════════ -->
+    <main class="content page-content hidden" id="page-memory">
+      <div class="card">
+        <div class="memory-header">
+          <div>
+            <div class="section-title">Product Memory <span class="memory-count" id="memory-count"></span></div>
+            <div style="color:var(--muted);font-size:12px;margin-top:4px">Commodity codes learned from processed invoices</div>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center">
+            <input class="memory-search" id="memory-search" type="text" placeholder="Search products…" />
+            <button class="btn-refresh-tariff" id="btn-refresh-tariff" title="Refresh tariff data for all entries">↻ Refresh tariff</button>
+          </div>
+        </div>
+        <div id="memory-list"></div>
+      </div>
+    </main>
+
+    <!-- ══════════════════════════════
+         PAGE: TARIFF
+    ══════════════════════════════ -->
+    <main class="content page-content hidden" id="page-tariff">
+      <div class="card">
+        <div class="section-title">UK Tariff Lookup</div>
+        <div style="color:var(--muted);font-size:12px;margin-top:4px;margin-bottom:20px">Search commodity codes via the official UK Trade Tariff</div>
+        <div class="tariff-search-row">
+          <input class="tariff-input" id="tariff-input" type="text" placeholder="e.g. mozzarella, branzino, olive oil…" />
+          <button class="btn-tariff-search" id="btn-tariff-search">Search</button>
+        </div>
+        <div id="tariff-results"></div>
+      </div>
+    </main>
+
+    <!-- ══════════════════════════════
+         PAGE: SETTINGS
+    ══════════════════════════════ -->
+    <main class="content page-content hidden" id="page-settings">
+
+      <!-- Users section -->
+      <div class="card" style="margin-bottom:16px">
+        <div class="section-title" style="margin-bottom:4px">Users</div>
+        <div style="color:var(--muted);font-size:12px;margin-bottom:16px">Manage who can access Invoice Sorter</div>
+        <div id="users-list"></div>
+        <button class="btn-add-user" id="btn-add-user" style="margin-top:14px">＋ Add user</button>
+        <!-- Add user form (hidden by default) -->
+        <div class="add-user-form hidden" id="add-user-form">
+          <div class="add-user-fields">
+            <input class="settings-input" id="new-username" type="text" placeholder="Username" autocomplete="off" />
+            <input class="settings-input" id="new-password" type="password" placeholder="Password" autocomplete="new-password" />
+            <select class="settings-select" id="new-role">
+              <option value="user">User</option>
+              <option value="admin">Admin</option>
+            </select>
+          </div>
+          <div style="display:flex;gap:8px;margin-top:10px">
+            <button class="btn-save-user" id="btn-save-user">Add user</button>
+            <button class="btn-cancel-user" id="btn-cancel-user">Cancel</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Change password section -->
+      <div class="card" style="margin-bottom:16px">
+        <div class="section-title" style="margin-bottom:4px">Change your password</div>
+        <div style="color:var(--muted);font-size:12px;margin-bottom:16px">Update the password for your own account</div>
+        <div class="add-user-fields">
+          <input class="settings-input" id="chpw-new" type="password" placeholder="New password" autocomplete="new-password" />
+          <input class="settings-input" id="chpw-confirm" type="password" placeholder="Confirm password" autocomplete="new-password" />
+          <button class="btn-save-user" id="btn-chpw">Update</button>
+        </div>
+        <div class="settings-msg hidden" id="chpw-msg"></div>
+      </div>
+
+      <!-- System info section -->
+      <div class="card">
+        <div class="section-title" style="margin-bottom:16px">System info</div>
+        <div class="settings-info-row">
+          <span class="settings-info-label">AI Model</span>
+          <span class="settings-info-value">claude-opus-4-6</span>
+        </div>
+        <div class="settings-info-row">
+          <span class="settings-info-label">API Status</span>
+          <span class="settings-info-value" style="color:var(--green)">✓ Connected</span>
+        </div>
+        <div class="settings-info-row">
+          <span class="settings-info-label">Version</span>
+          <span class="settings-info-value">Invoice Sorter beta</span>
+        </div>
+      </div>
+
+    </main><!-- /page-settings -->
+
+  </div><!-- /main-area -->
+</div><!-- /layout -->
+
+<!-- ════════════════════════════════════════════
+     RESOLVE MODAL
+════════════════════════════════════════════ -->
+<div class="modal-overlay hidden" id="modal-overlay">
+  <div class="modal">
+    <div class="modal-title">🔧 Resolve subcode</div>
+    <div class="modal-sub">
+      Confirm or correct the commodity subcode for
+      <strong id="modal-invoice-id"></strong>. Once confirmed, the invoice moves to <span style="color:var(--green)">Verified</span>.
+    </div>
+    <input
+      class="modal-input"
+      id="modal-subcode-input"
+      type="text"
+      placeholder="e.g. 0302110010"
+      maxlength="12"
+    />
+    <div class="modal-actions">
+      <button class="btn-modal-cancel" id="modal-cancel">Cancel</button>
+      <button class="btn-modal-confirm" id="modal-confirm">Confirm &amp; move to Verified</button>
+    </div>
+  </div>
+</div>
+
+<!-- CHANGE PASSWORD MODAL (for other users by admin) -->
+<div class="modal-overlay hidden" id="modal-chpw-overlay">
+  <div class="modal">
+    <div class="modal-title">🔑 Change password</div>
+    <div class="modal-sub">Set a new password for <strong id="modal-chpw-user"></strong></div>
+    <input class="modal-input" id="modal-chpw-input" type="password" placeholder="New password" />
+    <div class="modal-actions">
+      <button class="btn-modal-cancel" id="modal-chpw-cancel">Cancel</button>
+      <button class="btn-modal-confirm" id="modal-chpw-confirm">Update password</button>
+    </div>
+  </div>
+</div>
+
+<!-- TOAST CONTAINER -->
+<div id="toast-container"></div>
+
+<script src="/app.js?v=3"></script>
+</body>
+</html>

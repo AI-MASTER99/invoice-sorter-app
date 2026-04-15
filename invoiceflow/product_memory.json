@@ -1,0 +1,272 @@
+{
+  "04061030::MOZZARELLA X3 KG.BUF.DOP": {
+    "code": "04061030",
+    "description": "MOZZARELLA X3 KG.BUF.DOP",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "04061080::RICOTTA SALATA AGRILAT": {
+    "code": "04061080",
+    "description": "RICOTTA SALATA AGRILAT",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "04061080::SCAMORZA AFFUMICATA": {
+    "code": "04061080",
+    "description": "SCAMORZA AFFUMICATA",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "07020010::CAMONE SARDEGNA": {
+    "code": "07020010",
+    "description": "CAMONE SARDEGNA",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "07020010::CHERRY IL MARCHIO X3 ct": {
+    "code": "07020010",
+    "description": "CHERRY IL MARCHIO X3 ct",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "07020010::DATTERINO IL MARCHIO X3Kg": {
+    "code": "07020010",
+    "description": "DATTERINO IL MARCHIO X3Kg",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "07020010::POMOD.MAT.IL MARCHIO ct": {
+    "code": "07020010",
+    "description": "POMOD.MAT.IL MARCHIO ct",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "07031019::CIPOLLE BIANCHE": {
+    "code": "07031019",
+    "description": "CIPOLLE BIANCHE",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "07032000::AGLIO SERRA MORAD X 5KG.": {
+    "code": "07032000",
+    "description": "AGLIO SERRA MORAD X 5KG.",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "07049010::CIMA RAPA": {
+    "code": "07049010",
+    "description": "CIMA RAPA",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "07061000::CAROTE MAZZI": {
+    "code": "07061000",
+    "description": "CAROTE MAZZI",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "07081000::PISELLI VERDI PLAST.": {
+    "code": "07081000",
+    "description": "PISELLI VERDI PLAST.",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "07089000::FAVE SERRA riviera EX.": {
+    "code": "07089000",
+    "description": "FAVE SERRA riviera EX.",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "07092000::ASPARAGI BIANCHI": {
+    "code": "07092000",
+    "description": "ASPARAGI BIANCHI",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "07092000::ASPARAGI VENETO": {
+    "code": "07092000",
+    "description": "ASPARAGI VENETO",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "07093000::MELANZANE IL MARCHIO cart": {
+    "code": "07093000",
+    "description": "MELANZANE IL MARCHIO cart",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "07094000::SEDANO VERDE plastica": {
+    "code": "07094000",
+    "description": "SEDANO VERDE plastica",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "07096099::PEPER.R.PAD.CART.rossi": {
+    "code": "07096099",
+    "description": "PEPER.R.PAD.CART.rossi",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "07096099::PEPERONCINI PICCANTI": {
+    "code": "07096099",
+    "description": "PEPERONCINI PICCANTI",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "07099100::CARCIOFI (peso)": {
+    "code": "07099100",
+    "description": "CARCIOFI (peso)",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "07099100::MAMMOLE EX. (PESO)": {
+    "code": "07099100",
+    "description": "MAMMOLE EX. (PESO)",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "07099310::FIORI ZUCCA Padella": {
+    "code": "07099310",
+    "description": "FIORI ZUCCA Padella",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "07099310::ZUCCHINE COLONIA PLAST.": {
+    "code": "07099310",
+    "description": "ZUCCHINE COLONIA PLAST.",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "07099310::ZUCCHINE TONDE": {
+    "code": "07099310",
+    "description": "ZUCCHINE TONDE",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "07099910::RADICCHIO ROSA DI SIMONE": {
+    "code": "07099910",
+    "description": "RADICCHIO ROSA DI SIMONE",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "07099910::RADICCHIO ROSSO PRECOCE": {
+    "code": "07099910",
+    "description": "RADICCHIO ROSSO PRECOCE",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "07099910::RADICCHIO ROSSO TARDIVO": {
+    "code": "07099910",
+    "description": "RADICCHIO ROSSO TARDIVO",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "07099910::RADICCHIO VARIEGATO": {
+    "code": "07099910",
+    "description": "RADICCHIO VARIEGATO",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "07099950::FINOCCHI LEGNO": {
+    "code": "07099950",
+    "description": "FINOCCHI LEGNO",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "07099990::BARBA PINTO Plastica": {
+    "code": "07099990",
+    "description": "BARBA PINTO Plastica",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "07108085::ASPARAGINA": {
+    "code": "07108085",
+    "description": "ASPARAGINA",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "07108085::ASPARAGI PUGLIA": {
+    "code": "07108085",
+    "description": "ASPARAGI PUGLIA",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "08051028::ARANCE MORO 8": {
+    "code": "08051028",
+    "description": "ARANCE MORO 8",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "08051028::ARANCE VIN.LANE LATE": {
+    "code": "08051028",
+    "description": "ARANCE VIN.LANE LATE",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "08051028::TAROCCO 4 PAD.": {
+    "code": "08051028",
+    "description": "TAROCCO 4 PAD.",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "08051028::TAROCCO LEMPSO 4 PAD.": {
+    "code": "08051028",
+    "description": "TAROCCO LEMPSO 4 PAD.",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "08055010::LIMONI AFFILATI": {
+    "code": "08055010",
+    "description": "LIMONI AFFILATI",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "08055010::LIMONI VIN.SORR.IGP FOG.": {
+    "code": "08055010",
+    "description": "LIMONI VIN.SORR.IGP FOG.",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "08101000::FRAGOLE (PESO)": {
+    "code": "08101000",
+    "description": "FRAGOLE (PESO)",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "08104030::MIRTILLI": {
+    "code": "08104030",
+    "description": "MIRTILLI",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "08134030::PERE ABATE 16": {
+    "code": "08134030",
+    "description": "PERE ABATE 16",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "08134030::PERE DECANA 12": {
+    "code": "08134030",
+    "description": "PERE DECANA 12",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "12119086::AROMI": {
+    "code": "12119086",
+    "description": "AROMI",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "12119086::BASILICO SERRA": {
+    "code": "12119086",
+    "description": "BASILICO SERRA",
+    "confirmed": true,
+    "tariff": {}
+  },
+  "20021011::PELATI X3,4 KG.(PESO)": {
+    "code": "20021011",
+    "description": "PELATI X3,4 KG.(PESO)",
+    "confirmed": true,
+    "tariff": {}
+  }
+}

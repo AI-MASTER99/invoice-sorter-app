@@ -1,0 +1,1001 @@
+"""
+Invoice Sorter — FastAPI backend
+Processes supplier invoices (PDF/JPG/DOCX) via Claude API,
+runs dual-verification, looks up UK Trade Tariff, exports to Excel.
+"""
+
+import asyncio
+import base64
+import io
+import json
+import os
+import re
+import threading
+import time
+import uuid
+from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv(dotenv_path=Path(__file__).parent / ".env")
+
+from datetime import date, datetime
+from typing import Any
+
+import anthropic
+import httpx
+import openpyxl
+from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
+from passlib.context import CryptContext
+from starlette.middleware.sessions import SessionMiddleware
+
+# ---------------------------------------------------------------------------
+# Paths & startup
+# ---------------------------------------------------------------------------
+BASE_DIR = Path(__file__).parent
+
+# Op Vercel is het filesystem read-only; gebruik /tmp voor schrijfbare mappen
+_ON_VERCEL = os.environ.get("VERCEL") == "1"
+if _ON_VERCEL:
+    _DATA_ROOT = Path("/tmp/invoice-sorter")
+else:
+    _DATA_ROOT = BASE_DIR
+
+UPLOADS_DIR = _DATA_ROOT / "uploads"
+OUTPUT_DIR  = _DATA_ROOT / "output"
+MEMORY_FILE = _DATA_ROOT / "product_memory.json"
+USERS_FILE  = _DATA_ROOT / "users.json"
+
+for d in (UPLOADS_DIR, OUTPUT_DIR):
+    d.mkdir(parents=True, exist_ok=True)
+
+if not MEMORY_FILE.exists():
+    MEMORY_FILE.write_text("{}")
+
+# ---------------------------------------------------------------------------
+# Auth helpers
+# ---------------------------------------------------------------------------
+_pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+def load_users() -> dict:
+    if USERS_FILE.exists():
+        try:
+            return json.loads(USERS_FILE.read_text())
+        except Exception:
+            pass
+    # First-run: seed default admin from .env
+    default_pw = os.environ.get("APP_PASSWORD", "changeme")
+    users = {
+        "admin": {
+            "password_hash": _pwd_ctx.hash(default_pw),
+            "role": "admin",
+        }
+    }
+    USERS_FILE.write_text(json.dumps(users, indent=2))
+    return users
+
+
+def save_users(users: dict):
+    USERS_FILE.write_text(json.dumps(users, indent=2))
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    return _pwd_ctx.verify(plain, hashed)
+
+
+def require_auth(request: Request) -> str:
+    user = request.session.get("user")
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return user
+
+
+def require_admin(request: Request) -> str:
+    user = require_auth(request)
+    users = load_users()
+    if users.get(user, {}).get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin required")
+    return user
+
+# ---------------------------------------------------------------------------
+# In-memory state (thread-safe via a lock)
+# ---------------------------------------------------------------------------
+_lock = threading.Lock()
+
+# jobs: {job_id: {id, filename, status, progress, step, created_at, invoice_id, error}}
+jobs: dict[str, dict] = {}
+
+# invoices: {invoice_id: {...}}
+invoices: dict[str, dict] = {}
+
+# stats counters
+processed_today: int = 0
+_today_date: str = date.today().isoformat()
+
+
+def _reset_daily():
+    global processed_today, _today_date
+    today = date.today().isoformat()
+    if today != _today_date:
+        with _lock:
+            processed_today = 0
+            _today_date = today
+
+
+# ---------------------------------------------------------------------------
+# Product memory helpers
+# ---------------------------------------------------------------------------
+def load_memory() -> dict:
+    try:
+        return json.loads(MEMORY_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def save_memory(data: dict):
+    MEMORY_FILE.write_text(json.dumps(data, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Tariff lookup
+# ---------------------------------------------------------------------------
+async def lookup_tariff(commodity_code: str) -> dict:
+    """Query UK Trade Tariff API for duty/VAT rates."""
+    code = re.sub(r"\D", "", commodity_code)
+    if not code:
+        return {}
+    url = f"https://www.trade-tariff.service.gov.uk/api/v2/commodities/{code}"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(url)
+            if r.status_code != 200:
+                return {}
+            data = r.json()
+            # Extract duty and VAT from measures
+            duty = ""
+            vat = ""
+            measures = data.get("included", [])
+            for m in measures:
+                if not isinstance(m, dict):
+                    continue
+                mtype = m.get("attributes", {}).get("measure_type_description", "")
+                duty_expr = m.get("attributes", {}).get("duty_expression", {})
+                if isinstance(duty_expr, dict):
+                    formatted = duty_expr.get("formatted_base", "")
+                else:
+                    formatted = ""
+                if "Third country duty" in mtype and not duty:
+                    duty = formatted
+                if "VAT" in mtype and not vat:
+                    vat = formatted
+            desc = ""
+            attrs = data.get("data", {}).get("attributes", {})
+            if attrs:
+                desc = attrs.get("description", "")
+            return {
+                "description": desc,
+                "duty": duty or "N/A",
+                "vat": vat or "20%",
+            }
+    except Exception:
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# Claude extraction
+# ---------------------------------------------------------------------------
+PROMPT_EXTRACT = """DATA EXTRACTION — STEP 1
+
+Goal
+Extract all line items from the attached invoice into ONE table,
+following the exact column order and rules below.
+
+Hard rules (strict — no guessing)
+- Extract only information explicitly present on the invoice.
+- Do NOT invent commodity codes, descriptions, quantities,
+  weights, values, currencies, or countries.
+- If a field is missing, leave the cell BLANK.
+- Never infer or assume missing information.
+
+Output format
+- TAB-SEPARATED VALUES (TSV) only.
+- First row = header row.
+- No explanations, comments, or text outside the table.
+
+Columns (exactly in this order)
+1. Invoice            Invoice number exactly as shown.
+2. Comm./imp. cod     HS/commodity code — see formatting rules below.
+3. Description of Goods   Product description exactly as written. Blank if absent.
+4. Origin             Country of origin — ISO Alpha-2 (e.g. IT, ES, CN).
+5. Country            Full English country name matching the ISO code.
+6. Number of Packages     Leave blank if not mentioned.
+7. Gross Weight (KG)  In KG only. Blank if not in KG or not given.
+8. Net Weight (KG)    In KG only. Blank if not in KG or not given.
+9. Value              Line total with currency symbol (€ / $ / £). 2 decimals.
+
+Commodity code formatting rules
+Step 1 — Determine supplier country from VAT number prefix or address:
+  • VAT prefix IT, ES, FR, DE, NL, BE, PL, PT, … → EU supplier
+  • VAT prefix GB → UK supplier
+  • All others → Unknown
+
+Step 2 — Apply the correct digit length:
+  • EU supplier  → 8 digits. Truncate to 8 if longer, right-pad with zeros if shorter.
+  • UK supplier  → 10 digits. Right-pad with zeros if shorter.
+  • Unknown      → Copy exactly as printed, no modification.
+  Never invent or change the digits themselves — only pad or truncate.
+
+Sorting: by Invoice (ascending) → Commodity code (ascending, numeric).
+
+Grouping: merge rows where Invoice + Commodity code + Description + Origin are identical.
+For merged rows SUM: packages, gross weight, net weight, value.
+All numeric values: 2 decimals. Values must be numbers (positive or negative).
+"""
+
+PROMPT_VERIFY = (
+    "This is a second independent extraction. "
+    "Read the invoice fresh — do not reference any previous result.\n\n"
+    + PROMPT_EXTRACT
+)
+
+COLUMNS = [
+    "Invoice",
+    "Comm./imp. cod",
+    "Description of Goods",
+    "Origin",
+    "Country",
+    "Number of Packages",
+    "Gross Weight (KG)",
+    "Net Weight (KG)",
+    "Value",
+]
+
+
+def parse_tsv(tsv: str) -> list[dict]:
+    lines = [l for l in tsv.strip().splitlines() if l.strip()]
+    if not lines:
+        return []
+    # Find header row
+    header_line = 0
+    for i, line in enumerate(lines):
+        if "Invoice" in line or "Comm" in line:
+            header_line = i
+            break
+    headers = [h.strip() for h in lines[header_line].split("\t")]
+    rows = []
+    for line in lines[header_line + 1:]:
+        parts = line.split("\t")
+        # pad/trim to match headers
+        while len(parts) < len(headers):
+            parts.append("")
+        row = {headers[i]: parts[i].strip() for i in range(len(headers))}
+        rows.append(row)
+    return rows
+
+
+def normalise_row(row: dict) -> dict:
+    """Map any variant header names to canonical COLUMNS."""
+    mapping = {
+        "invoice": "Invoice",
+        "comm./imp. cod": "Comm./imp. cod",
+        "comm/imp cod": "Comm./imp. cod",
+        "commodity code": "Comm./imp. cod",
+        "description of goods": "Description of Goods",
+        "description": "Description of Goods",
+        "origin": "Origin",
+        "country": "Country",
+        "number of packages": "Number of Packages",
+        "packages": "Number of Packages",
+        "gross weight (kg)": "Gross Weight (KG)",
+        "gross weight": "Gross Weight (KG)",
+        "net weight (kg)": "Net Weight (KG)",
+        "net weight": "Net Weight (KG)",
+        "value": "Value",
+    }
+    out = {}
+    for k, v in row.items():
+        canon = mapping.get(k.lower().strip(), k)
+        out[canon] = v
+    return out
+
+
+def rows_match(a: list[dict], b: list[dict]) -> bool:
+    """Check if two extractions match on key numeric/code fields."""
+    if len(a) != len(b):
+        return False
+    for ra, rb in zip(a, b):
+        for field in ("Comm./imp. cod", "Value", "Gross Weight (KG)", "Net Weight (KG)"):
+            va = re.sub(r"[^\d.]", "", ra.get(field, "") or "")
+            vb = re.sub(r"[^\d.]", "", rb.get(field, "") or "")
+            if va and vb and va != vb:
+                return False
+    return True
+
+
+def extract_value_number(val_str: str) -> float | None:
+    if not val_str:
+        return None
+    cleaned = re.sub(r"[^\d.\-]", "", val_str)
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+async def run_extraction(client: anthropic.AsyncAnthropic, file_bytes: bytes, mime: str, prompt: str) -> str:
+    """Send file + prompt to Claude and return raw text response."""
+    # Encode file as base64 for vision/document
+    b64 = base64.standard_b64encode(file_bytes).decode()
+
+    # Determine content block type
+    if mime in ("application/pdf",):
+        doc_block = {
+            "type": "document",
+            "source": {"type": "base64", "media_type": mime, "data": b64},
+            "cache_control": {"type": "ephemeral"},
+        }
+    elif mime.startswith("image/"):
+        doc_block = {
+            "type": "image",
+            "source": {"type": "base64", "media_type": mime, "data": b64},
+            "cache_control": {"type": "ephemeral"},
+        }
+    else:
+        # For DOCX/other, encode as document with PDF media type fallback
+        doc_block = {
+            "type": "document",
+            "source": {"type": "base64", "media_type": "application/pdf", "data": b64},
+            "cache_control": {"type": "ephemeral"},
+        }
+
+    message = await client.messages.create(
+        model="claude-opus-4-6",
+        max_tokens=4096,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    doc_block,
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ],
+    )
+    return message.content[0].text
+
+
+# ---------------------------------------------------------------------------
+# Excel export — matches reference format exactly
+# Colors: header fill #1F3864, alt row #DCE6F1, totals fill #2E75B6
+# ---------------------------------------------------------------------------
+_FILL_HEADER = PatternFill("solid", fgColor="1F3864")   # dark navy header
+_FILL_ALT    = PatternFill("solid", fgColor="DCE6F1")   # light blue alt rows
+_FILL_TOTALS = PatternFill("solid", fgColor="2E75B6")   # medium blue totals
+_FONT_TITLE  = Font(name="Calibri", bold=True, color="1F3864", size=12)
+_FONT_HDR    = Font(name="Calibri", bold=True, color="FFFFFF",  size=10)
+_FONT_CELL   = Font(name="Calibri", color="000000", size=10)
+_FONT_TOTALS = Font(name="Calibri", bold=True, color="FFFFFF",  size=10)
+
+# col: (width, number_format, h_align)
+_COL_CFG = [
+    ("Invoice",             12,  "General", "left"),
+    ("Comm./imp. cod",      18,  "@",       "left"),
+    ("Description of Goods",42,  "General", "left"),
+    ("Origin",               8,  "General", "center"),
+    ("Country",             12,  "General", "left"),
+    ("Number of Packages",   8,  "#,##0.00","right"),
+    ("Gross Weight (KG)",   18,  "#,##0.00","right"),
+    ("Net Weight (KG)",     16,  "#,##0.00","right"),
+    ("Value",               14,  '\u20ac#,##0.00', "right"),
+]
+
+
+def build_excel(rows: list[dict], tariff_data: dict | None, sheet_title: str) -> bytes:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = sheet_title
+
+    # ── Row 1: merged title ───────────────────────────────────
+    ws.merge_cells("A1:I1")
+    # Build title from first data row
+    inv_num  = rows[0].get("Invoice", "") if rows else ""
+    date_str = datetime.now().strftime("%d/%m/%Y")
+    title_val = f"Invoice {inv_num} — {date_str}" if inv_num else sheet_title
+    c = ws["A1"]
+    c.value     = title_val
+    c.font      = _FONT_TITLE
+    c.fill      = PatternFill("solid", fgColor="FFFFFF")
+    c.alignment = Alignment(horizontal="left", vertical="center")
+    ws.row_dimensions[1].height = 22
+
+    # ── Row 2: column headers ─────────────────────────────────
+    for col_idx, (col_name, width, fmt, align) in enumerate(_COL_CFG, start=1):
+        c = ws.cell(row=2, column=col_idx, value=col_name)
+        c.font      = _FONT_HDR
+        c.fill      = _FILL_HEADER
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.row_dimensions[2].height = 30
+
+    # Freeze at row 3
+    ws.freeze_panes = "A3"
+
+    # ── Data rows ─────────────────────────────────────────────
+    data_start = 3
+    for row_idx, row in enumerate(rows, start=data_start):
+        fill = _FILL_ALT if (row_idx % 2 == 0) else None   # even = light blue, odd = white
+        for col_idx, (col_name, width, fmt, align) in enumerate(_COL_CFG, start=1):
+            c   = ws.cell(row=row_idx, column=col_idx)
+            raw = row.get(col_name, "") or ""
+
+            if fill:
+                c.fill = fill
+            c.font      = _FONT_CELL
+            c.alignment = Alignment(horizontal=align, vertical="center")
+            c.number_format = fmt
+
+            if col_name in ("Value", "Gross Weight (KG)", "Net Weight (KG)", "Number of Packages"):
+                num = extract_value_number(str(raw))
+                c.value = num if num is not None else raw
+            else:
+                c.value = str(raw) if raw else ""
+
+    data_end = data_start + len(rows) - 1
+
+    # ── Totals row ────────────────────────────────────────────
+    total_row = data_end + 1
+    ws.merge_cells(f"A{total_row}:E{total_row}")
+    tc = ws.cell(row=total_row, column=1, value="TOTALS")
+    tc.font      = _FONT_TOTALS
+    tc.fill      = _FILL_TOTALS
+    tc.alignment = Alignment(horizontal="left", vertical="center")
+
+    for col_idx, (col_name, width, fmt, align) in enumerate(_COL_CFG, start=1):
+        if col_idx < 6:   # already merged
+            ws.cell(row=total_row, column=col_idx).fill = _FILL_TOTALS
+            continue
+        col_letter = get_column_letter(col_idx)
+        c = ws.cell(row=total_row, column=col_idx)
+        c.fill      = _FILL_TOTALS
+        c.font      = _FONT_TOTALS
+        c.alignment = Alignment(horizontal="right", vertical="center")
+        c.number_format = fmt
+        if col_name in ("Gross Weight (KG)", "Net Weight (KG)", "Value"):
+            c.value = f"=ROUND(SUM({col_letter}{data_start}:{col_letter}{data_end}),2)"
+        else:
+            c.value = f"=SUM({col_letter}{data_start}:{col_letter}{data_end})"
+
+    # ── Column widths ─────────────────────────────────────────
+    for col_idx, (col_name, width, fmt, align) in enumerate(_COL_CFG, start=1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+    # ── Tariff sheet (full export only) ───────────────────────
+    if tariff_data:
+        ws2 = wb.create_sheet("Tariff Lookup")
+        tariff_cols = ["Commodity Code", "Description", "Duty Rate", "VAT Rate"]
+        tariff_widths = [20, 50, 20, 15]
+        for ci, h in enumerate(tariff_cols, start=1):
+            c = ws2.cell(row=1, column=ci, value=h)
+            c.font = _FONT_HDR
+            c.fill = _FILL_HEADER
+            c.alignment = Alignment(horizontal="center", vertical="center")
+        for ri, (code, info) in enumerate(tariff_data.items(), start=2):
+            fill = _FILL_ALT if ri % 2 == 0 else None
+            for ci, v in enumerate([code, info.get("description",""), info.get("duty",""), info.get("vat","")], start=1):
+                c = ws2.cell(row=ri, column=ci, value=v)
+                c.font = _FONT_CELL
+                if fill:
+                    c.fill = fill
+        for ci, w in enumerate(tariff_widths, start=1):
+            ws2.column_dimensions[get_column_letter(ci)].width = w
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Background processing pipeline
+# ---------------------------------------------------------------------------
+async def _process_invoice(job_id: str, file_path: Path, original_name: str, mime: str):
+    global processed_today
+
+    def update(progress: int, step: str):
+        with _lock:
+            if job_id in jobs:
+                jobs[job_id]["progress"] = progress
+                jobs[job_id]["step"] = step
+
+    invoice_id = str(uuid.uuid4())
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    client = anthropic.AsyncAnthropic(api_key=api_key)
+
+    try:
+        file_bytes = file_path.read_bytes()
+
+        # Steps 1+2 — Run A first (writes prompt cache), then Run B reads cache
+        # Serialized to stay under rate limits; Run B is ~10% cost via cache hit
+        update(10, "Extracting data (Run A)…")
+        raw_a = await run_extraction(client, file_bytes, mime, PROMPT_EXTRACT)
+        update(35, "Verifying (Run B, cached)…")
+        raw_b = await run_extraction(client, file_bytes, mime, PROMPT_VERIFY)
+        rows_a = [normalise_row(r) for r in parse_tsv(raw_a)]
+        rows_b = [normalise_row(r) for r in parse_tsv(raw_b)]
+
+        # Step 3 — Compare, retry up to 3x (only if mismatch)
+        update(60, "Cross-checking extractions…")
+        verified = rows_match(rows_a, rows_b)
+        final_rows = rows_a
+        attempts = 1
+        while not verified and attempts < 3:
+            raw_retry = await run_extraction(client, file_bytes, mime, PROMPT_VERIFY)
+            rows_retry = [normalise_row(r) for r in parse_tsv(raw_retry)]
+            verified = rows_match(rows_a, rows_retry)
+            if verified:
+                final_rows = rows_a
+            attempts += 1
+
+        status = "verified" if verified else "subcode_needed"
+
+        # Step 4 — Tariff lookup
+        update(80, "Looking up tariff codes…")
+        tariff_data: dict[str, Any] = {}
+        seen_codes: set[str] = set()
+        for row in final_rows:
+            code = row.get("Comm./imp. cod", "").strip()
+            if code and code not in seen_codes:
+                seen_codes.add(code)
+                info = await lookup_tariff(code)
+                tariff_data[code] = info
+
+        # Update product memory
+        memory = load_memory()
+        for row in final_rows:
+            code = row.get("Comm./imp. cod", "").strip()
+            desc = row.get("Description of Goods", "").strip()
+            if code and desc:
+                key = f"{code}::{desc}"
+                tariff_info = tariff_data.get(code, {})
+                if key not in memory:
+                    memory[key] = {
+                        "code": code,
+                        "description": desc,
+                        "confirmed": verified,
+                        "tariff": tariff_info,
+                    }
+                else:
+                    # Update tariff if it was empty before
+                    if not memory[key].get("tariff") and tariff_info:
+                        memory[key]["tariff"] = tariff_info
+                    # Mark confirmed if now verified
+                    if verified:
+                        memory[key]["confirmed"] = True
+        save_memory(memory)
+
+        # Step 5 — Generate Excel files
+        update(95, "Generating Excel files…")
+        stem = Path(original_name).stem
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_stem = re.sub(r"[^\w\-]", "_", stem)
+        full_path = OUTPUT_DIR / f"{safe_stem}_{ts}_full.xlsx"
+        raw_path = OUTPUT_DIR / f"{safe_stem}_{ts}_raw.xlsx"
+
+        full_bytes = build_excel(final_rows, tariff_data, "Invoice Data")
+        raw_bytes = build_excel(final_rows, None, "Raw Extraction")
+
+        full_path.write_bytes(full_bytes)
+        raw_path.write_bytes(raw_bytes)
+
+        # Detect supplier name from first row
+        supplier = final_rows[0].get("Invoice", original_name) if final_rows else original_name
+        total_value = 0.0
+        currency = "€"
+        for row in final_rows:
+            v = row.get("Value", "") or ""
+            num = extract_value_number(v)
+            if num:
+                total_value += num
+            if "£" in v:
+                currency = "£"
+            elif "$" in v:
+                currency = "$"
+
+        with _lock:
+            processed_today += 1
+            invoices[invoice_id] = {
+                "id": invoice_id,
+                "supplier": supplier,
+                "filename": original_name,
+                "date": datetime.now().isoformat(),
+                "value": f"{currency}{total_value:,.2f}",
+                "status": status,
+                "full_xlsx": str(full_path),
+                "raw_xlsx": str(raw_path),
+                "rows": final_rows,
+                "tariff_data": tariff_data,
+            }
+            jobs[job_id]["status"] = "done"
+            jobs[job_id]["invoice_id"] = invoice_id
+            jobs[job_id]["progress"] = 100
+            jobs[job_id]["step"] = "Complete"
+
+    except Exception as exc:
+        with _lock:
+            if job_id in jobs:
+                jobs[job_id]["status"] = "failed"
+                jobs[job_id]["step"] = f"Error: {exc}"
+                jobs[job_id]["progress"] = 0
+        raise
+
+
+def _run_pipeline(job_id: str, file_path: Path, original_name: str, mime: str):
+    """Thread entry point — runs the async pipeline in its own event loop."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(_process_invoice(job_id, file_path, original_name, mime))
+    finally:
+        loop.close()
+
+
+# ---------------------------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------------------------
+app = FastAPI(title="Invoice Sorter")
+
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=os.environ.get("SECRET_KEY", "dev-secret-change-me"),
+    session_cookie="is_session",
+    max_age=60 * 60 * 12,  # 12 hours
+    https_only=False,
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=True,
+)
+
+MIME_MAP = {
+    ".pdf": "application/pdf",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+}
+
+
+# ---------------------------------------------------------------------------
+# Auth endpoints
+# ---------------------------------------------------------------------------
+@app.get("/login", response_class=HTMLResponse)
+async def login_page():
+    login_html = BASE_DIR / "static" / "login.html"
+    return HTMLResponse(content=login_html.read_text(encoding="utf-8"))
+
+
+@app.post("/api/login")
+async def api_login(request: Request, body: dict = {}):
+    username = (body.get("username") or "").strip().lower()
+    password = body.get("password") or ""
+    users = load_users()
+    entry = users.get(username)
+    if not entry or not verify_password(password, entry["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    request.session["user"] = username
+    request.session["role"] = entry.get("role", "user")
+    return {"ok": True, "user": username, "role": entry.get("role", "user")}
+
+
+@app.post("/api/logout")
+async def api_logout(request: Request):
+    request.session.clear()
+    return {"ok": True}
+
+
+@app.get("/api/me")
+async def api_me(request: Request):
+    user = request.session.get("user")
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return {"user": user, "role": request.session.get("role", "user")}
+
+
+@app.get("/api/users")
+def api_list_users(current: str = Depends(require_admin)):
+    users = load_users()
+    return [{"username": u, "role": v.get("role", "user")} for u, v in users.items()]
+
+
+@app.post("/api/users")
+async def api_add_user(body: dict = {}, current: str = Depends(require_admin)):
+    username = (body.get("username") or "").strip().lower()
+    password = body.get("password") or ""
+    role = body.get("role", "user")
+    if not username or not password:
+        raise HTTPException(400, "Username and password required")
+    users = load_users()
+    if username in users:
+        raise HTTPException(409, "User already exists")
+    users[username] = {"password_hash": _pwd_ctx.hash(password), "role": role}
+    save_users(users)
+    return {"ok": True}
+
+
+@app.delete("/api/users/{username}")
+async def api_delete_user(username: str, current: str = Depends(require_admin)):
+    if username == current:
+        raise HTTPException(400, "Cannot delete your own account")
+    users = load_users()
+    if username not in users:
+        raise HTTPException(404, "User not found")
+    del users[username]
+    save_users(users)
+    return {"ok": True}
+
+
+@app.put("/api/users/{username}/password")
+async def api_change_password(username: str, body: dict = {}, current: str = Depends(require_auth)):
+    # Admins can change anyone; users can only change their own
+    users = load_users()
+    if current != username and users.get(current, {}).get("role") != "admin":
+        raise HTTPException(403, "Forbidden")
+    if username not in users:
+        raise HTTPException(404, "User not found")
+    new_pw = body.get("password") or ""
+    if not new_pw:
+        raise HTTPException(400, "Password required")
+    users[username]["password_hash"] = _pwd_ctx.hash(new_pw)
+    save_users(users)
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Tariff search endpoint
+# ---------------------------------------------------------------------------
+@app.get("/tariff/search")
+async def tariff_search(q: str = "", _: str = Depends(require_auth)):
+    if not q.strip():
+        return []
+    url = f"https://www.trade-tariff.service.gov.uk/api/v2/search?q={q}&per_page=15"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(url)
+            if r.status_code != 200:
+                return []
+            data = r.json()
+            results = []
+            for item in data.get("data", []):
+                attrs = item.get("attributes", {})
+                code = attrs.get("goods_nomenclature_item_id") or attrs.get("id", "")
+                desc = attrs.get("description") or attrs.get("formatted_description", "")
+                # Strip HTML tags from description
+                desc = re.sub(r"<[^>]+>", "", desc)
+                if code and desc:
+                    results.append({
+                        "code": code,
+                        "description": desc,
+                        "duty": attrs.get("applicable_duty_string", ""),
+                        "vat": "20%",
+                    })
+            return results[:15]
+    except Exception:
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Memory refresh-tariff endpoint
+# ---------------------------------------------------------------------------
+@app.post("/memory/refresh-tariff")
+async def refresh_memory_tariff(_: str = Depends(require_auth)):
+    memory = load_memory()
+    updated = 0
+    for key, entry in memory.items():
+        if not entry.get("tariff"):
+            code = entry.get("code", "")
+            if code:
+                info = await lookup_tariff(code)
+                if info:
+                    entry["tariff"] = info
+                    updated += 1
+    save_memory(memory)
+    return {"updated": updated}
+
+
+@app.post("/upload")
+async def upload_invoice(file: UploadFile = File(...), _: str = Depends(require_auth)):
+    _reset_daily()
+    ext = Path(file.filename).suffix.lower()
+    mime = MIME_MAP.get(ext)
+    if not mime:
+        raise HTTPException(400, f"Unsupported file type: {ext}")
+
+    job_id = str(uuid.uuid4())
+    safe_name = re.sub(r"[^\w\-.]", "_", file.filename)
+    dest = UPLOADS_DIR / f"{job_id}_{safe_name}"
+    content = await file.read()
+    dest.write_bytes(content)
+
+    with _lock:
+        jobs[job_id] = {
+            "id": job_id,
+            "filename": file.filename,
+            "status": "running",
+            "progress": 0,
+            "step": "Queued…",
+            "created_at": datetime.now().isoformat(),
+            "invoice_id": None,
+            "error": None,
+        }
+
+    t = threading.Thread(target=_run_pipeline, args=(job_id, dest, file.filename, mime), daemon=True)
+    t.start()
+
+    return {"job_id": job_id}
+
+
+@app.get("/jobs")
+def list_jobs(_: str = Depends(require_auth)):
+    _reset_daily()
+    with _lock:
+        return list(jobs.values())
+
+
+@app.get("/stats")
+def get_stats(_: str = Depends(require_auth)):
+    _reset_daily()
+    memory = load_memory()
+    pending = sum(1 for v in memory.values() if not v.get("confirmed", True))
+    total = len(invoices)
+    verified = sum(1 for v in invoices.values() if v["status"] == "verified")
+    rate = round(verified / total * 100) if total else 0
+    with _lock:
+        return {
+            "processed_today": processed_today,
+            "verification_rate": rate,
+            "memory_count": len(memory),
+            "memory_pending": pending,
+        }
+
+
+@app.get("/invoices")
+def list_invoices(_: str = Depends(require_auth)):
+    with _lock:
+        result = []
+        for inv in invoices.values():
+            result.append({
+                "id": inv["id"],
+                "supplier": inv["supplier"],
+                "filename": inv["filename"],
+                "date": inv["date"],
+                "value": inv["value"],
+                "status": inv["status"],
+            })
+        return sorted(result, key=lambda x: x["date"], reverse=True)
+
+
+@app.get("/invoices/{invoice_id}/export/full")
+def export_full(invoice_id: str, _: str = Depends(require_auth)):
+    with _lock:
+        inv = invoices.get(invoice_id)
+    if not inv:
+        raise HTTPException(404, "Invoice not found")
+    path = Path(inv["full_xlsx"])
+    if not path.exists():
+        raise HTTPException(404, "Excel file not found")
+    return FileResponse(
+        path=str(path),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=path.name,
+    )
+
+
+@app.get("/invoices/{invoice_id}/export/raw")
+def export_raw(invoice_id: str, _: str = Depends(require_auth)):
+    with _lock:
+        inv = invoices.get(invoice_id)
+    if not inv:
+        raise HTTPException(404, "Invoice not found")
+    path = Path(inv["raw_xlsx"])
+    if not path.exists():
+        raise HTTPException(404, "Excel file not found")
+    return FileResponse(
+        path=str(path),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=path.name,
+    )
+
+
+@app.post("/invoices/{invoice_id}/retry")
+async def retry_invoice(invoice_id: str, _: str = Depends(require_auth)):
+    with _lock:
+        inv = invoices.get(invoice_id)
+    if not inv:
+        raise HTTPException(404, "Invoice not found")
+
+    # Find original upload
+    original_file = inv["filename"]
+    # Look for matching file in uploads
+    matches = list(UPLOADS_DIR.glob(f"*_{re.sub(r'[^\\w\\-.]', '_', original_file)}"))
+    if not matches:
+        raise HTTPException(404, "Original upload not found")
+
+    file_path = matches[-1]
+    ext = file_path.suffix.lower()
+    mime = MIME_MAP.get(ext, "application/pdf")
+
+    job_id = str(uuid.uuid4())
+    with _lock:
+        jobs[job_id] = {
+            "id": job_id,
+            "filename": original_file,
+            "status": "running",
+            "progress": 0,
+            "step": "Retrying…",
+            "created_at": datetime.now().isoformat(),
+            "invoice_id": None,
+            "error": None,
+        }
+        # Remove old invoice entry
+        del invoices[invoice_id]
+
+    t = threading.Thread(target=_run_pipeline, args=(job_id, file_path, original_file, mime), daemon=True)
+    t.start()
+
+    return {"job_id": job_id}
+
+
+@app.post("/invoices/{invoice_id}/resolve")
+async def resolve_invoice(invoice_id: str, body: dict = {}, _: str = Depends(require_auth)):
+    """Mark a subcode_needed invoice as verified after manual review."""
+    with _lock:
+        inv = invoices.get(invoice_id)
+    if not inv:
+        raise HTTPException(404, "Invoice not found")
+    subcode = body.get("subcode", "")
+
+    # Update product memory entries for this invoice
+    memory = load_memory()
+    for key, entry in memory.items():
+        if entry.get("code", "") in [r.get("Comm./imp. cod","") for r in inv.get("rows", [])]:
+            entry["confirmed"] = True
+            if subcode:
+                entry["code"] = subcode
+    save_memory(memory)
+
+    # Regenerate Excel with updated status
+    with _lock:
+        invoices[invoice_id]["status"] = "verified"
+
+    return {"ok": True}
+
+
+@app.get("/memory")
+def list_memory(_: str = Depends(require_auth)):
+    memory = load_memory()
+    return [{"key": k, **v} for k, v in memory.items()]
+
+
+@app.post("/memory/{name}/confirm")
+def confirm_memory(name: str, body: dict = {}, _: str = Depends(require_auth)):
+    memory = load_memory()
+    if name not in memory:
+        raise HTTPException(404, "Memory entry not found")
+    subcode = body.get("subcode", "")
+    memory[name]["confirmed"] = True
+    if subcode:
+        memory[name]["code"] = subcode
+    save_memory(memory)
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Static files (must be last)
+# ---------------------------------------------------------------------------
+app.mount("/", StaticFiles(directory=str(BASE_DIR / "static"), html=True), name="static")

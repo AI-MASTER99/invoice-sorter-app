@@ -1,0 +1,38 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(py --version)",
+      "Bash(py -c \"import uvicorn; print\\('uvicorn ok'\\)\")",
+      "Bash(/c/Users/pol/AppData/Local/Microsoft/WindowsApps/python.exe --version)",
+      "Bash(/c/Users/pol/AppData/Local/Microsoft/WindowsApps/python.exe -m pip --version)",
+      "Read(//c/Users/pol/AppData/Local/Programs//**)",
+      "Read(//c/Users/pol/AppData/Roaming/**)",
+      "Read(//c/Users/pol/AppData/**)",
+      "Bash(wsl --status)",
+      "Bash(wsl python3:*)",
+      "Bash(wsl which:*)",
+      "Bash(/c/Users/pol/AppData/Local/Programs/Python/Python313/python.exe -m pip install -r requirements.txt)",
+      "mcp__Claude_Preview__preview_start",
+      "Bash(\"/c/Users/pol/AppData/Local/Programs/Python/Python313/python.exe\" \"C:/InvoiceFlow/invoiceflow/uploads/generate_invoice.py\")",
+      "Bash('C:\\\\Users\\\\pol\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python313\\\\python.exe' -m pip install pypdf pdfplumber -q)",
+      "Bash('C:\\\\Users\\\\pol\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python313\\\\python.exe' -c ':*)",
+      "Read(//c/Users/pol/Desktop//**)",
+      "Read(//c/Users/pol/**)",
+      "Bash(ls \"C:\\\\\\\\Users\\\\\\\\pol\\\\\\\\Desktop\\\\\\\\\")",
+      "Bash(dir \"C:\\\\\\\\Users\\\\\\\\pol\\\\\\\\Desktop\\\\\\\\\")",
+      "Bash(grep -i apicella find \"/c/Users/pol/Downloads\" -name \"*picella*\")",
+      "Bash('C:\\\\Users\\\\pol\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python313\\\\python.exe' -u -c ':*)",
+      "Skill(claude-api)",
+      "Skill(claude-api:*)",
+      "Bash(C:\\\\Users\\\\pol\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python313\\\\python.exe -m pip install \"passlib[bcrypt]\" --quiet)",
+      "Bash(/mnt/c/Users/pol/AppData/Local/Programs/Python/Python313/python.exe -m pip install \"passlib[bcrypt]\" --quiet)",
+      "Bash(python3 -m pip install \"passlib[bcrypt]\" --quiet)",
+      "Bash(cmd.exe /c \"py -m pip install passlib[bcrypt] --quiet 2>&1\")",
+      "Bash(cmd.exe /c \"py -m pip install passlib[bcrypt]\")",
+      "Bash(cmd.exe /c \"py -c \\\\\"import passlib; print\\(passlib.__version__\\)\\\\\"\")",
+      "Bash(cmd.exe /c \"py -m pip show passlib 2>&1 && py -c \\\\\"from passlib.context import CryptContext; print\\('OK'\\)\\\\\" 2>&1\")",
+      "Bash(cmd.exe /c \"git status 2>&1\")",
+      "Bash(cmd.exe /c \"git init && git remote add origin https://github.com/AI-MASTER99/invoice-sorter-app.git && git add . && git commit -m \\\\\"Invoice Sorter - full app upload\\\\\" && git branch -M main && git push -u origin main --force 2>&1\")"
+    ]
+  }
+}
