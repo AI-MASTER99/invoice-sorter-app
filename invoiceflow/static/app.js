@@ -1,3 +1,4 @@
+(function(){const _origFetch=window.fetch;window.fetch=function(u,o){o=o||{};const t=localStorage.getItem('auth_token');if(t&&typeof u==='string'){o.headers=Object.assign({'X-Auth-Token':t},o.headers||{});o.credentials=o.credentials||'include';}return _origFetch(u,o);};})();
 /* ============================================================
    Invoice Sorter — frontend app
    ============================================================ */
