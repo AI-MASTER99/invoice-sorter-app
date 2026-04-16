@@ -9,6 +9,7 @@ import base64
 import io
 import json
 import os
+import queue
 import re
 import threading
 import time
@@ -16,7 +17,7 @@ import uuid
 from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv(dotenv_path=Path(__file__).parent / ".env")
+load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=True)
 
 from datetime import date, datetime
 from typing import Any
@@ -33,6 +34,9 @@ from openpyxl.utils import get_column_letter
 from passlib.context import CryptContext
 from starlette.middleware.sessions import SessionMiddleware
 
+# Database layer (Supabase)
+import database as db
+
 # ---------------------------------------------------------------------------
 # Paths & startup
 # ---------------------------------------------------------------------------
@@ -47,143 +51,326 @@ else:
 
 UPLOADS_DIR = _DATA_ROOT / "uploads"
 OUTPUT_DIR  = _DATA_ROOT / "output"
-MEMORY_FILE = _DATA_ROOT / "product_memory.json"
-USERS_FILE  = _DATA_ROOT / "users.json"
+
+# AI model — configurable via .env (default: sonnet for best rate-limit compatibility)
+AI_MODEL = os.environ.get("AI_MODEL", "claude-sonnet-4-6")
 
 for d in (UPLOADS_DIR, OUTPUT_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
-if not MEMORY_FILE.exists():
-    MEMORY_FILE.write_text("{}")
-
 # ---------------------------------------------------------------------------
-# Auth helpers
+# Auth helpers (Supabase-backed, multi-tenant)
 # ---------------------------------------------------------------------------
 _pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
-def load_users() -> dict:
-    if USERS_FILE.exists():
-        try:
-            return json.loads(USERS_FILE.read_text())
-        except Exception:
-            pass
-    # First-run: seed default admin from .env
-    default_pw = os.environ.get("APP_PASSWORD", "changeme")
-    users = {
-        "admin": {
-            "password_hash": _pwd_ctx.hash(default_pw),
-            "role": "admin",
-        }
-    }
-    USERS_FILE.write_text(json.dumps(users, indent=2))
-    return users
-
-
-def save_users(users: dict):
-    USERS_FILE.write_text(json.dumps(users, indent=2))
-
-
 def verify_password(plain: str, hashed: str) -> bool:
-    return _pwd_ctx.verify(plain, hashed)
+    try:
+        return _pwd_ctx.verify(plain, hashed)
+    except Exception:
+        return False
 
 
-def require_auth(request: Request) -> str:
-    user = request.session.get("user")
-    if not user:
+def ensure_default_admin():
+    """Make sure the default admin user exists with a correct password hash.
+    Runs once at startup — idempotent."""
+    existing = db.get_user("admin", db.DEFAULT_COMPANY_ID)
+    default_pw = os.environ.get("APP_PASSWORD", "changeme")
+    new_hash = _pwd_ctx.hash(default_pw)
+    if not existing:
+        db.create_user(db.DEFAULT_COMPANY_ID, "admin", new_hash, "admin")
+    elif existing.get("password_hash", "").startswith("$2b$12$placeholder"):
+        # Schema's seed placeholder — replace with real hash
+        db.update_user_password(existing["id"], new_hash)
+
+
+ensure_default_admin()
+
+
+def require_auth(request: Request) -> dict:
+    """Returns {user_id, username, company_id, role}."""
+    sess_user_id = request.session.get("user_id")
+    if not sess_user_id:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    return user
+    return {
+        "user_id":    sess_user_id,
+        "username":   request.session.get("username", ""),
+        "company_id": request.session.get("company_id", ""),
+        "role":       request.session.get("role", "user"),
+    }
 
 
-def require_admin(request: Request) -> str:
-    user = require_auth(request)
-    users = load_users()
-    if users.get(user, {}).get("role") != "admin":
+def require_admin(request: Request) -> dict:
+    """Admin OR super_admin can access."""
+    ctx = require_auth(request)
+    if ctx["role"] not in ("admin", "super_admin"):
         raise HTTPException(status_code=403, detail="Admin required")
-    return user
+    return ctx
+
+
+def require_super_admin(request: Request) -> dict:
+    """Only super_admin — manages all companies."""
+    ctx = require_auth(request)
+    if ctx["role"] != "super_admin":
+        raise HTTPException(status_code=403, detail="Super admin required")
+    return ctx
 
 # ---------------------------------------------------------------------------
-# In-memory state (thread-safe via a lock)
+# Threading lock (retained for in-process safety, data lives in Supabase)
 # ---------------------------------------------------------------------------
 _lock = threading.Lock()
 
-# jobs: {job_id: {id, filename, status, progress, step, created_at, invoice_id, error}}
-jobs: dict[str, dict] = {}
-
-# invoices: {invoice_id: {...}}
-invoices: dict[str, dict] = {}
-
-# stats counters
-processed_today: int = 0
-_today_date: str = date.today().isoformat()
-
-
-def _reset_daily():
-    global processed_today, _today_date
-    today = date.today().isoformat()
-    if today != _today_date:
-        with _lock:
-            processed_today = 0
-            _today_date = today
-
 
 # ---------------------------------------------------------------------------
-# Product memory helpers
+# Sequential job queue — processes one invoice at a time to respect rate limits
+# Queue carries (job_id, company_id, file_path, original_name, mime, upload_storage_path)
 # ---------------------------------------------------------------------------
-def load_memory() -> dict:
-    try:
-        return json.loads(MEMORY_FILE.read_text())
-    except Exception:
-        return {}
+_job_queue: queue.Queue[tuple[str, str, Path, str, str, str]] = queue.Queue()
 
 
-def save_memory(data: dict):
-    MEMORY_FILE.write_text(json.dumps(data, indent=2))
+def _queue_worker():
+    """Single worker thread that processes jobs from the queue one at a time."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    while True:
+        job_id, company_id, file_path, original_name, mime, upload_storage_path = _job_queue.get()
+        try:
+            db.update_job(job_id, {"status": "running", "step": "Starting…"})
+        except Exception:
+            pass
+        try:
+            loop.run_until_complete(
+                _process_invoice(job_id, company_id, file_path, original_name, mime, upload_storage_path)
+            )
+        except Exception:
+            pass  # _process_invoice handles its own errors
+        finally:
+            _job_queue.task_done()
+
+
+# Start the single worker thread at module load
+_worker_thread = threading.Thread(target=_queue_worker, daemon=True)
+_worker_thread.start()
+
+
+def _enqueue_job(job_id: str, company_id: str, file_path: Path, original_name: str, mime: str, upload_storage_path: str = ""):
+    """Add a job to the processing queue."""
+    _job_queue.put((job_id, company_id, file_path, original_name, mime, upload_storage_path))
 
 
 # ---------------------------------------------------------------------------
 # Tariff lookup
 # ---------------------------------------------------------------------------
+def _extract_duty_vat(data: dict) -> tuple[str, str]:
+    """Extract duty and VAT strings from a UK Tariff API commodity response.
+
+    The API stores duty rates in separate 'duty_expression' items linked to
+    'measure' items via their ID (e.g. measure id "20237627" links to
+    duty_expression id "20237627-duty_expression").
+    """
+    included = data.get("included", [])
+    duty = ""
+    vat = ""
+
+    # Build lookup: duty_expression id → base string
+    duty_exprs: dict[str, str] = {}
+    for item in included:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "duty_expression":
+            attrs = item.get("attributes", {})
+            base = attrs.get("base", "") or ""
+            base = re.sub(r"<[^>]+>", "", base).strip()
+            if base:
+                duty_exprs[item.get("id", "")] = base
+
+    # Find measures and look up their duty expressions
+    for item in included:
+        if not isinstance(item, dict) or item.get("type") != "measure":
+            continue
+        attrs = item.get("attributes", {})
+        # measure_type_description is sometimes nested differently
+        mtype = ""
+        # Try direct attribute first
+        mtype = attrs.get("measure_type_description", "")
+        # Also check relationships for measure_type
+        if not mtype:
+            rels = item.get("relationships", {})
+            mt_data = rels.get("measure_type", {}).get("data", {})
+            mt_id = mt_data.get("id", "") if isinstance(mt_data, dict) else ""
+            # Look up measure_type in included
+            for inc in included:
+                if inc.get("type") == "measure_type" and inc.get("id") == mt_id:
+                    mtype = inc.get("attributes", {}).get("description", "")
+                    break
+
+        # Find linked duty_expression
+        measure_id = item.get("id", "")
+        expr_key = f"{measure_id}-duty_expression"
+        expr_base = duty_exprs.get(expr_key, "")
+
+        # Also check inline duty_expression attribute
+        if not expr_base:
+            inline = attrs.get("duty_expression", {})
+            if isinstance(inline, dict):
+                expr_base = re.sub(r"<[^>]+>", "", inline.get("base", "") or "").strip()
+
+        if "Third country duty" in mtype and not duty and expr_base:
+            duty = expr_base
+        if "VAT" in mtype and not vat:
+            if expr_base:
+                vat = expr_base
+
+    return duty, vat
+
+
+def _extract_commodity_desc(data: dict, code: str) -> str:
+    """Extract the commodity description from included items."""
+    for item in data.get("included", []):
+        if not isinstance(item, dict) or item.get("type") != "commodity":
+            continue
+        attrs = item.get("attributes", {})
+        if attrs.get("goods_nomenclature_item_id") == code:
+            return re.sub(r"<[^>]+>", "", attrs.get("description", "") or "").strip()
+    # Fallback to main data
+    attrs = data.get("data", {}).get("attributes", {})
+    return re.sub(r"<[^>]+>", "", attrs.get("description", "") or "").strip()
+
+
 async def lookup_tariff(commodity_code: str) -> dict:
-    """Query UK Trade Tariff API for duty/VAT rates."""
+    """Query UK Trade Tariff API for duty/VAT rates + possible sub-codes.
+
+    EU invoices use 8-digit codes. The UK API requires 10-digit leaf codes.
+    An 8-digit code padded to 10 is often a non-leaf (parent) node → 404.
+    Strategy:
+      1. Try /commodities/{10-digit} — if 200, it's a leaf → extract duty/vat.
+      2. If 404, try /subheadings/{10-digit}-80 to get all child leaf codes.
+      3. Return description, duty, vat, and subcodes list.
+    """
     code = re.sub(r"\D", "", commodity_code)
     if not code:
         return {}
-    url = f"https://www.trade-tariff.service.gov.uk/api/v2/commodities/{code}"
+    code10 = code.ljust(10, "0")[:10]
+    headers = {"Accept": "application/json"}
+    _empty = {"duty": "N/A", "vat": "0%", "description": "", "subcodes": []}
+
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(url)
-            if r.status_code != 200:
-                return {}
-            data = r.json()
-            # Extract duty and VAT from measures
-            duty = ""
-            vat = ""
-            measures = data.get("included", [])
-            for m in measures:
-                if not isinstance(m, dict):
-                    continue
-                mtype = m.get("attributes", {}).get("measure_type_description", "")
-                duty_expr = m.get("attributes", {}).get("duty_expression", {})
-                if isinstance(duty_expr, dict):
-                    formatted = duty_expr.get("formatted_base", "")
-                else:
-                    formatted = ""
-                if "Third country duty" in mtype and not duty:
-                    duty = formatted
-                if "VAT" in mtype and not vat:
-                    vat = formatted
-            desc = ""
-            attrs = data.get("data", {}).get("attributes", {})
-            if attrs:
-                desc = attrs.get("description", "")
-            return {
-                "description": desc,
-                "duty": duty or "N/A",
-                "vat": vat or "20%",
-            }
+        async with httpx.AsyncClient(timeout=15) as client:
+            # Step 1: try direct commodity lookup
+            r = await client.get(
+                f"https://www.trade-tariff.service.gov.uk/api/v2/commodities/{code10}",
+                headers=headers,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                duty, vat = _extract_duty_vat(data)
+                attrs = data.get("data", {}).get("attributes", {})
+                desc = re.sub(r"<[^>]+>", "", attrs.get("description", ""))
+                return {
+                    "description": desc.strip(),
+                    "duty": duty or "N/A",
+                    "vat": vat or "0%",
+                    "subcodes": [{
+                        "code": code10,
+                        "description": desc.strip(),
+                        "duty": duty or "N/A",
+                    }],
+                }
+
+            # Step 2: non-leaf → get subheading children
+            r2 = await client.get(
+                f"https://www.trade-tariff.service.gov.uk/api/v2/subheadings/{code10}-80",
+                headers=headers,
+            )
+            if r2.status_code == 200:
+                data2 = r2.json()
+                # Collect child commodity codes from included[]
+                subcodes = []
+                included = data2.get("included", [])
+
+                # Build a map of commodity IDs to their measures
+                measures_by_commodity: dict[str, str] = {}
+                for item in included:
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("type") == "measure":
+                        attrs = item.get("attributes", {})
+                        mtype = attrs.get("measure_type_description", "")
+                        if "Third country duty" in mtype:
+                            duty_expr = attrs.get("duty_expression", {})
+                            if isinstance(duty_expr, dict):
+                                base = re.sub(r"<[^>]+>", "", duty_expr.get("base", "") or "").strip()
+                                if base:
+                                    # Link to parent commodity via relationships
+                                    sid = item.get("id", "")
+                                    measures_by_commodity[sid] = base
+
+                for item in included:
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("type") != "commodity":
+                        continue
+                    attrs = item.get("attributes", {})
+                    item_code = attrs.get("goods_nomenclature_item_id", "")
+                    item_desc = re.sub(r"<[^>]+>", "", attrs.get("description", "") or "").strip()
+                    leaf = attrs.get("leaf", False)
+                    if item_code and leaf:
+                        subcodes.append({
+                            "code": item_code,
+                            "description": item_desc,
+                            "duty": "N/A",  # Will try to fill below
+                        })
+
+                # Fetch duty + description for each leaf sub-code (max 8)
+                first_vat = "0%"
+                for sc in subcodes[:8]:
+                    try:
+                        rs = await client.get(
+                            f"https://www.trade-tariff.service.gov.uk/api/v2/commodities/{sc['code']}",
+                            headers=headers,
+                        )
+                        if rs.status_code == 200:
+                            ds = rs.json()
+                            d, v = _extract_duty_vat(ds)
+                            sc["duty"] = d or "N/A"
+                            if not first_vat or first_vat == "0%":
+                                first_vat = v or "0%"
+                            # Get description from the commodity response
+                            cdesc = _extract_commodity_desc(ds, sc["code"])
+                            if cdesc:
+                                sc["description"] = cdesc
+                    except Exception:
+                        pass
+
+                attrs2 = data2.get("data", {}).get("attributes", {})
+                desc2 = re.sub(r"<[^>]+>", "", attrs2.get("description", "") or "").strip()
+                first_duty = subcodes[0]["duty"] if subcodes else "N/A"
+                return {
+                    "description": desc2,
+                    "duty": first_duty,
+                    "vat": first_vat,
+                    "subcodes": subcodes[:10],
+                }
+
+            # Step 3: fallback to heading
+            r4 = await client.get(
+                f"https://www.trade-tariff.service.gov.uk/api/v2/headings/{code[:4]}",
+                headers=headers,
+            )
+            if r4.status_code == 200:
+                data4 = r4.json()
+                attrs4 = data4.get("data", {}).get("attributes", {})
+                desc4 = re.sub(r"<[^>]+>", "", attrs4.get("description", "") or "").strip()
+                return {
+                    "description": desc4,
+                    "duty": "N/A",
+                    "vat": "0%",
+                    "subcodes": [],
+                }
+
+            return _empty
     except Exception:
-        return {}
+        return {"duty": "N/A", "vat": "0%", "description": "", "subcodes": []}
 
 
 # ---------------------------------------------------------------------------
@@ -191,8 +378,16 @@ async def lookup_tariff(commodity_code: str) -> dict:
 # ---------------------------------------------------------------------------
 PROMPT_EXTRACT = """DATA EXTRACTION — STEP 1
 
+CRITICAL OUTPUT RULE — READ FIRST
+Your entire response must be ONLY a TSV table. No thinking, no explanations,
+no comments, no lists, no prose, no markdown. The very first character of
+your response must be the letter "I" (from "Invoice" in the header row).
+The very last character must be the final value of the last row.
+If you write ANY text outside the TSV table, the output is unusable.
+Do not describe what you are doing. Just output the table.
+
 Goal
-Extract all line items from the attached invoice into ONE table,
+Extract all line items from the attached invoice into ONE TSV table,
 following the exact column order and rules below.
 
 Hard rules (strict — no guessing)
@@ -204,18 +399,37 @@ Hard rules (strict — no guessing)
 
 Output format
 - TAB-SEPARATED VALUES (TSV) only.
-- First row = header row.
+- First row = header row exactly: Invoice\tComm./imp. cod\tDescription of Goods\tOrigin\tCountry\tNumber of Packages\tGross Weight (KG)\tNet Weight (KG)\tValue
 - No explanations, comments, or text outside the table.
+- No markdown code fences. No ``` anywhere.
 
 Columns (exactly in this order)
-1. Invoice            Invoice number exactly as shown.
+1. Invoice            The invoice/document number (Fattura Nr, Invoice No, Nr, Rechnung-Nr).
+                      Look near headers like "FATTURA", "INVOICE", "Fattura Accompagnatoria".
+                      It is NOT the client reference (ns/rif), NOT the customer number (cliente),
+                      NOT a monetary amount. It is usually a short alphanumeric code
+                      (e.g. "SE 2692", "FAT/2026/001", "INV-12345").
+                      Use the SAME invoice number for every row from the same document.
 2. Comm./imp. cod     HS/commodity code — see formatting rules below.
 3. Description of Goods   Product description exactly as written. Blank if absent.
 4. Origin             Country of origin — ISO Alpha-2 (e.g. IT, ES, CN).
 5. Country            Full English country name matching the ISO code.
-6. Number of Packages     Leave blank if not mentioned.
-7. Gross Weight (KG)  In KG only. Blank if not in KG or not given.
-8. Net Weight (KG)    In KG only. Blank if not in KG or not given.
+6. Number of Packages     Number of SHIPPING PACKAGES / CARTONS / COLLI for that line.
+                          This is the physical package count — look for columns labelled
+                          "Colli", "Numero Colli", "Cartons", "Packages", "Pkgs", "Colis",
+                          "Kartons", "Pallets", "CT", "Boxes". It is NOT the unit quantity
+                          (pieces, bottles, pcs, stuks, pz, units) and NOT the order qty.
+                          If the invoice only shows a total NUMERO COLLI at the bottom and
+                          no per-line package count, leave this BLANK for every line.
+                          Never compute it from unit quantity.
+7. Gross Weight (KG)  Take the value from the invoice's GROSS WEIGHT column only
+                      ("Peso Lordo", "Gross Weight", "Brutto", "Poids Brut", "G.W.").
+                      In KG only. Do NOT calculate from unit weight × quantity.
+                      Blank if the line has no gross weight column entry.
+8. Net Weight (KG)    Take the value from the invoice's NET WEIGHT column only
+                      ("Peso Netto", "Net Weight", "Netto", "Poids Net", "N.W.").
+                      In KG only. Do NOT calculate from unit weight × quantity.
+                      Blank if the line has no net weight column entry.
 9. Value              Line total with currency symbol (€ / $ / £). 2 decimals.
 
 Commodity code formatting rules
@@ -233,7 +447,8 @@ Step 2 — Apply the correct digit length:
 Sorting: by Invoice (ascending) → Commodity code (ascending, numeric).
 
 Grouping: merge rows where Invoice + Commodity code + Description + Origin are identical.
-For merged rows SUM: packages, gross weight, net weight, value.
+For merged rows SUM: gross weight, net weight, value, and packages (only if
+packages were filled per line — otherwise keep blank).
 All numeric values: 2 decimals. Values must be numbers (positive or negative).
 """
 
@@ -242,6 +457,35 @@ PROMPT_VERIFY = (
     "Read the invoice fresh — do not reference any previous result.\n\n"
     + PROMPT_EXTRACT
 )
+
+PROMPT_TOTALS = """INVOICE TOTALS EXTRACTION
+
+Look ONLY at the invoice's SUMMARY / FOOTER / TOTALS section — the part where
+the invoice reports its own grand totals. Common labels:
+  • Total packages / Numero Colli / Total Colli / Total Cartons / Total Pkgs
+  • Total Gross Weight / Peso Lordo Totale / Brutto Totale / Total G.W.
+  • Total Net Weight / Peso Netto Totale / Netto Totale / Total N.W.
+  • Total / Totale / Total Amount / Grand Total / Importo Totale / Invoice Total
+
+Report the values EXACTLY as they appear in that summary — do NOT compute or
+sum them yourself from line items.
+
+OUTPUT FORMAT — STRICT
+Your entire response must be ONLY these 4 lines, in this exact order,
+with a TAB between key and value. No prose, no explanations, no markdown.
+If a value is not explicitly shown in the summary, leave it blank after the tab.
+
+total_packages\t<number or blank>
+total_gross_kg\t<number in KG or blank>
+total_net_kg\t<number in KG or blank>
+total_value\t<number with currency symbol or blank>
+
+Rules:
+- Numbers only (plus currency symbol on total_value). No units like "KG" or "colli".
+- Use a dot as decimal separator (e.g. 1234.56).
+- If the invoice shows "NUMERO COLLI 705", output: total_packages\t705
+- Never guess. Blank is better than wrong.
+"""
 
 COLUMNS = [
     "Invoice",
@@ -304,17 +548,151 @@ def normalise_row(row: dict) -> dict:
     return out
 
 
-def rows_match(a: list[dict], b: list[dict]) -> bool:
-    """Check if two extractions match on key numeric/code fields."""
+def _norm_num(s: str) -> str:
+    """Normalize a numeric string for comparison.
+    Handles EU (1.234,56) and US (1,234.56) formats, strips currency symbols.
+    Returns the integer representation (cents-like) for robust comparison."""
+    if not s:
+        return ""
+    cleaned = re.sub(r"[^\d,\.\-]", "", str(s))
+    if not cleaned:
+        return ""
+    # If both . and , present: last one is decimal separator
+    if "," in cleaned and "." in cleaned:
+        if cleaned.rfind(",") > cleaned.rfind("."):
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        else:
+            cleaned = cleaned.replace(",", "")
+    elif "," in cleaned:
+        # Comma only — treat as decimal if 1-2 digits after, else thousands
+        parts = cleaned.split(",")
+        if len(parts) == 2 and len(parts[1]) <= 2:
+            cleaned = cleaned.replace(",", ".")
+        else:
+            cleaned = cleaned.replace(",", "")
+    try:
+        return f"{float(cleaned):.2f}"
+    except ValueError:
+        return ""
+
+
+def _row_key(r: dict) -> tuple:
+    """Stable sort key for a row (commodity code + description)."""
+    return (
+        re.sub(r"\D", "", r.get("Comm./imp. cod", "") or ""),
+        (r.get("Description of Goods", "") or "").strip().lower(),
+    )
+
+
+def rows_match(a: list[dict], b: list[dict]) -> tuple[bool, list[str]]:
+    """Check if two extractions match on key numeric/code fields,
+    after sorting rows so order differences don't cause false mismatches.
+    Returns (match: bool, reasons: list of mismatch descriptions)."""
+    reasons: list[str] = []
     if len(a) != len(b):
-        return False
-    for ra, rb in zip(a, b):
-        for field in ("Comm./imp. cod", "Value", "Gross Weight (KG)", "Net Weight (KG)"):
-            va = re.sub(r"[^\d.]", "", ra.get(field, "") or "")
-            vb = re.sub(r"[^\d.]", "", rb.get(field, "") or "")
+        reasons.append(f"Row count differs: Run A has {len(a)} rows, Run B has {len(b)} rows")
+        return False, reasons
+    sa = sorted(a, key=_row_key)
+    sb = sorted(b, key=_row_key)
+    for i, (ra, rb) in enumerate(zip(sa, sb)):
+        desc_a = (ra.get("Description of Goods", "") or "").strip()[:40]
+        desc_b = (rb.get("Description of Goods", "") or "").strip()[:40]
+        row_label = desc_a or desc_b or f"row {i+1}"
+        # Commodity code: compare digits only
+        ca = re.sub(r"\D", "", ra.get("Comm./imp. cod", "") or "")
+        cb = re.sub(r"\D", "", rb.get("Comm./imp. cod", "") or "")
+        if ca and cb and ca != cb:
+            reasons.append(f"[{row_label}] Code differs: A={ca} vs B={cb}")
+        # Numeric fields: compare normalized values
+        for field in ("Value", "Gross Weight (KG)", "Net Weight (KG)"):
+            va = _norm_num(ra.get(field, ""))
+            vb = _norm_num(rb.get(field, ""))
             if va and vb and va != vb:
-                return False
-    return True
+                reasons.append(f"[{row_label}] {field} differs: A={va} vs B={vb}")
+    return len(reasons) == 0, reasons
+
+
+def parse_totals(raw: str) -> dict:
+    """Parse the Run C totals output into a dict of normalized numbers.
+    Keys: total_packages, total_gross_kg, total_net_kg, total_value.
+    Also keeps total_value_raw (with currency symbol) for display."""
+    out = {
+        "total_packages": "",
+        "total_gross_kg": "",
+        "total_net_kg": "",
+        "total_value": "",
+        "total_value_raw": "",
+    }
+    if not raw:
+        return out
+    for line in raw.strip().splitlines():
+        if "\t" not in line:
+            continue
+        k, v = line.split("\t", 1)
+        k = k.strip().lower()
+        v = v.strip()
+        if k not in out:
+            continue
+        if k == "total_value":
+            out["total_value_raw"] = v
+            out["total_value"] = _norm_num(v)
+        else:
+            out[k] = _norm_num(v)
+    return out
+
+
+def sum_rows_numeric(rows: list[dict], field: str) -> str:
+    """Sum a numeric column across rows, return normalized string (2 decimals)."""
+    total = 0.0
+    any_val = False
+    for r in rows:
+        n = _norm_num(r.get(field, ""))
+        if n:
+            try:
+                total += float(n)
+                any_val = True
+            except ValueError:
+                pass
+    return f"{total:.2f}" if any_val else ""
+
+
+def compare_totals(rows: list[dict], totals: dict) -> dict:
+    """Compare summed rows against invoice totals.
+    Returns a dict per field: {reported, computed, match}.
+    A field with no reported total is skipped (match=None)."""
+    def close(a: str, b: str, tol: float = 0.02) -> bool:
+        """Tolerance: 0.02 absolute for small values, 1% relative for large."""
+        if not a or not b:
+            return False
+        try:
+            fa, fb = float(a), float(b)
+        except ValueError:
+            return False
+        if abs(fa - fb) <= tol:
+            return True
+        if max(abs(fa), abs(fb)) > 0:
+            return abs(fa - fb) / max(abs(fa), abs(fb)) <= 0.01
+        return False
+
+    checks = {}
+    mapping = {
+        "total_value": "Value",
+        "total_gross_kg": "Gross Weight (KG)",
+        "total_net_kg": "Net Weight (KG)",
+        "total_packages": "Number of Packages",
+    }
+    for tkey, rfield in mapping.items():
+        reported = totals.get(tkey, "")
+        computed = sum_rows_numeric(rows, rfield)
+        if not reported:
+            checks[tkey] = {"reported": "", "computed": computed, "match": None}
+        else:
+            checks[tkey] = {
+                "reported": reported,
+                "computed": computed,
+                "match": close(reported, computed),
+            }
+    return checks
 
 
 def extract_value_number(val_str: str) -> float | None:
@@ -327,44 +705,125 @@ def extract_value_number(val_str: str) -> float | None:
         return None
 
 
-async def run_extraction(client: anthropic.AsyncAnthropic, file_bytes: bytes, mime: str, prompt: str) -> str:
-    """Send file + prompt to Claude and return raw text response."""
-    # Encode file as base64 for vision/document
-    b64 = base64.standard_b64encode(file_bytes).decode()
+def extract_pdf_text(file_bytes: bytes) -> str:
+    """Extract plain text from PDF locally (saves ~80% input tokens vs sending raw PDF)."""
+    try:
+        import pdfplumber
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            pages = []
+            for page in pdf.pages:
+                txt = page.extract_text() or ""
+                pages.append(txt)
+            return "\n\n--- PAGE BREAK ---\n\n".join(pages)
+    except Exception:
+        return ""
 
-    # Determine content block type
-    if mime in ("application/pdf",):
-        doc_block = {
-            "type": "document",
-            "source": {"type": "base64", "media_type": mime, "data": b64},
-            "cache_control": {"type": "ephemeral"},
-        }
+
+def extract_pdf_pages(file_bytes: bytes) -> list[str]:
+    """Return extracted text per page as a list."""
+    try:
+        import pdfplumber
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            return [(p.extract_text() or "") for p in pdf.pages]
+    except Exception:
+        return []
+
+
+def chunk_pages(pages: list[str], max_words_per_chunk: int = 1800) -> list[str]:
+    """Group pages into chunks that stay under the rate limit.
+    ~1800 words ≈ 2400 tokens, safely under 10K/min single-request budget."""
+    chunks: list[str] = []
+    current: list[str] = []
+    current_words = 0
+    for p in pages:
+        w = len(p.split())
+        if current and current_words + w > max_words_per_chunk:
+            chunks.append("\n\n--- PAGE BREAK ---\n\n".join(current))
+            current = [p]
+            current_words = w
+        else:
+            current.append(p)
+            current_words += w
+    if current:
+        chunks.append("\n\n--- PAGE BREAK ---\n\n".join(current))
+    return chunks
+
+
+async def run_extraction_text(client: anthropic.AsyncAnthropic, pdf_text: str, prompt: str) -> str:
+    """Run extraction on pre-extracted PDF text with prompt caching.
+    Run A writes cache, Run B reads cache at ~10% cost. Retries on rate limit."""
+    for attempt in range(5):
+        try:
+            message = await client.messages.create(
+                model=AI_MODEL,
+                max_tokens=16000,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"INVOICE TEXT:\n\n{pdf_text}",
+                            "cache_control": {"type": "ephemeral"},
+                        },
+                        {"type": "text", "text": prompt},
+                    ],
+                }],
+            )
+            return message.content[0].text
+        except anthropic.RateLimitError:
+            if attempt == 4:
+                raise
+            await asyncio.sleep(30 + attempt * 15)
+    return ""
+
+
+async def run_extraction(client: anthropic.AsyncAnthropic, file_bytes: bytes, mime: str, prompt: str) -> str:
+    """Send file + prompt to Claude and return raw text response.
+
+    For PDFs: extract text locally first (drastically reduces input tokens).
+    For images: send as vision input.
+    """
+    content_blocks: list = []
+
+    if mime == "application/pdf":
+        pdf_text = extract_pdf_text(file_bytes)
+        if pdf_text.strip():
+            # Send extracted text — cheap and fits within rate limits
+            content_blocks.append({
+                "type": "text",
+                "text": f"INVOICE TEXT (extracted from PDF):\n\n{pdf_text}",
+                "cache_control": {"type": "ephemeral"},
+            })
+        else:
+            # Fallback: send raw PDF if text extraction failed (scanned PDF)
+            b64 = base64.standard_b64encode(file_bytes).decode()
+            content_blocks.append({
+                "type": "document",
+                "source": {"type": "base64", "media_type": mime, "data": b64},
+                "cache_control": {"type": "ephemeral"},
+            })
     elif mime.startswith("image/"):
-        doc_block = {
+        b64 = base64.standard_b64encode(file_bytes).decode()
+        content_blocks.append({
             "type": "image",
             "source": {"type": "base64", "media_type": mime, "data": b64},
             "cache_control": {"type": "ephemeral"},
-        }
+        })
     else:
-        # For DOCX/other, encode as document with PDF media type fallback
-        doc_block = {
+        # DOCX / other
+        b64 = base64.standard_b64encode(file_bytes).decode()
+        content_blocks.append({
             "type": "document",
             "source": {"type": "base64", "media_type": "application/pdf", "data": b64},
             "cache_control": {"type": "ephemeral"},
-        }
+        })
+
+    content_blocks.append({"type": "text", "text": prompt})
 
     message = await client.messages.create(
-        model="claude-opus-4-6",
+        model=AI_MODEL,
         max_tokens=4096,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    doc_block,
-                    {"type": "text", "text": prompt},
-                ],
-            }
-        ],
+        messages=[{"role": "user", "content": content_blocks}],
     )
     return message.content[0].text
 
@@ -476,20 +935,55 @@ def build_excel(rows: list[dict], tariff_data: dict | None, sheet_title: str) ->
     # ── Tariff sheet (full export only) ───────────────────────
     if tariff_data:
         ws2 = wb.create_sheet("Tariff Lookup")
-        tariff_cols = ["Commodity Code", "Description", "Duty Rate", "VAT Rate"]
-        tariff_widths = [20, 50, 20, 15]
+        tariff_cols = ["Invoice Code", "Description", "Duty Rate", "VAT Rate",
+                       "Sub-code", "Sub-code Description", "Sub-code Duty"]
+        tariff_widths = [18, 40, 18, 12, 18, 40, 18]
         for ci, h in enumerate(tariff_cols, start=1):
             c = ws2.cell(row=1, column=ci, value=h)
             c.font = _FONT_HDR
             c.fill = _FILL_HEADER
             c.alignment = Alignment(horizontal="center", vertical="center")
-        for ri, (code, info) in enumerate(tariff_data.items(), start=2):
-            fill = _FILL_ALT if ri % 2 == 0 else None
-            for ci, v in enumerate([code, info.get("description",""), info.get("duty",""), info.get("vat","")], start=1):
-                c = ws2.cell(row=ri, column=ci, value=v)
+
+        row_idx = 2
+        for code, info in tariff_data.items():
+            subcodes = info.get("subcodes", [])
+            num_rows = max(1, len(subcodes))
+            fill = _FILL_ALT if row_idx % 2 == 0 else None
+
+            # Main commodity info (first row of this group)
+            for ci, v in enumerate([code, info.get("description",""),
+                                     info.get("duty",""), info.get("vat","")], start=1):
+                c = ws2.cell(row=row_idx, column=ci, value=v)
                 c.font = _FONT_CELL
                 if fill:
                     c.fill = fill
+
+            # Sub-codes (one per row)
+            for si, sc in enumerate(subcodes):
+                r = row_idx + si
+                if si > 0:
+                    # Fill main columns with empty for merged look
+                    for ci in range(1, 5):
+                        c = ws2.cell(row=r, column=ci)
+                        if fill:
+                            c.fill = fill
+                ws2.cell(row=r, column=5, value=sc.get("code", "")).font = _FONT_CELL
+                ws2.cell(row=r, column=6, value=sc.get("description", "")).font = _FONT_CELL
+                ws2.cell(row=r, column=7, value=sc.get("duty", "")).font = _FONT_CELL
+                for ci in range(5, 8):
+                    if fill:
+                        ws2.cell(row=r, column=ci).fill = fill
+
+            # If no subcodes, still one empty row for sub-code columns
+            if not subcodes:
+                for ci in range(5, 8):
+                    c = ws2.cell(row=row_idx, column=ci, value="—")
+                    c.font = _FONT_CELL
+                    if fill:
+                        c.fill = fill
+
+            row_idx += num_rows
+
         for ci, w in enumerate(tariff_widths, start=1):
             ws2.column_dimensions[get_column_letter(ci)].width = w
 
@@ -499,99 +993,273 @@ def build_excel(rows: list[dict], tariff_data: dict | None, sheet_title: str) ->
 
 
 # ---------------------------------------------------------------------------
+# Subcode matching — ask Claude which sub-code fits the product
+# ---------------------------------------------------------------------------
+async def match_subcodes(
+    client: anthropic.AsyncAnthropic,
+    products: list[dict],
+    tariff_data: dict[str, Any],
+) -> dict[str, dict]:
+    """For each product that has multiple possible sub-codes, ask Claude to
+    pick the best match. Returns {code::description -> {matched_code, matched_desc, duty}}.
+
+    Only calls Claude once with all products batched together.
+    """
+    # Build the prompt with all products that need matching
+    lines = []
+    for row in products:
+        code = row.get("Comm./imp. cod", "").strip()
+        desc = row.get("Description of Goods", "").strip()
+        if not code or not desc:
+            continue
+        tariff = tariff_data.get(code, {})
+        subcodes = tariff.get("subcodes", [])
+        if len(subcodes) < 2:
+            continue  # Only 1 or 0 subcodes → no choice to make
+        key = f"{code}::{desc}"
+        sc_list = " | ".join(
+            f"{s['code']} = {s['description']}" for s in subcodes
+        )
+        lines.append(f"- Product: {desc} (invoice code: {code}) → Options: {sc_list}")
+
+    if not lines:
+        return {}
+
+    prompt = f"""COMMODITY SUB-CODE MATCHING
+
+For each product below, pick the ONE sub-code that best matches the product description.
+Consider what the product actually is — its form, packaging, and characteristics.
+
+Products to classify:
+{chr(10).join(lines)}
+
+OUTPUT FORMAT — STRICT
+One line per product, TAB-separated: invoice_code\\tproduct_description\\tmatched_subcode
+No explanations, no prose. Just the TSV lines.
+
+Example:
+04061030\tMOZZARELLA X3 KG.BUF.DOP\t0406103090
+07020010\tCHERRY IL MARCHIO X3\t0702001007
+"""
+    try:
+        msg = await client.messages.create(
+            model=AI_MODEL,
+            max_tokens=2000,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        result: dict[str, dict] = {}
+        for line in msg.content[0].text.strip().splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 3:
+                inv_code = parts[0].strip()
+                prod_desc = parts[1].strip()
+                matched = parts[2].strip()
+                key = f"{inv_code}::{prod_desc}"
+                # Find the matched subcode info
+                tariff = tariff_data.get(inv_code, {})
+                for sc in tariff.get("subcodes", []):
+                    if sc["code"] == matched:
+                        result[key] = {
+                            "matched_code": matched,
+                            "matched_desc": sc.get("description", ""),
+                            "duty": sc.get("duty", "N/A"),
+                        }
+                        break
+                else:
+                    # Claude returned a code not in our list — store anyway
+                    result[key] = {
+                        "matched_code": matched,
+                        "matched_desc": "",
+                        "duty": "N/A",
+                    }
+        return result
+    except Exception:
+        return {}
+
+
+# ---------------------------------------------------------------------------
 # Background processing pipeline
 # ---------------------------------------------------------------------------
-async def _process_invoice(job_id: str, file_path: Path, original_name: str, mime: str):
-    global processed_today
-
+async def _process_invoice(job_id: str, company_id: str, file_path: Path, original_name: str, mime: str, upload_storage_path: str = ""):
     def update(progress: int, step: str):
-        with _lock:
-            if job_id in jobs:
-                jobs[job_id]["progress"] = progress
-                jobs[job_id]["step"] = step
+        try:
+            db.update_job(job_id, {"progress": progress, "step": step})
+        except Exception:
+            pass
 
-    invoice_id = str(uuid.uuid4())
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     client = anthropic.AsyncAnthropic(api_key=api_key)
 
     try:
         file_bytes = file_path.read_bytes()
 
-        # Steps 1+2 — Run A first (writes prompt cache), then Run B reads cache
-        # Serialized to stay under rate limits; Run B is ~10% cost via cache hit
+        # PDF → local text extraction for cheaper API calls
+        if mime == "application/pdf":
+            pdf_text = extract_pdf_text(file_bytes)
+        else:
+            pdf_text = ""
+
         update(10, "Extracting data (Run A)…")
-        raw_a = await run_extraction(client, file_bytes, mime, PROMPT_EXTRACT)
-        update(35, "Verifying (Run B, cached)…")
-        raw_b = await run_extraction(client, file_bytes, mime, PROMPT_VERIFY)
+        if pdf_text:
+            raw_a = await run_extraction_text(client, pdf_text, PROMPT_EXTRACT)
+        else:
+            raw_a = await run_extraction(client, file_bytes, mime, PROMPT_EXTRACT)
+
+        update(40, "Verifying (Run B, cached)…")
+        if pdf_text:
+            raw_b = await run_extraction_text(client, pdf_text, PROMPT_VERIFY)
+        else:
+            raw_b = await run_extraction(client, file_bytes, mime, PROMPT_VERIFY)
+
         rows_a = [normalise_row(r) for r in parse_tsv(raw_a)]
         rows_b = [normalise_row(r) for r in parse_tsv(raw_b)]
 
-        # Step 3 — Compare, retry up to 3x (only if mismatch)
-        update(60, "Cross-checking extractions…")
-        verified = rows_match(rows_a, rows_b)
+        update(55, "Cross-checking extractions…")
+        ab_match, ab_reasons = rows_match(rows_a, rows_b)
         final_rows = rows_a
-        attempts = 1
-        while not verified and attempts < 3:
-            raw_retry = await run_extraction(client, file_bytes, mime, PROMPT_VERIFY)
-            rows_retry = [normalise_row(r) for r in parse_tsv(raw_retry)]
-            verified = rows_match(rows_a, rows_retry)
-            if verified:
-                final_rows = rows_a
-            attempts += 1
+
+        # Run C — totals from footer
+        update(65, "Reading invoice totals (Run C)…")
+        try:
+            if pdf_text:
+                raw_c = await run_extraction_text(client, pdf_text, PROMPT_TOTALS)
+            else:
+                raw_c = await run_extraction(client, file_bytes, mime, PROMPT_TOTALS)
+        except Exception:
+            raw_c = ""
+        totals = parse_totals(raw_c)
+        totals_check = compare_totals(final_rows, totals)
+
+        totals_ok = all(c["match"] is not False for c in totals_check.values())
+        totals_confirmed = sum(1 for c in totals_check.values() if c["match"] is True)
+        if not totals_ok:
+            verified = False
+        elif totals_confirmed >= 2:
+            verified = True
+        else:
+            verified = ab_match
 
         status = "verified" if verified else "subcode_needed"
 
-        # Step 4 — Tariff lookup
+        # Step 4 — Tariff lookup (use product memory cache first)
         update(80, "Looking up tariff codes…")
+        memory_entries = db.list_memory(company_id)
+        memory_by_key = {
+            f"{m.get('code','')}::{m.get('description','')}": m for m in memory_entries
+        }
+        memory_by_code: dict[str, list[dict]] = {}
+        for m in memory_entries:
+            memory_by_code.setdefault(m.get("code", ""), []).append(m)
+
         tariff_data: dict[str, Any] = {}
         seen_codes: set[str] = set()
         for row in final_rows:
             code = row.get("Comm./imp. cod", "").strip()
-            if code and code not in seen_codes:
-                seen_codes.add(code)
+            if not code or code in seen_codes:
+                continue
+            seen_codes.add(code)
+            cached = None
+            for m in memory_by_code.get(code, []):
+                t = m.get("tariff") or {}
+                if t.get("subcodes"):
+                    cached = t
+                    break
+            if cached:
+                tariff_data[code] = cached
+            else:
                 info = await lookup_tariff(code)
                 tariff_data[code] = info
 
-        # Update product memory
-        memory = load_memory()
+        # Step 4b — Match sub-codes to specific products
+        update(85, "Matching sub-codes to products…")
+        products_to_match = []
         for row in final_rows:
             code = row.get("Comm./imp. cod", "").strip()
             desc = row.get("Description of Goods", "").strip()
-            if code and desc:
-                key = f"{code}::{desc}"
-                tariff_info = tariff_data.get(code, {})
-                if key not in memory:
-                    memory[key] = {
-                        "code": code,
-                        "description": desc,
-                        "confirmed": verified,
-                        "tariff": tariff_info,
-                    }
-                else:
-                    # Update tariff if it was empty before
-                    if not memory[key].get("tariff") and tariff_info:
-                        memory[key]["tariff"] = tariff_info
-                    # Mark confirmed if now verified
-                    if verified:
-                        memory[key]["confirmed"] = True
-        save_memory(memory)
+            if not code or not desc:
+                continue
+            key = f"{code}::{desc}"
+            existing = memory_by_key.get(key) or {}
+            if existing.get("matched_code"):
+                continue  # already matched
+            tariff = tariff_data.get(code, {})
+            if len(tariff.get("subcodes", [])) >= 2:
+                products_to_match.append(row)
 
-        # Step 5 — Generate Excel files
+        matched_codes: dict[str, dict] = {}
+        if products_to_match:
+            matched_codes = await match_subcodes(client, products_to_match, tariff_data)
+
+        # Persist memory updates to database
+        for row in final_rows:
+            code = row.get("Comm./imp. cod", "").strip()
+            desc = row.get("Description of Goods", "").strip()
+            if not code or not desc:
+                continue
+            key = f"{code}::{desc}"
+            existing = memory_by_key.get(key)
+            tariff_info = tariff_data.get(code, {})
+            match_info = matched_codes.get(key, {})
+
+            if existing:
+                updates: dict = {}
+                old_tariff = existing.get("tariff") or {}
+                if not old_tariff or not old_tariff.get("subcodes"):
+                    if tariff_info and tariff_info.get("subcodes"):
+                        updates["tariff"] = tariff_info
+                if match_info and not existing.get("matched_code"):
+                    updates["matched_code"] = match_info["matched_code"]
+                    updates["matched_desc"] = match_info["matched_desc"]
+                    updates["matched_duty"] = match_info["duty"]
+                if verified and not existing.get("confirmed"):
+                    updates["confirmed"] = True
+                if updates:
+                    db.update_memory(existing["id"], company_id, updates)
+            else:
+                entry = {
+                    "code": code,
+                    "description": desc,
+                    "confirmed": verified,
+                    "tariff": tariff_info,
+                }
+                if match_info:
+                    entry["matched_code"] = match_info["matched_code"]
+                    entry["matched_desc"] = match_info["matched_desc"]
+                    entry["matched_duty"] = match_info["duty"]
+                db.upsert_memory(company_id, entry)
+
+        # Step 5 — Generate Excel files + upload to Supabase Storage
         update(95, "Generating Excel files…")
         stem = Path(original_name).stem
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_stem = re.sub(r"[^\w\-]", "_", stem)
-        full_path = OUTPUT_DIR / f"{safe_stem}_{ts}_full.xlsx"
-        raw_path = OUTPUT_DIR / f"{safe_stem}_{ts}_raw.xlsx"
 
         full_bytes = build_excel(final_rows, tariff_data, "Invoice Data")
-        raw_bytes = build_excel(final_rows, None, "Raw Extraction")
+        raw_bytes  = build_excel(final_rows, None, "Raw Extraction")
 
-        full_path.write_bytes(full_bytes)
-        raw_path.write_bytes(raw_bytes)
+        xlsx_mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        full_storage = f"{company_id}/{safe_stem}_{ts}_full.xlsx"
+        raw_storage  = f"{company_id}/{safe_stem}_{ts}_raw.xlsx"
+        db.storage_upload(db.BUCKET_EXPORTS, full_storage, full_bytes, xlsx_mime)
+        db.storage_upload(db.BUCKET_EXPORTS, raw_storage,  raw_bytes,  xlsx_mime)
 
-        # Detect supplier name from first row
-        supplier = final_rows[0].get("Invoice", original_name) if final_rows else original_name
+        # Keep paths pointing to storage (not local disk) so Render deploys work
+        full_path = full_storage
+        raw_path  = raw_storage
+
+        # Detect supplier/invoice label from first row
+        raw_inv = final_rows[0].get("Invoice", "") if final_rows else ""
+        _inv_cleaned = re.sub(r"[^\d]", "", raw_inv)
+        _looks_like_amount = bool(
+            re.match(r"^[\d.,\s]+$", raw_inv.strip())
+            and ("," in raw_inv or "." in raw_inv)
+            and len(_inv_cleaned) > 4
+        )
+        if raw_inv and not _looks_like_amount:
+            supplier = raw_inv
+        else:
+            supplier = re.sub(r"[_\-]+", " ", Path(original_name).stem).strip()
+
         total_value = 0.0
         currency = "€"
         for row in final_rows:
@@ -604,42 +1272,49 @@ async def _process_invoice(job_id: str, file_path: Path, original_name: str, mim
             elif "$" in v:
                 currency = "$"
 
-        with _lock:
-            processed_today += 1
-            invoices[invoice_id] = {
-                "id": invoice_id,
-                "supplier": supplier,
-                "filename": original_name,
-                "date": datetime.now().isoformat(),
-                "value": f"{currency}{total_value:,.2f}",
-                "status": status,
-                "full_xlsx": str(full_path),
-                "raw_xlsx": str(raw_path),
-                "rows": final_rows,
-                "tariff_data": tariff_data,
-            }
-            jobs[job_id]["status"] = "done"
-            jobs[job_id]["invoice_id"] = invoice_id
-            jobs[job_id]["progress"] = 100
-            jobs[job_id]["step"] = "Complete"
+        invoice = db.create_invoice(company_id, {
+            "supplier":       supplier,
+            "filename":       original_name,
+            "date":           datetime.now().isoformat(),
+            "value":          f"{currency}{total_value:,.2f}",
+            "status":         status,
+            "rows":           final_rows,
+            "tariff_data":    tariff_data,
+            "totals":         totals,
+            "totals_check":   totals_check,
+            "ab_match":       ab_match,
+            "ab_reasons":     ab_reasons,
+            "full_xlsx_path": str(full_path),
+            "raw_xlsx_path":  str(raw_path),
+            "upload_path":    upload_storage_path,
+        })
+
+        db.update_job(job_id, {
+            "status":     "done",
+            "invoice_id": invoice["id"],
+            "progress":   100,
+            "step":       "Complete",
+        })
 
     except Exception as exc:
-        with _lock:
-            if job_id in jobs:
-                jobs[job_id]["status"] = "failed"
-                jobs[job_id]["step"] = f"Error: {exc}"
-                jobs[job_id]["progress"] = 0
+        try:
+            db.update_job(job_id, {
+                "status":   "failed",
+                "step":     f"Error: {exc}",
+                "progress": 0,
+                "error":    str(exc),
+            })
+        except Exception:
+            pass
         raise
-
-
-def _run_pipeline(job_id: str, file_path: Path, original_name: str, mime: str):
-    """Thread entry point — runs the async pipeline in its own event loop."""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(_process_invoice(job_id, file_path, original_name, mime))
     finally:
-        loop.close()
+        # Clean up the temp local file (original is safe in Supabase Storage)
+        try:
+            if file_path.exists():
+                file_path.unlink()
+        except Exception:
+            pass
+
 
 
 # ---------------------------------------------------------------------------
@@ -684,13 +1359,70 @@ async def login_page():
 async def api_login(request: Request, body: dict = {}):
     username = (body.get("username") or "").strip().lower()
     password = body.get("password") or ""
-    users = load_users()
-    entry = users.get(username)
-    if not entry or not verify_password(password, entry["password_hash"]):
+    company_name = (body.get("company") or "").strip()
+
+    # If company is provided, look up within that company; else search any
+    company = None
+    if company_name:
+        company = db.get_company_by_name(company_name)
+        if not company:
+            raise HTTPException(status_code=401, detail="Company not found")
+        user = db.get_user(username, company["id"])
+    else:
+        # No company specified — default company only (for backward compat)
+        user = db.get_user(username, db.DEFAULT_COMPANY_ID)
+
+    if not user or not verify_password(password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid username or password")
-    request.session["user"] = username
-    request.session["role"] = entry.get("role", "user")
-    return {"ok": True, "user": username, "role": entry.get("role", "user")}
+
+    request.session["user_id"]    = user["id"]
+    request.session["username"]   = user["username"]
+    request.session["company_id"] = user["company_id"]
+    request.session["role"]       = user.get("role", "user")
+    return {
+        "ok": True,
+        "user": user["username"],
+        "role": user.get("role", "user"),
+        "company_id": user["company_id"],
+    }
+
+
+@app.post("/api/admin/companies")
+async def api_create_company(body: dict = {}, _: dict = Depends(require_super_admin)):
+    """Super-admin only: provision a new customer company + first admin user."""
+    company_name = (body.get("company") or "").strip()
+    username     = (body.get("username") or "").strip().lower()
+    password     = body.get("password") or ""
+    if not company_name or not username or not password:
+        raise HTTPException(400, "Company, username and password are all required")
+    if len(password) < 6:
+        raise HTTPException(400, "Password must be at least 6 characters")
+    if db.get_company_by_name(company_name):
+        raise HTTPException(409, "Company already exists")
+    company = db.create_company(company_name)
+    db.create_user(company["id"], username, _pwd_ctx.hash(password), "admin")
+    return {"ok": True, "company": company}
+
+
+@app.get("/api/admin/companies")
+async def api_list_all_companies(_: dict = Depends(require_super_admin)):
+    """Super-admin: list every company with its users."""
+    companies = db.list_companies()
+    result = []
+    for c in companies:
+        users = db.list_users(c["id"])
+        result.append({**c, "users": users, "user_count": len(users)})
+    return result
+
+
+@app.delete("/api/admin/companies/{company_id}")
+async def api_delete_company(company_id: str, _: dict = Depends(require_super_admin)):
+    """Super-admin: delete a company (cascades to users, invoices, memory, jobs)."""
+    if company_id == db.DEFAULT_COMPANY_ID:
+        raise HTTPException(400, "Cannot delete the default company")
+    # Find super-admin's own company to prevent self-deletion
+    db.sb.table("companies").delete().eq("id", company_id).execute()
+    return {"ok": True}
 
 
 @app.post("/api/logout")
@@ -701,58 +1433,67 @@ async def api_logout(request: Request):
 
 @app.get("/api/me")
 async def api_me(request: Request):
-    user = request.session.get("user")
-    if not user:
+    user_id = request.session.get("user_id")
+    if not user_id:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    return {"user": user, "role": request.session.get("role", "user")}
+    # Enrich with company name
+    user = db.get_user_by_id(user_id)
+    if not user:
+        request.session.clear()
+        raise HTTPException(status_code=401, detail="User no longer exists")
+    company = next(
+        (c for c in db.list_companies() if c["id"] == user["company_id"]),
+        None,
+    )
+    return {
+        "user":       user["username"],
+        "role":       user.get("role", "user"),
+        "company_id": user["company_id"],
+        "company":    company["name"] if company else "",
+    }
 
 
 @app.get("/api/users")
-def api_list_users(current: str = Depends(require_admin)):
-    users = load_users()
-    return [{"username": u, "role": v.get("role", "user")} for u, v in users.items()]
+def api_list_users(ctx: dict = Depends(require_admin)):
+    return db.list_users(ctx["company_id"])
 
 
 @app.post("/api/users")
-async def api_add_user(body: dict = {}, current: str = Depends(require_admin)):
+async def api_add_user(body: dict = {}, ctx: dict = Depends(require_admin)):
     username = (body.get("username") or "").strip().lower()
     password = body.get("password") or ""
     role = body.get("role", "user")
     if not username or not password:
         raise HTTPException(400, "Username and password required")
-    users = load_users()
-    if username in users:
-        raise HTTPException(409, "User already exists")
-    users[username] = {"password_hash": _pwd_ctx.hash(password), "role": role}
-    save_users(users)
+    if db.get_user(username, ctx["company_id"]):
+        raise HTTPException(409, "User already exists in this company")
+    db.create_user(ctx["company_id"], username, _pwd_ctx.hash(password), role)
     return {"ok": True}
 
 
 @app.delete("/api/users/{username}")
-async def api_delete_user(username: str, current: str = Depends(require_admin)):
-    if username == current:
+async def api_delete_user(username: str, ctx: dict = Depends(require_admin)):
+    if username == ctx["username"]:
         raise HTTPException(400, "Cannot delete your own account")
-    users = load_users()
-    if username not in users:
+    target = db.get_user(username, ctx["company_id"])
+    if not target:
         raise HTTPException(404, "User not found")
-    del users[username]
-    save_users(users)
+    db.delete_user(target["id"])
     return {"ok": True}
 
 
 @app.put("/api/users/{username}/password")
-async def api_change_password(username: str, body: dict = {}, current: str = Depends(require_auth)):
-    # Admins can change anyone; users can only change their own
-    users = load_users()
-    if current != username and users.get(current, {}).get("role") != "admin":
+async def api_change_password(username: str, body: dict = {}, ctx: dict = Depends(require_auth)):
+    # Admins can change anyone in their company; users can only change their own
+    if username != ctx["username"] and ctx["role"] != "admin":
         raise HTTPException(403, "Forbidden")
-    if username not in users:
+    target = db.get_user(username, ctx["company_id"])
+    if not target:
         raise HTTPException(404, "User not found")
     new_pw = body.get("password") or ""
     if not new_pw:
         raise HTTPException(400, "Password required")
-    users[username]["password_hash"] = _pwd_ctx.hash(new_pw)
-    save_users(users)
+    db.update_user_password(target["id"], _pwd_ctx.hash(new_pw))
     return {"ok": True}
 
 
@@ -760,32 +1501,47 @@ async def api_change_password(username: str, body: dict = {}, current: str = Dep
 # Tariff search endpoint
 # ---------------------------------------------------------------------------
 @app.get("/tariff/search")
-async def tariff_search(q: str = "", _: str = Depends(require_auth)):
+async def tariff_search(q: str = "", ctx: dict = Depends(require_auth)):
     if not q.strip():
         return []
-    url = f"https://www.trade-tariff.service.gov.uk/api/v2/search?q={q}&per_page=15"
+    url = f"https://www.trade-tariff.service.gov.uk/api/v2/search?q={q.strip()}&per_page=20"
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(url)
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(url, headers={"Accept": "application/json"})
             if r.status_code != 200:
                 return []
             data = r.json()
             results = []
-            for item in data.get("data", []):
-                attrs = item.get("attributes", {})
-                code = attrs.get("goods_nomenclature_item_id") or attrs.get("id", "")
-                desc = attrs.get("description") or attrs.get("formatted_description", "")
-                # Strip HTML tags from description
-                desc = re.sub(r"<[^>]+>", "", desc)
-                if code and desc:
-                    results.append({
-                        "code": code,
-                        "description": desc,
-                        "duty": attrs.get("applicable_duty_string", ""),
-                        "vat": "20%",
-                    })
+
+            # The API returns results under data[] or search_results[]
+            items = data.get("data", [])
+            if not items:
+                # Try alternative response format
+                items = data.get("search_results", {}).get("commodities", [])
+
+            for item in items:
+                if isinstance(item, dict):
+                    attrs = item.get("attributes", item)  # some items have flat structure
+                    code = (
+                        attrs.get("goods_nomenclature_item_id")
+                        or attrs.get("producline_suffix", "")
+                        or item.get("id", "")
+                    )
+                    desc = (
+                        attrs.get("description")
+                        or attrs.get("formatted_description", "")
+                    )
+                    desc = re.sub(r"<[^>]+>", "", str(desc)).strip()
+                    if code and desc and len(code) >= 4:
+                        results.append({
+                            "code": code,
+                            "description": desc,
+                            "duty": attrs.get("applicable_duty_string", "") or "—",
+                            "vat": "20%",
+                        })
+
             return results[:15]
-    except Exception:
+    except Exception as e:
         return []
 
 
@@ -793,205 +1549,229 @@ async def tariff_search(q: str = "", _: str = Depends(require_auth)):
 # Memory refresh-tariff endpoint
 # ---------------------------------------------------------------------------
 @app.post("/memory/refresh-tariff")
-async def refresh_memory_tariff(_: str = Depends(require_auth)):
-    memory = load_memory()
+async def refresh_memory_tariff(ctx: dict = Depends(require_auth)):
+    memory = db.list_memory(ctx["company_id"])
     updated = 0
-    for key, entry in memory.items():
-        if not entry.get("tariff"):
+    for entry in memory:
+        tariff = entry.get("tariff") or {}
+        needs_refresh = (
+            not tariff
+            or not tariff.get("subcodes")
+            or tariff.get("duty") == "N/A"
+        )
+        if needs_refresh:
             code = entry.get("code", "")
             if code:
                 info = await lookup_tariff(code)
-                if info:
-                    entry["tariff"] = info
+                if info and (info.get("subcodes") or info.get("duty") != "N/A"):
+                    db.update_memory(entry["id"], ctx["company_id"], {"tariff": info})
                     updated += 1
-    save_memory(memory)
     return {"updated": updated}
 
 
 @app.post("/upload")
-async def upload_invoice(file: UploadFile = File(...), _: str = Depends(require_auth)):
-    _reset_daily()
+async def upload_invoice(file: UploadFile = File(...), ctx: dict = Depends(require_auth)):
     ext = Path(file.filename).suffix.lower()
     mime = MIME_MAP.get(ext)
     if not mime:
         raise HTTPException(400, f"Unsupported file type: {ext}")
 
-    job_id = str(uuid.uuid4())
     safe_name = re.sub(r"[^\w\-.]", "_", file.filename)
-    dest = UPLOADS_DIR / f"{job_id}_{safe_name}"
     content = await file.read()
-    dest.write_bytes(content)
 
-    with _lock:
-        jobs[job_id] = {
-            "id": job_id,
-            "filename": file.filename,
-            "status": "running",
-            "progress": 0,
-            "step": "Queued…",
-            "created_at": datetime.now().isoformat(),
-            "invoice_id": None,
-            "error": None,
-        }
+    # Store original upload in Supabase Storage, scoped by company
+    storage_path = f"{ctx['company_id']}/{uuid.uuid4()}_{safe_name}"
+    db.storage_upload(db.BUCKET_UPLOADS, storage_path, content, mime)
 
-    t = threading.Thread(target=_run_pipeline, args=(job_id, dest, file.filename, mime), daemon=True)
-    t.start()
+    # Also write a temporary local copy for the queue worker (faster PDF reads)
+    tmp_local = UPLOADS_DIR / f"tmp_{uuid.uuid4()}_{safe_name}"
+    tmp_local.write_bytes(content)
 
-    return {"job_id": job_id}
+    job = db.create_job(ctx["company_id"], {
+        "filename": file.filename,
+        "status":   "queued",
+        "progress": 0,
+        "step":     "Waiting in queue…",
+    })
+    _enqueue_job(job["id"], ctx["company_id"], tmp_local, file.filename, mime, storage_path)
+    return {"job_id": job["id"]}
 
 
 @app.get("/jobs")
-def list_jobs(_: str = Depends(require_auth)):
-    _reset_daily()
-    with _lock:
-        return list(jobs.values())
+def list_jobs(ctx: dict = Depends(require_auth)):
+    raw = db.list_jobs(ctx["company_id"])
+    queued = [j for j in raw if j["status"] == "queued"]
+    queued_ids = [j["id"] for j in queued]
+    result = []
+    for j in raw:
+        entry = {**j}
+        if j["status"] == "queued" and j["id"] in queued_ids:
+            pos = queued_ids.index(j["id"]) + 1
+            entry["queue_position"] = pos
+            entry["queue_total"] = len(queued_ids)
+            entry["step"] = f"In queue ({pos}/{len(queued_ids)})…"
+        result.append(entry)
+    return result
 
 
 @app.get("/stats")
-def get_stats(_: str = Depends(require_auth)):
-    _reset_daily()
-    memory = load_memory()
-    pending = sum(1 for v in memory.values() if not v.get("confirmed", True))
-    total = len(invoices)
-    verified = sum(1 for v in invoices.values() if v["status"] == "verified")
+def get_stats(ctx: dict = Depends(require_auth)):
+    cid = ctx["company_id"]
+    all_invoices = db.list_invoices(cid)
+    total = len(all_invoices)
+    verified = sum(1 for v in all_invoices if v["status"] == "verified")
     rate = round(verified / total * 100) if total else 0
-    with _lock:
-        return {
-            "processed_today": processed_today,
-            "verification_rate": rate,
-            "memory_count": len(memory),
-            "memory_pending": pending,
-        }
+    memory = db.list_memory(cid)
+    pending = sum(1 for m in memory if not m.get("confirmed", False))
+    return {
+        "processed_today":   db.count_jobs_today(cid),
+        "verification_rate": rate,
+        "memory_count":      len(memory),
+        "memory_pending":    pending,
+    }
 
 
 @app.get("/invoices")
-def list_invoices(_: str = Depends(require_auth)):
-    with _lock:
-        result = []
-        for inv in invoices.values():
-            result.append({
-                "id": inv["id"],
-                "supplier": inv["supplier"],
-                "filename": inv["filename"],
-                "date": inv["date"],
-                "value": inv["value"],
-                "status": inv["status"],
-            })
-        return sorted(result, key=lambda x: x["date"], reverse=True)
+def list_invoices(ctx: dict = Depends(require_auth)):
+    invoices_list = db.list_invoices(ctx["company_id"])
+    return [{
+        "id":       inv["id"],
+        "supplier": inv.get("supplier") or "",
+        "filename": inv.get("filename") or "",
+        "date":     inv.get("date") or inv.get("created_at"),
+        "value":    inv.get("value") or "",
+        "status":   inv.get("status") or "",
+    } for inv in invoices_list]
+
+
+@app.get("/invoices/{invoice_id}/debug")
+def invoice_debug(invoice_id: str, ctx: dict = Depends(require_auth)):
+    inv = db.get_invoice(invoice_id, ctx["company_id"])
+    if not inv:
+        raise HTTPException(404, "Invoice not found")
+    rows = inv.get("rows") or []
+    return {
+        "ab_match":     inv.get("ab_match"),
+        "ab_reasons":   inv.get("ab_reasons") or [],
+        "rows_a_count": len(rows),
+        "rows_b_count": len(rows),
+        "totals":       inv.get("totals"),
+        "totals_check": inv.get("totals_check"),
+        "row_count":    len(rows),
+        "rows_preview": rows[:3],
+    }
+
+
+def _stream_storage_file(storage_path: str, suggested_name: str):
+    """Download a file from Supabase Storage and stream it to the client."""
+    from fastapi.responses import Response
+    try:
+        data = db.storage_download(db.BUCKET_EXPORTS, storage_path)
+    except Exception:
+        raise HTTPException(404, "Excel file not found in storage")
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{suggested_name}"'},
+    )
 
 
 @app.get("/invoices/{invoice_id}/export/full")
-def export_full(invoice_id: str, _: str = Depends(require_auth)):
-    with _lock:
-        inv = invoices.get(invoice_id)
+def export_full(invoice_id: str, ctx: dict = Depends(require_auth)):
+    inv = db.get_invoice(invoice_id, ctx["company_id"])
     if not inv:
         raise HTTPException(404, "Invoice not found")
-    path = Path(inv["full_xlsx"])
-    if not path.exists():
+    storage_path = inv.get("full_xlsx_path") or ""
+    if not storage_path:
         raise HTTPException(404, "Excel file not found")
-    return FileResponse(
-        path=str(path),
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename=path.name,
-    )
+    return _stream_storage_file(storage_path, Path(storage_path).name)
 
 
 @app.get("/invoices/{invoice_id}/export/raw")
-def export_raw(invoice_id: str, _: str = Depends(require_auth)):
-    with _lock:
-        inv = invoices.get(invoice_id)
+def export_raw(invoice_id: str, ctx: dict = Depends(require_auth)):
+    inv = db.get_invoice(invoice_id, ctx["company_id"])
     if not inv:
         raise HTTPException(404, "Invoice not found")
-    path = Path(inv["raw_xlsx"])
-    if not path.exists():
+    storage_path = inv.get("raw_xlsx_path") or ""
+    if not storage_path:
         raise HTTPException(404, "Excel file not found")
-    return FileResponse(
-        path=str(path),
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename=path.name,
-    )
+    return _stream_storage_file(storage_path, Path(storage_path).name)
 
 
 @app.post("/invoices/{invoice_id}/retry")
-async def retry_invoice(invoice_id: str, _: str = Depends(require_auth)):
-    with _lock:
-        inv = invoices.get(invoice_id)
+async def retry_invoice(invoice_id: str, ctx: dict = Depends(require_auth)):
+    inv = db.get_invoice(invoice_id, ctx["company_id"])
     if not inv:
         raise HTTPException(404, "Invoice not found")
 
-    # Find original upload
-    original_file = inv["filename"]
-    # Look for matching file in uploads
-    matches = list(UPLOADS_DIR.glob(f"*_{re.sub(r'[^\\w\\-.]', '_', original_file)}"))
-    if not matches:
-        raise HTTPException(404, "Original upload not found")
+    original_file = inv.get("filename") or ""
+    upload_path = inv.get("upload_path") or ""
+    if not upload_path:
+        raise HTTPException(404, "Original upload not found in storage")
 
-    file_path = matches[-1]
-    ext = file_path.suffix.lower()
+    # Download from Supabase Storage to a local temp file
+    try:
+        data = db.storage_download(db.BUCKET_UPLOADS, upload_path)
+    except Exception:
+        raise HTTPException(404, "Original upload could not be downloaded")
+
+    ext = Path(original_file).suffix.lower()
     mime = MIME_MAP.get(ext, "application/pdf")
+    tmp_local = UPLOADS_DIR / f"retry_{uuid.uuid4()}_{re.sub(r'[^\\w\\-.]', '_', original_file)}"
+    tmp_local.write_bytes(data)
 
-    job_id = str(uuid.uuid4())
-    with _lock:
-        jobs[job_id] = {
-            "id": job_id,
-            "filename": original_file,
-            "status": "running",
-            "progress": 0,
-            "step": "Retrying…",
-            "created_at": datetime.now().isoformat(),
-            "invoice_id": None,
-            "error": None,
-        }
-        # Remove old invoice entry
-        del invoices[invoice_id]
-
-    t = threading.Thread(target=_run_pipeline, args=(job_id, file_path, original_file, mime), daemon=True)
-    t.start()
-
-    return {"job_id": job_id}
+    # Create new job + delete old invoice record
+    job = db.create_job(ctx["company_id"], {
+        "filename": original_file,
+        "status":   "queued",
+        "progress": 0,
+        "step":     "Waiting in queue…",
+    })
+    db.delete_invoice(invoice_id, ctx["company_id"])
+    _enqueue_job(job["id"], ctx["company_id"], tmp_local, original_file, mime, upload_path)
+    return {"job_id": job["id"]}
 
 
 @app.post("/invoices/{invoice_id}/resolve")
-async def resolve_invoice(invoice_id: str, body: dict = {}, _: str = Depends(require_auth)):
+async def resolve_invoice(invoice_id: str, body: dict = {}, ctx: dict = Depends(require_auth)):
     """Mark a subcode_needed invoice as verified after manual review."""
-    with _lock:
-        inv = invoices.get(invoice_id)
+    inv = db.get_invoice(invoice_id, ctx["company_id"])
     if not inv:
         raise HTTPException(404, "Invoice not found")
     subcode = body.get("subcode", "")
 
-    # Update product memory entries for this invoice
-    memory = load_memory()
-    for key, entry in memory.items():
-        if entry.get("code", "") in [r.get("Comm./imp. cod","") for r in inv.get("rows", [])]:
-            entry["confirmed"] = True
+    # Confirm all memory entries whose code appears in this invoice's rows
+    row_codes = {r.get("Comm./imp. cod", "") for r in (inv.get("rows") or [])}
+    for code in row_codes:
+        if not code:
+            continue
+        entries = db.get_memory_by_code(ctx["company_id"], code)
+        for e in entries:
+            updates = {"confirmed": True}
             if subcode:
-                entry["code"] = subcode
-    save_memory(memory)
+                updates["matched_code"] = subcode
+            db.update_memory(e["id"], ctx["company_id"], updates)
 
-    # Regenerate Excel with updated status
-    with _lock:
-        invoices[invoice_id]["status"] = "verified"
-
+    db.update_invoice(invoice_id, ctx["company_id"], {"status": "verified"})
     return {"ok": True}
 
 
 @app.get("/memory")
-def list_memory(_: str = Depends(require_auth)):
-    memory = load_memory()
-    return [{"key": k, **v} for k, v in memory.items()]
+def list_memory(ctx: dict = Depends(require_auth)):
+    entries = db.list_memory(ctx["company_id"])
+    # Expose a stable "key" field for backward compat with frontend
+    for e in entries:
+        e["key"] = f"{e.get('code','')}::{e.get('description','')}"
+    return entries
 
 
-@app.post("/memory/{name}/confirm")
-def confirm_memory(name: str, body: dict = {}, _: str = Depends(require_auth)):
-    memory = load_memory()
-    if name not in memory:
-        raise HTTPException(404, "Memory entry not found")
+@app.post("/memory/{entry_id}/confirm")
+def confirm_memory(entry_id: str, body: dict = {}, ctx: dict = Depends(require_auth)):
+    updates: dict = {"confirmed": True}
     subcode = body.get("subcode", "")
-    memory[name]["confirmed"] = True
     if subcode:
-        memory[name]["code"] = subcode
-    save_memory(memory)
+        updates["matched_code"] = subcode
+    db.update_memory(entry_id, ctx["company_id"], updates)
     return {"ok": True}
 
 

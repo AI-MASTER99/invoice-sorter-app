@@ -48,7 +48,13 @@ async function checkAuth() {
     const data = await me.json();
     currentUser = data.user;
     currentRole = data.role;
-    document.getElementById('sidebar-username').textContent = currentUser;
+    const label = data.company ? `${currentUser} · ${data.company}` : currentUser;
+    document.getElementById('sidebar-username').textContent = label;
+    // Show admin panel nav item only for super_admin
+    const navAdmin = document.getElementById('nav-admin');
+    if (navAdmin) {
+      navAdmin.classList.toggle('hidden', currentRole !== 'super_admin');
+    }
   } catch {
     window.location.href = '/login';
   }
@@ -77,12 +83,14 @@ function navigateTo(page) {
     memory:    'Product Memory',
     tariff:    'UK Tariff Lookup',
     settings:  'Settings',
+    admin:     'Admin panel',
   };
   document.getElementById('topbar-title').textContent = titles[page] || page;
 
   if (page === 'invoices') refreshInvoicesPage();
   if (page === 'memory')   refreshMemoryPage();
   if (page === 'settings') refreshSettingsPage();
+  if (page === 'admin')    refreshAdminPage();
 }
 
 document.querySelectorAll('.nav-item[data-page]').forEach(el => {
@@ -142,11 +150,11 @@ const knownJobs = {};
 async function refreshJobs() {
   try {
     const jobs = await api('GET', '/jobs');
-    const active = jobs.filter(j => j.status === 'running');
+    const active = jobs.filter(j => j.status === 'running' || j.status === 'queued');
 
     jobs.forEach(j => {
       const prev = knownJobs[j.id];
-      if (prev && prev.status === 'running') {
+      if (prev && (prev.status === 'running' || prev.status === 'queued')) {
         if (j.status === 'done') {
           toast('Invoice processed successfully!', 'success');
           refreshInvoices();
@@ -165,17 +173,25 @@ async function refreshJobs() {
     if (active.length === 0) { section.classList.remove('visible'); return; }
     section.classList.add('visible');
 
+    // Show running jobs first, then queued
+    const sorted = [...active].sort((a, b) => {
+      if (a.status === 'running' && b.status !== 'running') return -1;
+      if (a.status !== 'running' && b.status === 'running') return 1;
+      return (a.queue_position || 0) - (b.queue_position || 0);
+    });
+
     container.innerHTML = '';
-    active.forEach(job => {
+    sorted.forEach(job => {
+      const isQueued = job.status === 'queued';
       const card = document.createElement('div');
-      card.className = 'job-card';
+      card.className = 'job-card' + (isQueued ? ' job-queued' : '');
       card.innerHTML = `
-        <div class="spinner"></div>
+        <div class="${isQueued ? 'queue-icon' : 'spinner'}">${isQueued ? '⏳' : ''}</div>
         <div class="job-info">
           <div class="job-filename">${escHtml(job.filename)}</div>
           <div class="job-step">${escHtml(job.step || 'Processing…')}</div>
           <div class="job-progress-track">
-            <div class="job-progress-fill" style="width:${job.progress}%"></div>
+            <div class="job-progress-fill${isQueued ? ' queued' : ''}" style="width:${isQueued ? 0 : job.progress}%"></div>
           </div>
         </div>
         <button class="btn-cancel" onclick="cancelJob('${job.id}')">Cancel</button>`;
@@ -368,27 +384,54 @@ function renderMemoryTable(items) {
     container.innerHTML = `<div class="empty-state" style="padding:32px 0"><div class="empty-icon">🧠</div>${query ? 'No products match your search.' : 'No products in memory yet.'}</div>`;
     return;
   }
+
+  let rows = '';
+  for (const m of filtered) {
+    const subs = m.tariff?.subcodes || [];
+    const matchedCode = m.matched_code || '';
+    let subsHtml = '<span style="color:var(--muted)">—</span>';
+    if (subs.length > 0) {
+      subsHtml = subs.map(s => {
+        const isMatch = matchedCode && s.code === matchedCode;
+        return `<div class="subcode-row${isMatch ? ' subcode-matched' : ''}">`
+          + `<span class="code-mono">${escHtml(s.code)}</span> `
+          + `<span class="subcode-desc">${escHtml(s.description)}</span> `
+          + `<span class="subcode-duty">${escHtml(s.duty || '')}</span>`
+          + (isMatch ? ' <span class="match-badge">✓ match</span>' : '')
+          + `</div>`;
+      }).join('');
+    }
+    // Show matched code prominently if available
+    const matchHtml = matchedCode
+      ? `<span class="code-mono matched-code">${escHtml(matchedCode)}</span>`
+      : '<span style="color:var(--muted)">—</span>';
+    const statusBadge = m.confirmed
+      ? '<span class="status-badge badge-verified">✓ Confirmed</span>'
+      : '<span class="status-badge badge-subcode">⚠ Pending</span>';
+    rows += `
+      <tr>
+        <td><span class="code-mono">${escHtml(m.code)}</span></td>
+        <td>${escHtml(m.description)}</td>
+        <td class="tariff-cell">${matchHtml}</td>
+        <td class="tariff-cell">${escHtml(m.tariff?.duty || '—')}</td>
+        <td class="tariff-cell">${escHtml(m.tariff?.vat || '—')}</td>
+        <td class="subcodes-cell">${subsHtml}</td>
+        <td>${statusBadge}</td>
+      </tr>`;
+  }
+
   container.innerHTML = `
     <table class="memory-table">
       <thead><tr>
-        <th>Code</th>
+        <th>Invoice code</th>
         <th>Description</th>
+        <th>Matched sub-code</th>
         <th>Duty</th>
         <th>VAT</th>
+        <th>All possible sub-codes</th>
         <th>Status</th>
       </tr></thead>
-      <tbody>
-        ${filtered.map(m => `
-          <tr>
-            <td><span class="code-mono">${escHtml(m.code)}</span></td>
-            <td>${escHtml(m.description)}</td>
-            <td class="tariff-cell">${escHtml(m.tariff?.duty || '—')}</td>
-            <td class="tariff-cell">${escHtml(m.tariff?.vat || '—')}</td>
-            <td>${m.confirmed
-              ? '<span class="status-badge badge-verified">✓ Confirmed</span>'
-              : '<span class="status-badge badge-subcode">⚠ Pending</span>'}</td>
-          </tr>`).join('')}
-      </tbody>
+      <tbody>${rows}</tbody>
     </table>`;
 }
 
@@ -590,7 +633,7 @@ document.getElementById('btn-upload-topbar').addEventListener('click', () => fil
 document.getElementById('btn-choose').addEventListener('click', () => fileInput.click());
 
 fileInput.addEventListener('change', e => {
-  [...e.target.files].forEach(uploadFile);
+  handleBulkUpload([...e.target.files]);
   fileInput.value = '';
 });
 
@@ -599,22 +642,112 @@ dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-ove
 dropZone.addEventListener('drop', e => {
   e.preventDefault();
   dropZone.classList.remove('drag-over');
-  [...e.dataTransfer.files].forEach(uploadFile);
+  handleBulkUpload([...e.dataTransfer.files]);
 });
 
-async function uploadFile(file) {
+async function handleBulkUpload(files) {
   const allowed = ['.pdf','.jpg','.jpeg','.png','.docx'];
-  const ext = file.name.substring(file.name.lastIndexOf('.')).toLowerCase();
-  if (!allowed.includes(ext)) { toast(`Unsupported file type: ${ext}`, 'error'); return; }
-  const fd = new FormData();
-  fd.append('file', file);
-  try {
-    const r = await api('POST', '/upload', fd);
-    knownJobs[r.job_id] = { id: r.job_id, status: 'running' };
-    toast(`Processing ${file.name}…`, 'info');
-    refreshJobs();
-  } catch (e) { toast('Upload failed: ' + e.message, 'error'); }
+  const valid = files.filter(f => {
+    const ext = f.name.substring(f.name.lastIndexOf('.')).toLowerCase();
+    if (!allowed.includes(ext)) { toast(`Skipped ${f.name} — unsupported type`, 'error'); return false; }
+    return true;
+  });
+  if (valid.length === 0) return;
+
+  if (valid.length > 1) {
+    toast(`Uploading ${valid.length} invoices — they'll be processed one at a time`, 'info');
+  }
+
+  let queued = 0;
+  for (const file of valid) {
+    try {
+      const fd = new FormData();
+      fd.append('file', file);
+      const r = await api('POST', '/upload', fd);
+      knownJobs[r.job_id] = { id: r.job_id, status: 'queued' };
+      queued++;
+    } catch (e) { toast(`Upload failed for ${file.name}: ${e.message}`, 'error'); }
+  }
+
+  if (queued === 1) {
+    toast(`Processing ${valid[0].name}…`, 'info');
+  } else if (queued > 1) {
+    toast(`${queued} invoices queued for processing`, 'success');
+  }
+  refreshJobs();
 }
+
+/* ── Admin panel (super_admin only) ──────────────────────── */
+async function refreshAdminPage() {
+  if (currentRole !== 'super_admin') return;
+  try {
+    const companies = await api('GET', '/api/admin/companies');
+    document.getElementById('admin-company-count').textContent =
+      companies.length > 0 ? `(${companies.length})` : '';
+    const container = document.getElementById('admin-companies-list');
+    if (!companies || companies.length === 0) {
+      container.innerHTML = `<div style="color:var(--muted);font-size:13px">No companies yet.</div>`;
+      return;
+    }
+    let html = '<table class="memory-table"><thead><tr>'
+      + '<th>Company</th><th>Users</th><th>Created</th><th></th></tr></thead><tbody>';
+    for (const c of companies) {
+      const usersList = c.users.map(u => `${escHtml(u.username)} (${escHtml(u.role)})`).join(', ');
+      const created   = fmtDate(c.created_at);
+      const isSelf    = c.users.some(u => u.role === 'super_admin' && u.username === currentUser);
+      const delBtn    = isSelf
+        ? '<span style="color:var(--muted);font-size:11px">(your company)</span>'
+        : `<button class="btn-export btn-retry" onclick="deleteCompany('${c.id}', '${escHtml(c.name)}')">Delete</button>`;
+      html += `<tr>
+        <td><strong>${escHtml(c.name)}</strong></td>
+        <td style="color:var(--muted);font-size:12px">${usersList || '—'}</td>
+        <td>${created}</td>
+        <td style="text-align:right">${delBtn}</td>
+      </tr>`;
+    }
+    html += '</tbody></table>';
+    container.innerHTML = html;
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+async function deleteCompany(companyId, companyName) {
+  if (!confirm(`Permanently delete "${companyName}" and ALL their data (invoices, memory, users)?\n\nThis cannot be undone.`)) return;
+  try {
+    await api('DELETE', `/api/admin/companies/${companyId}`);
+    toast(`Deleted ${companyName}`, 'success');
+    refreshAdminPage();
+  } catch (e) { toast('Delete failed: ' + e.message, 'error'); }
+}
+
+document.getElementById('btn-create-company')?.addEventListener('click', async () => {
+  const company  = document.getElementById('admin-new-company').value.trim();
+  const username = document.getElementById('admin-new-username').value.trim();
+  const password = document.getElementById('admin-new-password').value;
+  const msg      = document.getElementById('admin-msg');
+  if (!company || !username || !password) {
+    msg.textContent = 'All fields are required.';
+    msg.className = 'settings-msg error show'; return;
+  }
+  if (password.length < 6) {
+    msg.textContent = 'Password must be at least 6 characters.';
+    msg.className = 'settings-msg error show'; return;
+  }
+  try {
+    await api('POST', '/api/admin/companies', { company, username, password });
+    msg.textContent = `✓ Company "${company}" created. Share credentials with the customer.`;
+    msg.className = 'settings-msg success show';
+    document.getElementById('admin-new-company').value = '';
+    document.getElementById('admin-new-username').value = '';
+    document.getElementById('admin-new-password').value = '';
+    refreshAdminPage();
+  } catch (e) {
+    msg.textContent = 'Error: ' + e.message;
+    msg.className = 'settings-msg error show';
+  }
+  setTimeout(() => msg.classList.remove('show'), 5000);
+});
 
 /* ── Polling ─────────────────────────────────────────────── */
 function startPolling() {

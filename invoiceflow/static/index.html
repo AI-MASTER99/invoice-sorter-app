@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/style.css?v=3" />
+  <link rel="stylesheet" href="/style.css?v=5" />
 </head>
 <body>
 
@@ -19,7 +19,18 @@
   <aside class="sidebar">
 
     <div class="sidebar-logo">
-      <div class="logo-icon">⚡</div>
+      <div class="logo-icon">
+        <svg viewBox="0 0 40 40" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+          <path d="M11 7 H22 L29 14 V32 a1 1 0 0 1 -1 1 H12 a1 1 0 0 1 -1 -1 Z"
+                fill="rgba(255,255,255,0.18)"
+                stroke="white" stroke-width="2" stroke-linejoin="round"/>
+          <path d="M22 7 V13 a1 1 0 0 0 1 1 H29"
+                fill="none" stroke="white" stroke-width="2" stroke-linejoin="round"/>
+          <line x1="15" y1="19"   x2="25" y2="19"   stroke="white" stroke-width="2" stroke-linecap="round"/>
+          <line x1="15" y1="23.5" x2="22" y2="23.5" stroke="white" stroke-width="2" stroke-linecap="round"/>
+          <line x1="15" y1="28"   x2="24" y2="28"   stroke="white" stroke-width="2" stroke-linecap="round"/>
+        </svg>
+      </div>
       <div><div class="logo-text">Invoice Sorter</div></div>
       <span class="beta-pill">beta</span>
     </div>
@@ -51,6 +62,12 @@
       <div class="nav-item" data-page="settings">
         <span class="icon">⚙</span>
         <span>Settings</span>
+      </div>
+
+      <!-- Super-admin only -->
+      <div class="nav-item hidden" data-page="admin" id="nav-admin">
+        <span class="icon">👑</span>
+        <span>Admin panel</span>
       </div>
     </nav>
 
@@ -324,6 +341,35 @@
 
     </main><!-- /page-settings -->
 
+    <!-- ══════════════════════════════
+         PAGE: ADMIN (super-admin only)
+    ══════════════════════════════ -->
+    <main class="content page-content hidden" id="page-admin">
+
+      <!-- Create new company -->
+      <div class="card" style="margin-bottom:16px">
+        <div class="section-title" style="margin-bottom:4px">Provision new customer</div>
+        <div style="color:var(--muted);font-size:12px;margin-bottom:16px">
+          Create a company and its first admin user. Share the credentials with your customer.
+        </div>
+        <div class="add-user-fields">
+          <input class="settings-input" id="admin-new-company" type="text" placeholder="Company name (e.g. Acme Imports BV)" />
+          <input class="settings-input" id="admin-new-username" type="text" placeholder="Admin username" autocomplete="off" />
+          <input class="settings-input" id="admin-new-password" type="text" placeholder="Temporary password (min 6)" autocomplete="new-password" />
+          <button class="btn-save-user" id="btn-create-company">Create company</button>
+        </div>
+        <div class="settings-msg hidden" id="admin-msg"></div>
+      </div>
+
+      <!-- Companies list -->
+      <div class="card">
+        <div class="section-title" style="margin-bottom:4px">All customers <span id="admin-company-count" style="color:var(--muted);font-size:13px;margin-left:6px"></span></div>
+        <div style="color:var(--muted);font-size:12px;margin-bottom:16px">Every company registered in the system</div>
+        <div id="admin-companies-list"></div>
+      </div>
+
+    </main><!-- /page-admin -->
+
   </div><!-- /main-area -->
 </div><!-- /layout -->
 
@@ -367,6 +413,6 @@
 <!-- TOAST CONTAINER -->
 <div id="toast-container"></div>
 
-<script src="/app.js?v=3"></script>
+<script src="/app.js?v=5"></script>
 </body>
 </html>

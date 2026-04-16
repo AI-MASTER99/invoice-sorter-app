@@ -1,18 +1,44 @@
-# Geheime bestanden — NOOIT naar GitHub
+# ── Environment secrets — NEVER commit ─────────────────
 .env
-users.json
+*.env
+.env.*
 
-# Gegenereerde bestanden
+# ── Legacy local data (now in Supabase) ────────────────
+invoiceflow/users.json
+invoiceflow/product_memory.json
+
+# ── Runtime data (ephemeral on Render, stored in Supabase) ──
 invoiceflow/uploads/
 invoiceflow/output/
-invoiceflow/__pycache__/
-*.pyc
-*.pyo
-.DS_Store
 
-# Python
+# ── Python ─────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
 *.egg-info/
 dist/
 build/
 .venv/
 venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── OS / Editor ────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Claude Code local files ────────────────────────────
+.claude/
+
+# ── Old schema / migration files (keep local only) ─────
+invoiceflow/schema.sql
+invoiceflow/migrate.py

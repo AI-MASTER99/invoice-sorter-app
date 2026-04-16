@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: invoice-sorter
+    runtime: python
+    region: frankfurt
+    plan: free
+    buildCommand: pip install -r invoiceflow/requirements.txt
+    startCommand: cd invoiceflow && uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.5"
+      # Real secrets are configured in the Render dashboard, NOT in this file
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: SECRET_KEY
+        sync: false
+      - key: APP_PASSWORD
+        sync: false
+      - key: AI_MODEL
+        value: claude-sonnet-4-6
+    autoDeploy: true
