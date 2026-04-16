@@ -1,4 +1,4 @@
-# v1776278049645
+# v1776278049645 - supabase migration
 import asyncio
 import base64
 import io
@@ -23,6 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from starlette.middleware.sessions import SessionMiddleware
+from supabase import create_client, Client
 
 BASE_DIR = Path(__file__).parent.parent / "invoiceflow"
 _ON_VERCEL = os.environ.get("VERCEL") == "1"
@@ -32,42 +33,34 @@ else:
     _DATA_ROOT = BASE_DIR
 UPLOADS_DIR = _DATA_ROOT / "uploads"
 OUTPUT_DIR = _DATA_ROOT / "output"
-MEMORY_FILE = _DATA_ROOT / "product_memory.json"
 USERS_FILE = _DATA_ROOT / "users.json"
 for d in (UPLOADS_DIR, OUTPUT_DIR):
     d.mkdir(parents=True, exist_ok=True)
-if not MEMORY_FILE.exists():
-    MEMORY_FILE.write_text("{}")
 
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+STORAGE_BUCKET = "invoice-exports"
+_supabase: Client | None = None
 
-def _verify_token(token: str) -> str:
-    import hmac, hashlib, time
-    if not token: return ""
-    parts = token.split(":")
-    if len(parts) != 3: return ""
-    u, ts, sig = parts
-    try:
-        if int(time.time()) - int(ts) > 43200: return ""
-    except: return ""
-    secret = os.environ.get("SECRET_KEY","dev-secret")
-    expected = hmac.new(secret.encode(), f"{u}:{ts}".encode(), hashlib.sha256).hexdigest()
-    return u if hmac.compare_digest(sig, expected) else ""
-def load_users() -> dict:
+def get_supabase():
+    global _supabase
+    if _supabase is None and SUPABASE_URL and SUPABASE_KEY:
+        try:
+            _supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        except Exception as e:
+            print(f"[supabase] init failed: {e}")
+            _supabase = None
+    return _supabase
+
+def load_users():
     default_user = os.environ.get("APP_USERNAME", "admin")
     default_pw = os.environ.get("APP_PASSWORD", "changeme")
-    return {
-        default_user: {
-            "password": default_pw,
-            "role": "admin",
-        }
-    }
-def save_users(users: dict):
-    USERS_FILE.write_text(json.dumps(users, indent=2))
+    return {default_user: {"password": default_pw, "role": "admin"}}
 
-def verify_password(plain: str, hashed: str) -> bool:
+def verify_password(plain, hashed):
     return plain == hashed
 
-def require_auth(request: Request) -> str:
+def require_auth(request):
     user = request.session.get("user")
     if not user:
         import hmac, hashlib, time
@@ -82,18 +75,10 @@ def require_auth(request: Request) -> str:
         raise HTTPException(status_code=401, detail="Not authenticated")
     return user
 
-def require_admin(request: Request) -> str:
-    user = require_auth(request)
-    users = load_users()
-    if users.get(user, {}).get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Admin required")
-    return user
-
 _lock = threading.Lock()
-jobs: dict[str, dict] = {}
-invoices: dict[str, dict] = {}
-processed_today: int = 0
-_today_date: str = date.today().isoformat()
+jobs = {}
+processed_today = 0
+_today_date = date.today().isoformat()
 
 def _reset_daily():
     global processed_today, _today_date
@@ -103,32 +88,126 @@ def _reset_daily():
             processed_today = 0
             _today_date = today
 
-def load_memory() -> dict:
+def load_memory():
+    sb = get_supabase()
+    if not sb: return {}
     try:
-        return json.loads(MEMORY_FILE.read_text())
-    except Exception:
+        res = sb.table("product_memory").select("*").execute()
+        result = {}
+        for row in (res.data or []):
+            key = row.get("key")
+            if not key: continue
+            result[key] = {
+                "code": row.get("code",""),
+                "description": row.get("description",""),
+                "confirmed": row.get("confirmed", False),
+                "tariff": row.get("tariff") or {},
+            }
+        return result
+    except Exception as e:
+        print(f"[load_memory] error: {e}")
         return {}
 
-def save_memory(data: dict):
-    MEMORY_FILE.write_text(json.dumps(data, indent=2))
+def save_memory(data):
+    sb = get_supabase()
+    if not sb: return
+    try:
+        records = []
+        for key, val in data.items():
+            records.append({
+                "key": key,
+                "code": val.get("code",""),
+                "description": val.get("description",""),
+                "confirmed": bool(val.get("confirmed", False)),
+                "tariff": val.get("tariff") or {},
+            })
+        if records:
+            sb.table("product_memory").upsert(records).execute()
+    except Exception as e:
+        print(f"[save_memory] error: {e}")
 
-async def lookup_tariff(commodity_code: str) -> dict:
-    code = re.sub(r"\D", "", commodity_code)
-    if not code:
-        return {}
+def save_processed_invoice(inv):
+    sb = get_supabase()
+    if not sb: return
+    try:
+        sb.table("processed_invoices").upsert({
+            "id": inv["id"],
+            "supplier": inv.get("supplier",""),
+            "filename": inv.get("filename",""),
+            "invoice_date": inv.get("date") or datetime.now().isoformat(),
+            "value": inv.get("value",""),
+            "status": inv.get("status",""),
+            "full_xlsx_path": inv.get("full_xlsx_path",""),
+            "raw_xlsx_path": inv.get("raw_xlsx_path",""),
+            "rows": inv.get("rows") or [],
+            "tariff_data": inv.get("tariff_data") or {},
+            "user_name": inv.get("user_name",""),
+        }).execute()
+    except Exception as e:
+        print(f"[save_invoice] error: {e}")
+
+def list_processed_invoices():
+    sb = get_supabase()
+    if not sb: return []
+    try:
+        res = sb.table("processed_invoices").select("id,supplier,filename,invoice_date,value,status").order("invoice_date", desc=True).execute()
+        return [
+            {"id":r["id"],"supplier":r.get("supplier",""),"filename":r.get("filename",""),
+             "date":r.get("invoice_date",""),"value":r.get("value",""),"status":r.get("status","")}
+            for r in (res.data or [])
+        ]
+    except Exception as e:
+        print(f"[list_invoices] error: {e}")
+        return []
+
+def get_processed_invoice(invoice_id):
+    sb = get_supabase()
+    if not sb: return None
+    try:
+        res = sb.table("processed_invoices").select("*").eq("id", invoice_id).limit(1).execute()
+        rows = res.data or []
+        return rows[0] if rows else None
+    except Exception as e:
+        print(f"[get_invoice] error: {e}")
+        return None
+
+def upload_to_storage(local_path, remote_path):
+    sb = get_supabase()
+    if not sb: return ""
+    try:
+        data = local_path.read_bytes()
+        sb.storage.from_(STORAGE_BUCKET).upload(
+            path=remote_path, file=data,
+            file_options={"content-type":"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet","upsert":"true"}
+        )
+        return remote_path
+    except Exception as e:
+        print(f"[upload_storage] error: {e}")
+        return ""
+
+def download_from_storage(remote_path):
+    sb = get_supabase()
+    if not sb: return None
+    try:
+        return sb.storage.from_(STORAGE_BUCKET).download(remote_path)
+    except Exception as e:
+        print(f"[download_storage] error: {e}")
+        return None
+
+async def lookup_tariff(commodity_code):
+    code = re.sub(r"\\D", "", commodity_code)
+    if not code: return {}
     url = f"https://www.trade-tariff.service.gov.uk/api/v2/commodities/{code}"
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(url)
-            if r.status_code != 200:
-                return {}
+            if r.status_code != 200: return {}
             data = r.json()
             duty = ""
             vat = ""
             measures = data.get("included", [])
             for m in measures:
-                if not isinstance(m, dict):
-                    continue
+                if not isinstance(m, dict): continue
                 mtype = m.get("attributes", {}).get("measure_type_description", "")
                 duty_expr = m.get("attributes", {}).get("duty_expression", {})
                 formatted = duty_expr.get("formatted_base", "") if isinstance(duty_expr, dict) else ""
@@ -148,44 +227,41 @@ Rules: Extract only what is explicitly on the invoice. Leave blank if missing. O
 PROMPT_VERIFY = "Second independent extraction. " + PROMPT_EXTRACT
 COLUMNS = ["Invoice","Comm./imp. cod","Description of Goods","Origin","Country","Number of Packages","Gross Weight (KG)","Net Weight (KG)","Value"]
 
-def parse_tsv(tsv: str) -> list[dict]:
+def parse_tsv(tsv):
     lines = [l for l in tsv.strip().splitlines() if l.strip()]
-    if not lines:
-        return []
+    if not lines: return []
     header_line = 0
     for i, line in enumerate(lines):
         if "Invoice" in line or "Comm" in line:
             header_line = i
             break
-    headers = [h.strip() for h in lines[header_line].split("\t")]
+    headers = [h.strip() for h in lines[header_line].split("\\t")]
     rows = []
     for line in lines[header_line + 1:]:
-        parts = line.split("\t")
+        parts = line.split("\\t")
         while len(parts) < len(headers):
             parts.append("")
         row = {headers[i]: parts[i].strip() for i in range(len(headers))}
         rows.append(row)
     return rows
 
-def normalise_row(row: dict) -> dict:
+def normalise_row(row):
     mapping = {"invoice":"Invoice","comm./imp. cod":"Comm./imp. cod","description of goods":"Description of Goods","origin":"Origin","country":"Country","number of packages":"Number of Packages","gross weight (kg)":"Gross Weight (KG)","net weight (kg)":"Net Weight (KG)","value":"Value"}
     return {mapping.get(k.lower().strip(), k): v for k, v in row.items()}
 
-def rows_match(a: list[dict], b: list[dict]) -> bool:
-    if len(a) != len(b):
-        return False
+def rows_match(a, b):
+    if len(a) != len(b): return False
     for ra, rb in zip(a, b):
         for field in ("Comm./imp. cod","Value","Gross Weight (KG)","Net Weight (KG)"):
-            va = re.sub(r"[^\d.]", "", ra.get(field, "") or "")
-            vb = re.sub(r"[^\d.]", "", rb.get(field, "") or "")
+            va = re.sub(r"[^\\d.]", "", ra.get(field, "") or "")
+            vb = re.sub(r"[^\\d.]", "", rb.get(field, "") or "")
             if va and vb and va != vb:
                 return False
     return True
 
-def extract_value_number(val_str: str):
-    if not val_str:
-        return None
-    cleaned = re.sub(r"[^\d.\-]", "", val_str)
+def extract_value_number(val_str):
+    if not val_str: return None
+    cleaned = re.sub(r"[^\\d.\\-]", "", val_str)
     try:
         return float(cleaned)
     except ValueError:
@@ -199,7 +275,7 @@ _FONT_CELL = Font(name="Calibri", color="000000", size=10)
 _FONT_TOTALS = Font(name="Calibri", bold=True, color="FFFFFF", size=10)
 _COL_CFG = [("Invoice",12,"General","left"),("Comm./imp. cod",18,"@","left"),("Description of Goods",42,"General","left"),("Origin",8,"General","center"),("Country",12,"General","left"),("Number of Packages",8,"#,##0.00","right"),("Gross Weight (KG)",18,"#,##0.00","right"),("Net Weight (KG)",16,"#,##0.00","right"),("Value",14,"\u20ac#,##0.00","right")]
 
-def build_excel(rows: list[dict], tariff_data, sheet_title: str) -> bytes:
+def build_excel(rows, tariff_data, sheet_title):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = sheet_title
@@ -258,7 +334,7 @@ def build_excel(rows: list[dict], tariff_data, sheet_title: str) -> bytes:
     wb.save(buf)
     return buf.getvalue()
 
-async def run_extraction(client, file_bytes: bytes, mime: str, prompt: str) -> str:
+async def run_extraction(client, file_bytes, mime, prompt):
     b64 = base64.standard_b64encode(file_bytes).decode()
     if mime == "application/pdf":
         doc_block = {"type":"document","source":{"type":"base64","media_type":mime,"data":b64},"cache_control":{"type":"ephemeral"}}
@@ -269,7 +345,7 @@ async def run_extraction(client, file_bytes: bytes, mime: str, prompt: str) -> s
     message = await client.messages.create(model="claude-opus-4-6",max_tokens=4096,messages=[{"role":"user","content":[doc_block,{"type":"text","text":prompt}]}])
     return message.content[0].text
 
-async def _process_invoice(job_id: str, file_path: Path, original_name: str, mime: str):
+async def _process_invoice(job_id, file_path, original_name, mime):
     global processed_today
     def update(progress, step):
         with _lock:
@@ -326,13 +402,17 @@ async def _process_invoice(job_id: str, file_path: Path, original_name: str, mim
         update(95, "Generating Excel files...")
         stem = Path(original_name).stem
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_stem = re.sub(r"[^\w\-]", "_", stem)
-        full_path = OUTPUT_DIR / f"{safe_stem}_{ts}_full.xlsx"
-        raw_path = OUTPUT_DIR / f"{safe_stem}_{ts}_raw.xlsx"
+        safe_stem = re.sub(r"[^\\w\\-]", "_", stem)
+        local_full = OUTPUT_DIR / f"{safe_stem}_{ts}_full.xlsx"
+        local_raw = OUTPUT_DIR / f"{safe_stem}_{ts}_raw.xlsx"
         full_bytes = build_excel(final_rows, tariff_data, "Invoice Data")
         raw_bytes = build_excel(final_rows, None, "Raw Extraction")
-        full_path.write_bytes(full_bytes)
-        raw_path.write_bytes(raw_bytes)
+        local_full.write_bytes(full_bytes)
+        local_raw.write_bytes(raw_bytes)
+        remote_full = f"{invoice_id}/{safe_stem}_{ts}_full.xlsx"
+        remote_raw = f"{invoice_id}/{safe_stem}_{ts}_raw.xlsx"
+        upload_to_storage(local_full, remote_full)
+        upload_to_storage(local_raw, remote_raw)
         supplier = final_rows[0].get("Invoice", original_name) if final_rows else original_name
         total_value = 0.0
         currency = "\u20ac"
@@ -347,11 +427,17 @@ async def _process_invoice(job_id: str, file_path: Path, original_name: str, mim
                 currency = "$"
         with _lock:
             processed_today += 1
-            invoices[invoice_id] = {"id":invoice_id,"supplier":supplier,"filename":original_name,"date":datetime.now().isoformat(),"value":f"{currency}{total_value:,.2f}","status":status,"full_xlsx":str(full_path),"raw_xlsx":str(raw_path),"rows":final_rows,"tariff_data":tariff_data}
-            jobs[job_id]["status"] = "done"
-            jobs[job_id]["invoice_id"] = invoice_id
-            jobs[job_id]["progress"] = 100
-            jobs[job_id]["step"] = "Complete"
+        invoice_record = {
+            "id":invoice_id,"supplier":supplier,"filename":original_name,
+            "date":datetime.now().isoformat(),"value":f"{currency}{total_value:,.2f}",
+            "status":status,"full_xlsx_path":remote_full,"raw_xlsx_path":remote_raw,
+            "rows":final_rows,"tariff_data":tariff_data
+        }
+        save_processed_invoice(invoice_record)
+        jobs[job_id]["status"] = "done"
+        jobs[job_id]["invoice_id"] = invoice_id
+        jobs[job_id]["progress"] = 100
+        jobs[job_id]["step"] = "Complete"
     except Exception as exc:
         with _lock:
             if job_id in jobs:
@@ -401,11 +487,7 @@ async def api_login(request: Request, body: dict = {}):
 @app.post("/api/logout")
 async def api_logout(request: Request):
     request.session.clear()
-    import hmac as _h, hashlib as _hs, time as _t
-    _sec = os.environ.get("SECRET_KEY","dev-secret-change-me")
-    _ts = str(int(_t.time()))
-    _sig = _h.new(_sec.encode(), f"{username}:{_ts}".encode(), _hs.sha256).hexdigest()
-    return {"ok":True,"user":username,"role":entry.get("role","user"),"token":f"{username}:{_ts}:{_sig}"}
+    return {"ok":True}
 
 @app.get("/api/me")
 async def api_me(request: Request):
@@ -431,7 +513,7 @@ async def upload_invoice(file: UploadFile = File(...), _: str = Depends(require_
     if not mime:
         raise HTTPException(400, f"Unsupported file type: {ext}")
     job_id = str(uuid.uuid4())
-    safe_name = re.sub(r"[^\w\-.]","_",file.filename)
+    safe_name = re.sub(r"[^\\w\\-.]","_",file.filename)
     dest = UPLOADS_DIR / f"{job_id}_{safe_name}"
     content = await file.read()
     dest.write_bytes(content)
@@ -452,39 +534,46 @@ def get_stats(_: str = Depends(require_auth)):
     _reset_daily()
     memory = load_memory()
     pending = sum(1 for v in memory.values() if not v.get("confirmed",True))
-    total = len(invoices)
-    verified = sum(1 for v in invoices.values() if v["status"]=="verified")
+    all_invoices = list_processed_invoices()
+    total = len(all_invoices)
+    verified = sum(1 for v in all_invoices if v["status"]=="verified")
     rate = round(verified/total*100) if total else 0
     with _lock:
         return {"processed_today":processed_today,"verification_rate":rate,"memory_count":len(memory),"memory_pending":pending}
 
 @app.get("/invoices")
 def list_invoices(_: str = Depends(require_auth)):
-    with _lock:
-        result = [{"id":inv["id"],"supplier":inv["supplier"],"filename":inv["filename"],"date":inv["date"],"value":inv["value"],"status":inv["status"]} for inv in invoices.values()]
-        return sorted(result,key=lambda x:x["date"],reverse=True)
+    return list_processed_invoices()
 
 @app.get("/invoices/{invoice_id}/export/full")
 def export_full(invoice_id: str, _: str = Depends(require_auth)):
-    with _lock:
-        inv = invoices.get(invoice_id)
+    inv = get_processed_invoice(invoice_id)
     if not inv:
         raise HTTPException(404,"Invoice not found")
-    path = Path(inv["full_xlsx"])
-    if not path.exists():
+    remote = inv.get("full_xlsx_path","")
+    if not remote:
         raise HTTPException(404,"Excel file not found")
-    return FileResponse(path=str(path),media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",filename=path.name)
+    data = download_from_storage(remote)
+    if not data:
+        raise HTTPException(404,"Excel file not found in storage")
+    from fastapi.responses import Response
+    filename = Path(remote).name
+    return Response(content=data, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 @app.get("/invoices/{invoice_id}/export/raw")
 def export_raw(invoice_id: str, _: str = Depends(require_auth)):
-    with _lock:
-        inv = invoices.get(invoice_id)
+    inv = get_processed_invoice(invoice_id)
     if not inv:
         raise HTTPException(404,"Invoice not found")
-    path = Path(inv["raw_xlsx"])
-    if not path.exists():
+    remote = inv.get("raw_xlsx_path","")
+    if not remote:
         raise HTTPException(404,"Excel file not found")
-    return FileResponse(path=str(path),media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",filename=path.name)
+    data = download_from_storage(remote)
+    if not data:
+        raise HTTPException(404,"Excel file not found in storage")
+    from fastapi.responses import Response
+    filename = Path(remote).name
+    return Response(content=data, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 @app.get("/memory")
 def list_memory(_: str = Depends(require_auth)):
