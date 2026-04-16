@@ -57,10 +57,10 @@ def load_users():
     default_pw = os.environ.get("APP_PASSWORD", "changeme")
     return {default_user: {"password": default_pw, "role": "admin"}}
 
-def verify_password(plain, hashed):
+def verify_password(plain: str, hashed: str) -> bool:
     return plain == hashed
 
-def require_auth(request):
+def require_auth(request: Request) -> str:
     user = request.session.get("user")
     if not user:
         import hmac, hashlib, time
