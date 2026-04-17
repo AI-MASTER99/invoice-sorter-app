@@ -245,7 +245,40 @@ def _extract_commodity_desc(data: dict, code: str) -> str:
     return re.sub(r"<[^>]+>", "", attrs.get("description", "") or "").strip()
 
 
+TARIFF_CACHE_MAX_AGE_DAYS = 30  # Gov.uk updates tariff rates monthly
+
+
+def _tariff_is_stale(tariff: dict) -> bool:
+    """Return True if the cached tariff entry was fetched more than
+    TARIFF_CACHE_MAX_AGE_DAYS ago (so we should refetch from gov.uk)."""
+    if not tariff:
+        return True
+    fetched = tariff.get("fetched_at")
+    if not fetched:
+        return True  # legacy entry without timestamp
+    try:
+        from datetime import datetime, timezone, timedelta
+        # Handle both with and without timezone
+        ts = fetched.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        age = datetime.now(timezone.utc) - dt
+        return age > timedelta(days=TARIFF_CACHE_MAX_AGE_DAYS)
+    except Exception:
+        return True
+
+
 async def lookup_tariff(commodity_code: str) -> dict:
+    """Wrapper: calls _lookup_tariff_raw and stamps fetched_at for cache aging."""
+    from datetime import datetime, timezone
+    result = await _lookup_tariff_raw(commodity_code)
+    if isinstance(result, dict):
+        result["fetched_at"] = datetime.now(timezone.utc).isoformat()
+    return result
+
+
+async def _lookup_tariff_raw(commodity_code: str) -> dict:
     """Query UK Trade Tariff API for duty/VAT rates + possible sub-codes.
 
     EU invoices use 8-digit codes. The UK API requires 10-digit leaf codes.
@@ -1272,12 +1305,13 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
             cached = None
             for m in memory_by_code.get(code, []):
                 t = m.get("tariff") or {}
-                if t.get("subcodes"):
+                if t.get("subcodes") and not _tariff_is_stale(t):
                     cached = t
                     break
             if cached:
                 tariff_data[code] = cached
             else:
+                # Either no cache or cache is older than 30 days → refetch
                 info = await lookup_tariff(code)
                 tariff_data[code] = info
 
@@ -1803,16 +1837,26 @@ async def tariff_search(q: str = "", ctx: dict = Depends(require_auth)):
 # Memory refresh-tariff endpoint
 # ---------------------------------------------------------------------------
 @app.post("/memory/refresh-tariff")
-async def refresh_memory_tariff(ctx: dict = Depends(require_auth)):
+async def refresh_memory_tariff(
+    ctx: dict = Depends(require_auth),
+    only_stale: bool = False,
+):
+    """Refresh tariff data from gov.uk for all memory entries.
+    If only_stale=True, only refetch entries older than 30 days or missing data."""
     memory = db.list_memory(ctx["company_id"])
     updated = 0
     for entry in memory:
         tariff = entry.get("tariff") or {}
-        needs_refresh = (
-            not tariff
-            or not tariff.get("subcodes")
-            or tariff.get("duty") == "N/A"
-        )
+        if only_stale:
+            needs_refresh = (
+                not tariff
+                or not tariff.get("subcodes")
+                or tariff.get("duty") == "N/A"
+                or _tariff_is_stale(tariff)
+            )
+        else:
+            # Full refresh mode — refetch everything with real data
+            needs_refresh = True
         if needs_refresh:
             code = entry.get("code", "")
             if code:
@@ -1821,6 +1865,24 @@ async def refresh_memory_tariff(ctx: dict = Depends(require_auth)):
                     db.update_memory(entry["id"], ctx["company_id"], {"tariff": info})
                     updated += 1
     return {"updated": updated}
+
+
+@app.post("/memory/refresh-stale")
+async def refresh_stale_tariff(ctx: dict = Depends(require_auth)):
+    """Refetch tariff data for entries whose cache is older than 30 days.
+    Runs much faster than a full refresh when most entries are still fresh."""
+    memory = db.list_memory(ctx["company_id"])
+    updated = 0
+    for entry in memory:
+        tariff = entry.get("tariff") or {}
+        if _tariff_is_stale(tariff):
+            code = entry.get("code", "")
+            if code:
+                info = await lookup_tariff(code)
+                if info:
+                    db.update_memory(entry["id"], ctx["company_id"], {"tariff": info})
+                    updated += 1
+    return {"updated": updated, "total": len(memory)}
 
 
 @app.post("/upload")

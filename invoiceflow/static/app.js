@@ -470,6 +470,8 @@ function renderMemoryTable(items) {
     const statusBadge = m.confirmed
       ? '<span class="status-badge badge-verified">✓ Confirmed</span>'
       : '<span class="status-badge badge-subcode">⚠ Pending</span>';
+    // Tariff age: calculate from fetched_at (or fall back to — if missing)
+    const ageHtml = tariffAgeBadge(m.tariff?.fetched_at);
     rows += `
       <tr>
         <td><span class="code-mono">${escHtml(m.code)}</span></td>
@@ -478,6 +480,7 @@ function renderMemoryTable(items) {
         <td class="tariff-cell">${escHtml(m.tariff?.duty || '—')}</td>
         <td class="tariff-cell">${escHtml(m.tariff?.vat || '—')}</td>
         <td class="subcodes-cell">${subsHtml}</td>
+        <td>${ageHtml}</td>
         <td>${statusBadge}</td>
         <td><button class="btn-delete" title="Delete from memory" onclick="deleteMemoryEntry('${m.id}', '${escHtml(m.description)}')">🗑</button></td>
       </tr>`;
@@ -492,11 +495,41 @@ function renderMemoryTable(items) {
         <th>Duty</th>
         <th>VAT</th>
         <th>All possible sub-codes</th>
+        <th>Tariff age</th>
         <th>Status</th>
         <th></th>
       </tr></thead>
       <tbody>${rows}</tbody>
     </table>`;
+}
+
+function tariffAgeBadge(fetchedAtIso) {
+  if (!fetchedAtIso) return '<span class="age-badge age-unknown" title="Tariff data age unknown — click Refresh stale to update">? unknown</span>';
+  try {
+    const fetched = new Date(fetchedAtIso);
+    const ageDays = Math.floor((Date.now() - fetched.getTime()) / 86400000);
+    if (ageDays < 7)  return `<span class="age-badge age-fresh" title="Fetched ${fetched.toLocaleDateString()}">● ${ageDays}d ago</span>`;
+    if (ageDays < 30) return `<span class="age-badge age-ok"    title="Fetched ${fetched.toLocaleDateString()}">● ${ageDays}d ago</span>`;
+    return `<span class="age-badge age-stale" title="Tariff cache is older than 30 days — refetch recommended">⚠ ${ageDays}d ago</span>`;
+  } catch { return '<span class="age-badge age-unknown">—</span>'; }
+}
+
+async function refreshStaleTariffs() {
+  const btn = event?.currentTarget;
+  if (btn) { btn.disabled = true; btn.textContent = '↻ Checking…'; }
+  try {
+    const r = await api('POST', '/memory/refresh-stale');
+    if (r.updated === 0) {
+      toast(`All ${r.total} tariff entries are up to date`, 'success');
+    } else {
+      toast(`Refreshed ${r.updated} stale entries (of ${r.total})`, 'success');
+    }
+    refreshMemoryPage();
+  } catch (e) {
+    toast('Refresh failed: ' + e.message, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '🔄 Refresh stale'; }
+  }
 }
 
 async function deleteMemoryEntry(entryId, desc) {

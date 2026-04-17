@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/style.css?v=7" />
+  <link rel="stylesheet" href="/style.css?v=8" />
 </head>
 <body>
 
@@ -258,9 +258,10 @@
             <div class="section-title">Product Memory <span class="memory-count" id="memory-count"></span></div>
             <div style="color:var(--muted);font-size:12px;margin-top:4px">Commodity codes learned from processed invoices</div>
           </div>
-          <div style="display:flex;gap:8px;align-items:center">
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
             <input class="memory-search" id="memory-search" type="text" placeholder="Search products…" />
-            <button class="btn-refresh-tariff" id="btn-refresh-tariff" title="Refresh tariff data for all entries">↻ Refresh tariff</button>
+            <button class="btn-refresh-tariff" onclick="refreshStaleTariffs()" title="Refetch only entries older than 30 days (recommended monthly)">🔄 Refresh stale</button>
+            <button class="btn-refresh-tariff" id="btn-refresh-tariff" title="Force refetch tariff data for ALL entries (slow, higher cost)">↻ Refresh all</button>
             <button class="btn-refresh-tariff" onclick="cleanupInvalidMemory()" title="Remove entries whose code is not a real HS/commodity code">🧹 Clean invalid</button>
           </div>
         </div>
@@ -414,6 +415,6 @@
 <!-- TOAST CONTAINER -->
 <div id="toast-container"></div>
 
-<script src="/app.js?v=9"></script>
+<script src="/app.js?v=10"></script>
 </body>
 </html>
