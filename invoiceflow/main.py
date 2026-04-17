@@ -1622,44 +1622,61 @@ async def api_change_password(username: str, body: dict = {}, ctx: dict = Depend
 async def tariff_search(q: str = "", ctx: dict = Depends(require_auth)):
     if not q.strip():
         return []
-    url = f"https://www.trade-tariff.service.gov.uk/api/v2/search?q={q.strip()}&per_page=20"
+    url = f"https://www.trade-tariff.service.gov.uk/api/v2/search?q={q.strip()}"
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             r = await client.get(url, headers={"Accept": "application/json"})
             if r.status_code != 200:
                 return []
             data = r.json()
-            results = []
 
-            # The API returns results under data[] or search_results[]
-            items = data.get("data", [])
-            if not items:
-                # Try alternative response format
-                items = data.get("search_results", {}).get("commodities", [])
+            # New API structure (2024+): data.attributes.goods_nomenclature_match.commodities
+            attrs = data.get("data", {}).get("attributes", {}) or {}
+            match = attrs.get("goods_nomenclature_match", {}) or {}
+            commodities = match.get("commodities", []) or []
+            # Also include heading-level results (broader matches)
+            headings = match.get("headings", []) or []
 
-            for item in items:
-                if isinstance(item, dict):
-                    attrs = item.get("attributes", item)  # some items have flat structure
-                    code = (
-                        attrs.get("goods_nomenclature_item_id")
-                        or attrs.get("producline_suffix", "")
-                        or item.get("id", "")
-                    )
-                    desc = (
-                        attrs.get("description")
-                        or attrs.get("formatted_description", "")
-                    )
+            def collect(items, kind):
+                out = []
+                for item in items:
+                    src = item.get("_source") or item.get("attributes") or {}
+                    code = src.get("goods_nomenclature_item_id") or ""
+                    desc = src.get("description") or src.get("formatted_description") or ""
                     desc = re.sub(r"<[^>]+>", "", str(desc)).strip()
                     if code and desc and len(code) >= 4:
-                        results.append({
+                        out.append({
                             "code": code,
                             "description": desc,
-                            "duty": attrs.get("applicable_duty_string", "") or "—",
-                            "vat": "20%",
+                            "declarable": bool(src.get("declarable")),
+                            "kind": kind,
+                            "duty": "—",
+                            "vat": "0-20%",
                         })
+                return out
 
+            results = collect(commodities, "commodity") + collect(headings, "heading")
+
+            # Fetch actual duty/vat for the top 5 declarable commodities (parallel)
+            async def enrich(item):
+                if item["kind"] != "commodity" or not item.get("declarable"):
+                    return item
+                try:
+                    info = await lookup_tariff(item["code"])
+                    if info:
+                        item["duty"] = info.get("duty") or "—"
+                        item["vat"] = info.get("vat") or "0%"
+                except Exception:
+                    pass
+                return item
+
+            import asyncio as _asyncio
+            top = results[:10]
+            enriched = await _asyncio.gather(*(enrich(it) for it in top))
+            # Replace the first 10 with enriched versions
+            results[:10] = enriched
             return results[:15]
-    except Exception as e:
+    except Exception:
         return []
 
 
