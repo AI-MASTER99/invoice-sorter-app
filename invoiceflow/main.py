@@ -52,8 +52,16 @@ else:
 UPLOADS_DIR = _DATA_ROOT / "uploads"
 OUTPUT_DIR  = _DATA_ROOT / "output"
 
-# AI model — configurable via .env (default: sonnet for best rate-limit compatibility)
-AI_MODEL = os.environ.get("AI_MODEL", "claude-sonnet-4-6")
+# AI models — the primary one does the heavy lifting (extraction, verification,
+# sub-code matching — anything where quality directly affects customs outcomes).
+# The light one handles the simple totals extraction where Sonnet is plenty.
+AI_MODEL_PRIMARY = os.environ.get("AI_MODEL_PRIMARY", "claude-opus-4-7")
+AI_MODEL_LIGHT   = os.environ.get("AI_MODEL_LIGHT",   "claude-sonnet-4-6")
+
+# Legacy single-model env var — if set, override both (for easy rollback)
+if os.environ.get("AI_MODEL"):
+    AI_MODEL_PRIMARY = os.environ["AI_MODEL"]
+    AI_MODEL_LIGHT   = os.environ["AI_MODEL"]
 
 for d in (UPLOADS_DIR, OUTPUT_DIR):
     d.mkdir(parents=True, exist_ok=True)
@@ -771,13 +779,14 @@ def chunk_pages(pages: list[str], max_words_per_chunk: int = 1800) -> list[str]:
     return chunks
 
 
-async def run_extraction_text(client: anthropic.AsyncAnthropic, pdf_text: str, prompt: str) -> str:
+async def run_extraction_text(client: anthropic.AsyncAnthropic, pdf_text: str, prompt: str, model: str | None = None) -> str:
     """Run extraction on pre-extracted PDF text with prompt caching.
     Run A writes cache, Run B reads cache at ~10% cost. Retries on rate limit."""
+    model = model or AI_MODEL_PRIMARY
     for attempt in range(5):
         try:
             message = await client.messages.create(
-                model=AI_MODEL,
+                model=model,
                 max_tokens=16000,
                 messages=[{
                     "role": "user",
@@ -799,12 +808,13 @@ async def run_extraction_text(client: anthropic.AsyncAnthropic, pdf_text: str, p
     return ""
 
 
-async def run_extraction(client: anthropic.AsyncAnthropic, file_bytes: bytes, mime: str, prompt: str) -> str:
+async def run_extraction(client: anthropic.AsyncAnthropic, file_bytes: bytes, mime: str, prompt: str, model: str | None = None) -> str:
     """Send file + prompt to Claude and return raw text response.
 
     For PDFs: extract text locally first (drastically reduces input tokens).
     For images: send as vision input.
     """
+    model = model or AI_MODEL_PRIMARY
     content_blocks: list = []
 
     if mime == "application/pdf":
@@ -843,7 +853,7 @@ async def run_extraction(client: anthropic.AsyncAnthropic, file_bytes: bytes, mi
     content_blocks.append({"type": "text", "text": prompt})
 
     message = await client.messages.create(
-        model=AI_MODEL,
+        model=model,
         max_tokens=4096,
         messages=[{"role": "user", "content": content_blocks}],
     )
@@ -1065,7 +1075,7 @@ Example:
 """
     try:
         msg = await client.messages.create(
-            model=AI_MODEL,
+            model=AI_MODEL_PRIMARY,
             max_tokens=2000,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -1140,13 +1150,13 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
         ab_match, ab_reasons = rows_match(rows_a, rows_b)
         final_rows = rows_a
 
-        # Run C — totals from footer
+        # Run C — totals from footer (simpler task, uses lighter/cheaper model)
         update(65, "Reading invoice totals (Run C)…")
         try:
             if pdf_text:
-                raw_c = await run_extraction_text(client, pdf_text, PROMPT_TOTALS)
+                raw_c = await run_extraction_text(client, pdf_text, PROMPT_TOTALS, model=AI_MODEL_LIGHT)
             else:
-                raw_c = await run_extraction(client, file_bytes, mime, PROMPT_TOTALS)
+                raw_c = await run_extraction(client, file_bytes, mime, PROMPT_TOTALS, model=AI_MODEL_LIGHT)
         except Exception:
             raw_c = ""
         totals = parse_totals(raw_c)
