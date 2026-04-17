@@ -408,6 +408,11 @@ Hard rules (strict — no guessing)
 Output format
 - TAB-SEPARATED VALUES (TSV) only.
 - First row = header row exactly: Invoice\tComm./imp. cod\tDescription of Goods\tOrigin\tCountry\tNumber of Packages\tGross Weight (KG)\tNet Weight (KG)\tValue
+- EVERY data row MUST have exactly 9 TAB-separated fields (blank cells allowed,
+  but there must still be the correct number of tabs). NEVER shift columns:
+  if the invoice has no per-line weight, Gross Weight and Net Weight are BOTH
+  BLANK and the line total goes in the Value column — never cascade values
+  up through empty columns.
 - No explanations, comments, or text outside the table.
 - No markdown code fences. No ``` anywhere.
 
@@ -460,7 +465,46 @@ Columns (exactly in this order)
                       In KG only. Do NOT calculate from unit weight × quantity.
                       Blank if the line has no net weight column entry.
                       Same rule as Gross Weight: blank if only a total is shown.
-9. Value              Line total with currency symbol (€ / $ / £). 2 decimals.
+9. Value              Line total with currency symbol (€ / $ / £ / CHF). 2 decimals.
+                      The Value is the LAST/RIGHTMOST numeric amount on the line —
+                      the line total (not unit price, not quantity, not weight).
+                      On Swiss/Caran d'Ache style invoices:
+                        "0005 115.201 50 BRUSH WITH WATER RESERVOIR JP 2.05 102.50"
+                        → Value = CHF 102.50 (the last number, line total)
+                        → 2.05 is unit price (ignore)
+                        → 50 is quantity (ignore)
+                      Value is ALWAYS filled unless the line is a note or a header.
+                      Never confuse Value with Gross/Net Weight. If the invoice has no
+                      per-line weight column, the weight cells stay BLANK — never put
+                      the price there.
+
+CONCRETE EXAMPLES — match these patterns exactly
+
+Example 1 — Italian invoice with per-line weights + commodity codes:
+Input line:
+  "30  CIMA RAPA  IT KG  1  8,80  ,70  8,10  4,000  32,40
+   nomenclatura 07049010"
+Expected TSV row (9 columns, tab-separated):
+  91021436<TAB>07049010<TAB>CIMA RAPA<TAB>IT<TAB>Italy<TAB>1<TAB>8.80<TAB>8.10<TAB>€32.40
+
+Example 2 — Swiss Caran d'Ache invoice, NO commodity code, NO per-line weight:
+Input line:
+  "0001 3.289 30 FIXPENCIL MECH.PEN BLACK 3MM ASS. 8.22 246.60"
+Expected TSV row (9 columns, tab-separated):
+  91021436<TAB><TAB>FIXPENCIL MECH.PEN BLACK 3MM ASS.<TAB><TAB><TAB><TAB><TAB><TAB>CHF 246.60
+(Notice: commodity code blank, origin blank, country blank, packages blank,
+gross weight blank, net weight blank. The line total CHF 246.60 goes in the
+LAST column — Value — never in Gross Weight.)
+
+Example 3 — Swiss line WITH origin:
+Input line:
+  "0005 115.201 50 BRUSH WITH WATER RESERVOIR LARGE JP 2.05 102.50"
+Expected TSV row:
+  91021436<TAB><TAB>BRUSH WITH WATER RESERVOIR LARGE<TAB>JP<TAB>Japan<TAB><TAB><TAB><TAB>CHF 102.50
+
+Remember: 9 columns always. Value is ALWAYS the last column and contains the
+line total with currency symbol. Weight columns are ONLY for real weight data
+from a weight column on the invoice — NEVER for monetary values.
 
 Commodity code formatting rules
 Step 1 — Determine supplier country from VAT number prefix or address:
@@ -715,7 +759,13 @@ def compare_totals(rows: list[dict], totals: dict) -> dict:
         reported = totals.get(tkey, "")
         computed = sum_rows_numeric(rows, rfield)
         if not reported:
+            # Invoice didn't report this total — can't verify, treat as N/A
             checks[tkey] = {"reported": "", "computed": computed, "match": None}
+        elif not computed:
+            # Invoice reports a total but there's no per-line data to sum.
+            # This is common on invoices that only show totals in the footer
+            # (e.g. Swiss Caran d'Ache style). Not a mismatch — just unverifiable.
+            checks[tkey] = {"reported": reported, "computed": "", "match": None}
         else:
             checks[tkey] = {
                 "reported": reported,
