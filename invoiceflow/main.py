@@ -537,12 +537,19 @@ PROMPT_TOTALS = """INVOICE TOTALS EXTRACTION
 Look ONLY at the invoice's SUMMARY / FOOTER / TOTALS section — the part where
 the invoice reports its own grand totals. Common labels:
   • Total packages / Numero Colli / Total Colli / Total Cartons / Total Pkgs
-  • Total Gross Weight / Peso Lordo Totale / Brutto Totale / Total G.W.
-  • Total Net Weight / Peso Netto Totale / Netto Totale / Total N.W.
+  • Pallets / Pallet count / N X PALLETS / BOX PALLETS
+  • Total Gross Weight / Peso Lordo Totale / Brutto Totale / Total G.W. / GROSS WEIGHT
+  • Total Net Weight / Peso Netto Totale / Netto Totale / Total N.W. / NET WEIGHT
   • Total / Totale / Total Amount / Grand Total / Importo Totale / Invoice Total
 
 Report the values EXACTLY as they appear in that summary — do NOT compute or
 sum them yourself from line items.
+
+Special case — pallet arithmetic:
+  If the invoice says "4 X BOX PALLETS + 1 X PALLET", that is 4 + 1 = 5 pallets.
+  Output total_packages\\t5.
+  If it says "3 PALLETS", output total_packages\\t3.
+  Treat pallets, boxes, cartons, and colli as interchangeable for the package count.
 
 OUTPUT FORMAT — STRICT
 Your entire response must be ONLY these 4 lines, in this exact order,
@@ -557,7 +564,10 @@ total_value\t<number with currency symbol or blank>
 Rules:
 - Numbers only (plus currency symbol on total_value). No units like "KG" or "colli".
 - Use a dot as decimal separator (e.g. 1234.56).
+- Thousand separators: accept both comma and apostrophe (1,081.79 or 1'081.79).
+  Always output with dot as decimal separator: 1081.79.
 - If the invoice shows "NUMERO COLLI 705", output: total_packages\t705
+- If it shows "GROSS WEIGHT : 1'081.790 KGS", output: total_gross_kg\t1081.79
 - Never guess. Blank is better than wrong.
 """
 
