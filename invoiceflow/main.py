@@ -1212,43 +1212,47 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
         if products_to_match:
             matched_codes = await match_subcodes(client, products_to_match, tariff_data)
 
-        # Persist memory updates to database
-        for row in final_rows:
-            code = row.get("Comm./imp. cod", "").strip()
-            desc = row.get("Description of Goods", "").strip()
-            if not code or not desc:
-                continue
-            key = f"{code}::{desc}"
-            existing = memory_by_key.get(key)
-            tariff_info = tariff_data.get(code, {})
-            match_info = matched_codes.get(key, {})
+        # Persist memory updates to database — BUT ONLY IF the invoice is verified.
+        # Unverified / subcode_needed invoices don't touch product memory to avoid
+        # learning wrong data. Memory is populated later when the user confirms
+        # the invoice via /resolve.
+        if verified:
+            for row in final_rows:
+                code = row.get("Comm./imp. cod", "").strip()
+                desc = row.get("Description of Goods", "").strip()
+                if not code or not desc:
+                    continue
+                key = f"{code}::{desc}"
+                existing = memory_by_key.get(key)
+                tariff_info = tariff_data.get(code, {})
+                match_info = matched_codes.get(key, {})
 
-            if existing:
-                updates: dict = {}
-                old_tariff = existing.get("tariff") or {}
-                if not old_tariff or not old_tariff.get("subcodes"):
-                    if tariff_info and tariff_info.get("subcodes"):
-                        updates["tariff"] = tariff_info
-                if match_info and not existing.get("matched_code"):
-                    updates["matched_code"] = match_info["matched_code"]
-                    updates["matched_desc"] = match_info["matched_desc"]
-                    updates["matched_duty"] = match_info["duty"]
-                if verified and not existing.get("confirmed"):
-                    updates["confirmed"] = True
-                if updates:
-                    db.update_memory(existing["id"], company_id, updates)
-            else:
-                entry = {
-                    "code": code,
-                    "description": desc,
-                    "confirmed": verified,
-                    "tariff": tariff_info,
-                }
-                if match_info:
-                    entry["matched_code"] = match_info["matched_code"]
-                    entry["matched_desc"] = match_info["matched_desc"]
-                    entry["matched_duty"] = match_info["duty"]
-                db.upsert_memory(company_id, entry)
+                if existing:
+                    updates: dict = {}
+                    old_tariff = existing.get("tariff") or {}
+                    if not old_tariff or not old_tariff.get("subcodes"):
+                        if tariff_info and tariff_info.get("subcodes"):
+                            updates["tariff"] = tariff_info
+                    if match_info and not existing.get("matched_code"):
+                        updates["matched_code"] = match_info["matched_code"]
+                        updates["matched_desc"] = match_info["matched_desc"]
+                        updates["matched_duty"] = match_info["duty"]
+                    if not existing.get("confirmed"):
+                        updates["confirmed"] = True
+                    if updates:
+                        db.update_memory(existing["id"], company_id, updates)
+                else:
+                    entry = {
+                        "code": code,
+                        "description": desc,
+                        "confirmed": True,
+                        "tariff": tariff_info,
+                    }
+                    if match_info:
+                        entry["matched_code"] = match_info["matched_code"]
+                        entry["matched_desc"] = match_info["matched_desc"]
+                        entry["matched_duty"] = match_info["duty"]
+                    db.upsert_memory(company_id, entry)
 
         # Step 5 — Generate Excel files + upload to Supabase Storage
         update(95, "Generating Excel files…")
@@ -1601,20 +1605,22 @@ async def upload_invoice(file: UploadFile = File(...), ctx: dict = Depends(requi
     safe_name = re.sub(r"[^\w\-.]", "_", file.filename)
     content = await file.read()
 
-    # Store original upload in Supabase Storage, scoped by company
-    storage_path = f"{ctx['company_id']}/{uuid.uuid4()}_{safe_name}"
-    db.storage_upload(db.BUCKET_UPLOADS, storage_path, content, mime)
-
-    # Also write a temporary local copy for the queue worker (faster PDF reads)
-    tmp_local = UPLOADS_DIR / f"tmp_{uuid.uuid4()}_{safe_name}"
-    tmp_local.write_bytes(content)
-
+    # Create the job first so we can use its id as the storage prefix.
+    # This way we can always find the original upload by job id — no extra
+    # DB column required even for failed jobs that never became an invoice.
     job = db.create_job(ctx["company_id"], {
         "filename": file.filename,
         "status":   "queued",
         "progress": 0,
         "step":     "Waiting in queue…",
     })
+    storage_path = f"{ctx['company_id']}/{job['id']}_{safe_name}"
+    db.storage_upload(db.BUCKET_UPLOADS, storage_path, content, mime)
+
+    # Local temp copy for the queue worker (fast PDF reads)
+    tmp_local = UPLOADS_DIR / f"tmp_{job['id']}_{safe_name}"
+    tmp_local.write_bytes(content)
+
     _enqueue_job(job["id"], ctx["company_id"], tmp_local, file.filename, mime, storage_path)
     return {"job_id": job["id"]}
 
@@ -1720,6 +1726,52 @@ def export_raw(invoice_id: str, ctx: dict = Depends(require_auth)):
     return _stream_storage_file(storage_path, Path(storage_path).name)
 
 
+@app.post("/jobs/{job_id}/retry")
+async def retry_job(job_id: str, ctx: dict = Depends(require_auth)):
+    """Retry a failed job by re-downloading its upload from Supabase Storage.
+    Used when a job failed before producing an invoice (e.g. out-of-credit)."""
+    job = db.get_job(job_id)
+    if not job or job.get("company_id") != ctx["company_id"]:
+        raise HTTPException(404, "Job not found")
+    if job.get("status") not in ("failed", "done"):
+        raise HTTPException(400, "Only failed or done jobs can be retried")
+
+    original_file = job.get("filename") or ""
+    safe_name = re.sub(r"[^\w\-.]", "_", original_file)
+    # Storage path convention used at upload: {company_id}/{job_id}_{safe_name}
+    upload_path = f"{ctx['company_id']}/{job_id}_{safe_name}"
+
+    try:
+        data = db.storage_download(db.BUCKET_UPLOADS, upload_path)
+    except Exception:
+        raise HTTPException(404, "Original upload not found in storage")
+
+    ext = Path(original_file).suffix.lower()
+    mime = MIME_MAP.get(ext, "application/pdf")
+
+    new_job = db.create_job(ctx["company_id"], {
+        "filename": original_file,
+        "status":   "queued",
+        "progress": 0,
+        "step":     "Waiting in queue…",
+    })
+    # Copy the storage object to the new job's path so future retries also work
+    new_storage_path = f"{ctx['company_id']}/{new_job['id']}_{safe_name}"
+    db.storage_upload(db.BUCKET_UPLOADS, new_storage_path, data, mime)
+
+    tmp_local = UPLOADS_DIR / f"retry_{new_job['id']}_{safe_name}"
+    tmp_local.write_bytes(data)
+
+    _enqueue_job(new_job["id"], ctx["company_id"], tmp_local, original_file, mime, new_storage_path)
+
+    # Remove the old failed job from view
+    try:
+        db.sb.table("jobs").delete().eq("id", job_id).execute()
+    except Exception:
+        pass
+    return {"job_id": new_job["id"]}
+
+
 @app.post("/invoices/{invoice_id}/retry")
 async def retry_invoice(invoice_id: str, ctx: dict = Depends(require_auth)):
     inv = db.get_invoice(invoice_id, ctx["company_id"])
@@ -1756,23 +1808,41 @@ async def retry_invoice(invoice_id: str, ctx: dict = Depends(require_auth)):
 
 @app.post("/invoices/{invoice_id}/resolve")
 async def resolve_invoice(invoice_id: str, body: dict = {}, ctx: dict = Depends(require_auth)):
-    """Mark a subcode_needed invoice as verified after manual review."""
+    """Mark a subcode_needed invoice as verified after manual review.
+    This also adds the invoice's products to product memory (they were
+    held back during processing because the invoice wasn't verified)."""
     inv = db.get_invoice(invoice_id, ctx["company_id"])
     if not inv:
         raise HTTPException(404, "Invoice not found")
     subcode = body.get("subcode", "")
+    tariff_data = inv.get("tariff_data") or {}
 
-    # Confirm all memory entries whose code appears in this invoice's rows
-    row_codes = {r.get("Comm./imp. cod", "") for r in (inv.get("rows") or [])}
-    for code in row_codes:
-        if not code:
+    # Add every row to product memory (now that the human confirmed it)
+    for row in (inv.get("rows") or []):
+        code = (row.get("Comm./imp. cod") or "").strip()
+        desc = (row.get("Description of Goods") or "").strip()
+        if not code or not desc:
             continue
-        entries = db.get_memory_by_code(ctx["company_id"], code)
-        for e in entries:
+        existing = db.get_memory_entry(ctx["company_id"], code, desc)
+        tariff_info = tariff_data.get(code) or {}
+        if existing:
             updates = {"confirmed": True}
             if subcode:
                 updates["matched_code"] = subcode
-            db.update_memory(e["id"], ctx["company_id"], updates)
+            old_tariff = existing.get("tariff") or {}
+            if not old_tariff.get("subcodes") and tariff_info.get("subcodes"):
+                updates["tariff"] = tariff_info
+            db.update_memory(existing["id"], ctx["company_id"], updates)
+        else:
+            entry = {
+                "code": code,
+                "description": desc,
+                "confirmed": True,
+                "tariff": tariff_info,
+            }
+            if subcode:
+                entry["matched_code"] = subcode
+            db.upsert_memory(ctx["company_id"], entry)
 
     db.update_invoice(invoice_id, ctx["company_id"], {"status": "verified"})
     return {"ok": True}

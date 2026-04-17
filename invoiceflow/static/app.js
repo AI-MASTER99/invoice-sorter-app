@@ -150,7 +150,8 @@ const knownJobs = {};
 async function refreshJobs() {
   try {
     const jobs = await api('GET', '/jobs');
-    const active = jobs.filter(j => j.status === 'running' || j.status === 'queued');
+    // Show running, queued AND failed jobs (so failed ones can be retried)
+    const visible = jobs.filter(j => ['running', 'queued', 'failed'].includes(j.status));
 
     jobs.forEach(j => {
       const prev = knownJobs[j.id];
@@ -170,34 +171,69 @@ async function refreshJobs() {
     const section   = document.getElementById('jobs-section');
     const container = document.getElementById('jobs-container');
 
-    if (active.length === 0) { section.classList.remove('visible'); return; }
+    if (visible.length === 0) { section.classList.remove('visible'); return; }
     section.classList.add('visible');
 
-    // Show running jobs first, then queued
-    const sorted = [...active].sort((a, b) => {
-      if (a.status === 'running' && b.status !== 'running') return -1;
-      if (a.status !== 'running' && b.status === 'running') return 1;
+    // Sort: running → queued → failed
+    const rank = { running: 0, queued: 1, failed: 2 };
+    const sorted = [...visible].sort((a, b) => {
+      const d = (rank[a.status] ?? 9) - (rank[b.status] ?? 9);
+      if (d !== 0) return d;
       return (a.queue_position || 0) - (b.queue_position || 0);
     });
 
     container.innerHTML = '';
     sorted.forEach(job => {
       const isQueued = job.status === 'queued';
+      const isFailed = job.status === 'failed';
       const card = document.createElement('div');
-      card.className = 'job-card' + (isQueued ? ' job-queued' : '');
+      let cls = 'job-card';
+      if (isQueued) cls += ' job-queued';
+      if (isFailed) cls += ' job-failed';
+      card.className = cls;
+      const iconHtml = isFailed
+        ? '<div class="fail-icon">❌</div>'
+        : isQueued
+          ? '<div class="queue-icon">⏳</div>'
+          : '<div class="spinner"></div>';
+      const stepText = isFailed
+        ? (job.step || job.error || 'Processing failed')
+        : (job.step || 'Processing…');
+      const actionBtn = isFailed
+        ? `<button class="btn-retry-job" onclick="retryFailedJob('${job.id}')">↻ Retry</button>
+           <button class="btn-cancel" onclick="dismissFailedJob('${job.id}')">Dismiss</button>`
+        : `<button class="btn-cancel" onclick="cancelJob('${job.id}')">Cancel</button>`;
       card.innerHTML = `
-        <div class="${isQueued ? 'queue-icon' : 'spinner'}">${isQueued ? '⏳' : ''}</div>
+        ${iconHtml}
         <div class="job-info">
           <div class="job-filename">${escHtml(job.filename)}</div>
-          <div class="job-step">${escHtml(job.step || 'Processing…')}</div>
+          <div class="job-step">${escHtml(stepText)}</div>
           <div class="job-progress-track">
-            <div class="job-progress-fill${isQueued ? ' queued' : ''}" style="width:${isQueued ? 0 : job.progress}%"></div>
+            <div class="job-progress-fill${isQueued ? ' queued' : ''}${isFailed ? ' failed' : ''}" style="width:${isFailed ? 100 : (isQueued ? 0 : job.progress)}%"></div>
           </div>
         </div>
-        <button class="btn-cancel" onclick="cancelJob('${job.id}')">Cancel</button>`;
+        <div class="job-actions">${actionBtn}</div>`;
       container.appendChild(card);
     });
   } catch (e) { /* silent */ }
+}
+
+async function retryFailedJob(jobId) {
+  try {
+    const r = await api('POST', `/jobs/${jobId}/retry`);
+    toast('Retrying…', 'info');
+    delete knownJobs[jobId];
+    knownJobs[r.job_id] = { id: r.job_id, status: 'queued' };
+    refreshJobs(); refreshStats();
+  } catch (e) {
+    toast('Retry failed: ' + e.message, 'error');
+  }
+}
+
+async function dismissFailedJob(id) {
+  delete knownJobs[id];
+  // Optional: could DELETE /jobs/{id} in future — for now just hide from view
+  refreshJobs();
 }
 
 function cancelJob(id) {
@@ -296,6 +332,7 @@ function actionsHtml(inv) {
   if (inv.status === 'subcode_needed') {
     return `
       <button class="btn-export btn-resolve" onclick="openResolve('${inv.id}', '${escHtml(inv.supplier)}')">Resolve</button>
+      <button class="btn-export btn-retry"   onclick="retryInvoice('${inv.id}')">↻ Retry</button>
       <button class="btn-export btn-raw"     onclick="exportRaw('${inv.id}')">Raw only</button>`;
   }
   if (inv.status === 'failed') {
