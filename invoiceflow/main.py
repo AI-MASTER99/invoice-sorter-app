@@ -1079,14 +1079,11 @@ def build_excel(rows: list[dict], tariff_data: dict | None, sheet_title: str) ->
     # ── Tariff sheet (full export only) ───────────────────────
     if tariff_data:
         from openpyxl.styles import Border, Side
-        thick_top  = Border(top=Side(style="medium", color="1F3864"))
-        match_fill = PatternFill("solid", fgColor="DCFCE7")   # green for matched cells
-        group_fill = PatternFill("solid", fgColor="EEF1FF")   # light-blue group header band
+        thick_top = Border(top=Side(style="medium", color="1F3864"))
 
         ws2 = wb.create_sheet("Tariff Lookup")
-        tariff_cols = ["Commodity Code", "Product", "Matched Sub-code",
-                       "Matched Description", "Duty", "VAT"]
-        tariff_widths = [18, 44, 20, 44, 22, 10]
+        tariff_cols = ["Commodity Code", "Product", "Matched Sub-code", "Duty", "VAT"]
+        tariff_widths = [18, 46, 20, 22, 10]
         for ci, h in enumerate(tariff_cols, start=1):
             c = ws2.cell(row=1, column=ci, value=h)
             c.font = _FONT_HDR
@@ -1095,56 +1092,34 @@ def build_excel(rows: list[dict], tariff_data: dict | None, sheet_title: str) ->
         for ci, w in enumerate(tariff_widths, start=1):
             ws2.column_dimensions[get_column_letter(ci)].width = w
 
-        # Group invoice rows by commodity code so groups render with a separator
-        from collections import OrderedDict
-        rows_by_code: OrderedDict[str, list[dict]] = OrderedDict()
+        row_idx = 2
+        prev_code = None
         for r in rows:
             code = (r.get("Comm./imp. cod") or "").strip()
-            if not code:
+            desc = (r.get("Description of Goods") or "").strip()
+            if not code or not desc:
                 continue
-            rows_by_code.setdefault(code, []).append(r)
 
-        row_idx = 2
-        for code, product_rows in rows_by_code.items():
             info = tariff_data.get(code, {})
-            group_desc = info.get("description", "")
+            matched_code = r.get("_matched_code", "") or ""
+            matched_duty = r.get("_matched_duty", "") or info.get("duty", "")
+            vat_val = info.get("vat", "") or ""
 
-            # 1) Group header row — thick top border + light-blue band
-            for ci in range(1, 7):
-                c = ws2.cell(row=row_idx, column=ci)
-                c.fill = group_fill
-                c.border = thick_top
-            ws2.cell(row=row_idx, column=1, value=code).font = _FONT_HDR
-            ws2.cell(
-                row=row_idx, column=2,
-                value=f"{group_desc}  ({len(product_rows)} product{'s' if len(product_rows) != 1 else ''})",
-            ).font = _FONT_HDR
+            cells = [
+                code,
+                desc,
+                matched_code or "—",
+                matched_duty or "—",
+                vat_val or "—",
+            ]
+            for ci, v in enumerate(cells, start=1):
+                c = ws2.cell(row=row_idx, column=ci, value=v)
+                c.font = _FONT_CELL
+                # Thick top border marks a new commodity-code group
+                if prev_code is not None and code != prev_code:
+                    c.border = thick_top
+            prev_code = code
             row_idx += 1
-
-            # 2) One row per invoice product line — ONLY the matched-info cells
-            #    (cols 3-6: sub-code, description, duty, vat) get the green fill
-            for pr in product_rows:
-                desc = pr.get("Description of Goods", "") or ""
-                matched_code = pr.get("_matched_code", "") or ""
-                matched_desc = pr.get("_matched_desc", "") or ""
-                matched_duty = pr.get("_matched_duty", "") or info.get("duty", "")
-                vat_val = info.get("vat", "") or ""
-                is_match = bool(matched_code)
-
-                cells = [
-                    code,                            # col 1: never green
-                    desc,                            # col 2: never green
-                    matched_code or "—",             # col 3: green if matched
-                    matched_desc or "—",             # col 4: green if matched
-                    matched_duty or "—",             # col 5: green if matched
-                    vat_val or "—",                  # col 6: green if matched
-                ]
-                for ci, v in enumerate(cells, start=1):
-                    c = ws2.cell(row=row_idx, column=ci, value=v)
-                    c.font = _FONT_CELL
-                    if is_match and ci >= 3:
-                        c.fill = match_fill
-                row_idx += 1
 
     buf = io.BytesIO()
     wb.save(buf)
