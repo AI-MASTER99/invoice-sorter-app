@@ -1868,13 +1868,31 @@ async def tariff_search(q: str = "", ctx: dict = Depends(require_auth)):
 # ---------------------------------------------------------------------------
 # Memory refresh-tariff endpoint
 # ---------------------------------------------------------------------------
+def _auto_match_from_tariff(entry: dict, tariff: dict) -> dict:
+    """If an entry has no matched_code yet but the tariff has exactly one
+    sub-code, return the update dict that fills in the auto-match fields.
+    Returns empty dict if no auto-match is possible."""
+    if entry.get("matched_code"):
+        return {}
+    subs = (tariff.get("subcodes") if tariff else None) or []
+    if len(subs) != 1:
+        return {}
+    sc = subs[0]
+    return {
+        "matched_code": sc.get("code", ""),
+        "matched_desc": sc.get("description", "") or tariff.get("description", ""),
+        "matched_duty": sc.get("duty", "") or tariff.get("duty", ""),
+    }
+
+
 @app.post("/memory/refresh-tariff")
 async def refresh_memory_tariff(
     ctx: dict = Depends(require_auth),
     only_stale: bool = False,
 ):
     """Refresh tariff data from gov.uk for all memory entries.
-    If only_stale=True, only refetch entries older than 30 days or missing data."""
+    Also fills in matched_code for entries whose commodity code has only
+    one sub-code option (auto-match)."""
     memory = db.list_memory(ctx["company_id"])
     updated = 0
     for entry in memory:
@@ -1887,33 +1905,52 @@ async def refresh_memory_tariff(
                 or _tariff_is_stale(tariff)
             )
         else:
-            # Full refresh mode — refetch everything with real data
             needs_refresh = True
+
+        updates: dict = {}
+        new_tariff = tariff
         if needs_refresh:
             code = entry.get("code", "")
             if code:
                 info = await lookup_tariff(code)
                 if info and (info.get("subcodes") or info.get("duty") != "N/A"):
-                    db.update_memory(entry["id"], ctx["company_id"], {"tariff": info})
-                    updated += 1
+                    updates["tariff"] = info
+                    new_tariff = info
+
+        # Auto-match: fill matched_code if there's a single sub-code option
+        am = _auto_match_from_tariff(entry, new_tariff)
+        if am:
+            updates.update(am)
+
+        if updates:
+            db.update_memory(entry["id"], ctx["company_id"], updates)
+            updated += 1
     return {"updated": updated}
 
 
 @app.post("/memory/refresh-stale")
 async def refresh_stale_tariff(ctx: dict = Depends(require_auth)):
-    """Refetch tariff data for entries whose cache is older than 30 days.
-    Runs much faster than a full refresh when most entries are still fresh."""
+    """Refetch tariff data for entries whose cache is older than 30 days,
+    and auto-fill matched_code for single-option codes at the same time."""
     memory = db.list_memory(ctx["company_id"])
     updated = 0
     for entry in memory:
         tariff = entry.get("tariff") or {}
+        updates: dict = {}
+        new_tariff = tariff
         if _tariff_is_stale(tariff):
             code = entry.get("code", "")
             if code:
                 info = await lookup_tariff(code)
                 if info:
-                    db.update_memory(entry["id"], ctx["company_id"], {"tariff": info})
-                    updated += 1
+                    updates["tariff"] = info
+                    new_tariff = info
+        am = _auto_match_from_tariff(entry, new_tariff)
+        if am:
+            updates.update(am)
+        if updates:
+            db.update_memory(entry["id"], ctx["company_id"], updates)
+            updated += 1
     return {"updated": updated, "total": len(memory)}
 
 
