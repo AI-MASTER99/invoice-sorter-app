@@ -1325,9 +1325,11 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
         if products_to_match:
             matched_codes = await match_subcodes(client, products_to_match, tariff_data)
 
-        # Enrich each row with its matched sub-code (from memory if already
-        # known, otherwise from this run's match_subcodes). This lets the
-        # Excel export and any consumer see the per-product match directly.
+        # Enrich each row with its matched sub-code. Priority:
+        #   1. Existing memory entry
+        #   2. Fresh match from this run's match_subcodes (for codes with >=2 options)
+        #   3. Single-subcode auto-match (when the invoice code IS the only leaf —
+        #      common for 8-digit codes like 07031019 → 0703101900 "Other")
         for row in final_rows:
             code = row.get("Comm./imp. cod", "").strip()
             desc = row.get("Description of Goods", "").strip()
@@ -1344,6 +1346,15 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
                 row["_matched_code"] = m.get("matched_code", "")
                 row["_matched_desc"] = m.get("matched_desc", "")
                 row["_matched_duty"] = m.get("duty", "")
+            else:
+                # Single-subcode fallback — auto-match if there's only one option
+                tariff = tariff_data.get(code, {}) or {}
+                subs = tariff.get("subcodes", []) or []
+                if len(subs) == 1:
+                    sc = subs[0]
+                    row["_matched_code"] = sc.get("code", "")
+                    row["_matched_desc"] = sc.get("description", "") or tariff.get("description", "")
+                    row["_matched_duty"] = sc.get("duty", "") or tariff.get("duty", "")
 
         # Persist memory updates to database — BUT ONLY IF the invoice is verified.
         # Unverified / subcode_needed invoices don't touch product memory to avoid
@@ -1362,6 +1373,17 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
                 existing = memory_by_key.get(key)
                 tariff_info = tariff_data.get(code, {})
                 match_info = matched_codes.get(key, {})
+                # Single-subcode auto-match fallback for codes that are
+                # already leaf (e.g. 07031019 has only "0703101900 Other")
+                if not match_info:
+                    subs = (tariff_info.get("subcodes") or []) if tariff_info else []
+                    if len(subs) == 1:
+                        sc = subs[0]
+                        match_info = {
+                            "matched_code": sc.get("code", ""),
+                            "matched_desc": sc.get("description", "") or tariff_info.get("description", ""),
+                            "duty":         sc.get("duty", "") or tariff_info.get("duty", ""),
+                        }
 
                 if existing:
                     updates: dict = {}
@@ -2169,10 +2191,34 @@ async def resolve_invoice(invoice_id: str, body: dict = {}, ctx: dict = Depends(
             continue  # Skip internal SKUs
         existing = db.get_memory_entry(ctx["company_id"], code, desc)
         tariff_info = tariff_data.get(code) or {}
+
+        # Prefer any match info already on the row (from processing).
+        # Else, use the user-provided override (subcode).
+        # Else, if there's only one subcode, use it as the match.
+        row_matched = row.get("_matched_code") or ""
+        auto_match: dict = {}
+        if row_matched:
+            auto_match = {
+                "matched_code": row_matched,
+                "matched_desc": row.get("_matched_desc", "") or tariff_info.get("description", ""),
+                "matched_duty": row.get("_matched_duty", "") or tariff_info.get("duty", ""),
+            }
+        elif subcode:
+            auto_match = {"matched_code": subcode}
+        else:
+            subs = tariff_info.get("subcodes") or []
+            if len(subs) == 1:
+                sc = subs[0]
+                auto_match = {
+                    "matched_code": sc.get("code", ""),
+                    "matched_desc": sc.get("description", "") or tariff_info.get("description", ""),
+                    "matched_duty": sc.get("duty", "") or tariff_info.get("duty", ""),
+                }
+
         if existing:
             updates = {"confirmed": True}
-            if subcode:
-                updates["matched_code"] = subcode
+            if auto_match.get("matched_code") and not existing.get("matched_code"):
+                updates.update({k: v for k, v in auto_match.items() if v})
             old_tariff = existing.get("tariff") or {}
             if not old_tariff.get("subcodes") and tariff_info.get("subcodes"):
                 updates["tariff"] = tariff_info
@@ -2184,8 +2230,9 @@ async def resolve_invoice(invoice_id: str, body: dict = {}, ctx: dict = Depends(
                 "confirmed": True,
                 "tariff": tariff_info,
             }
-            if subcode:
-                entry["matched_code"] = subcode
+            for k, v in auto_match.items():
+                if v:
+                    entry[k] = v
             db.upsert_memory(ctx["company_id"], entry)
 
     db.update_invoice(invoice_id, ctx["company_id"], {"status": "verified"})
