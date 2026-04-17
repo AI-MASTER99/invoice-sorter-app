@@ -1618,11 +1618,130 @@ async def api_change_password(username: str, body: dict = {}, ctx: dict = Depend
 # ---------------------------------------------------------------------------
 # Tariff search endpoint
 # ---------------------------------------------------------------------------
+async def _tariff_code_lookup(code: str) -> list[dict]:
+    """Look up a numeric tariff code directly. Handles 4-10 digit codes:
+    - 10 digits  → commodity leaf: return with duty/vat + description
+    - 8/9 digits → pad to 10 and try commodity; if non-leaf, list all children
+    - 6/7 digits → subheading: list children
+    - 4/5 digits → heading: list commodities under that heading
+    - 2/3 digits → chapter: list headings under that chapter
+    """
+    headers = {"Accept": "application/json"}
+    results: list[dict] = []
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        # Try exact commodity first (pad to 10 digits)
+        code10 = code.ljust(10, "0")[:10]
+
+        # 1) Direct commodity (leaf) — only if the code was specific enough
+        # (8-10 digits). For shorter codes we go straight to listing children.
+        if len(code) >= 8:
+            r = await client.get(
+                f"https://www.trade-tariff.service.gov.uk/api/v2/commodities/{code10}",
+                headers=headers,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                attrs = data.get("data", {}).get("attributes", {})
+                # Only treat as leaf result if it's actually declarable
+                if attrs.get("declarable"):
+                    duty, vat = _extract_duty_vat(data)
+                    desc = re.sub(r"<[^>]+>", "", attrs.get("description", "") or "").strip()
+                    results.append({
+                        "code": code10,
+                        "description": desc,
+                        "declarable": True,
+                        "kind": "commodity",
+                        "duty": duty or "—",
+                        "vat":  vat  or "0%",
+                    })
+
+        # 2) Non-leaf code → try subheading for children
+        if not results and len(code) >= 6:
+            r2 = await client.get(
+                f"https://www.trade-tariff.service.gov.uk/api/v2/subheadings/{code10}-80",
+                headers=headers,
+            )
+            if r2.status_code == 200:
+                data = r2.json()
+                for item in data.get("included", []):
+                    if item.get("type") != "commodity":
+                        continue
+                    a = item.get("attributes", {})
+                    cd = a.get("goods_nomenclature_item_id", "")
+                    desc = re.sub(r"<[^>]+>", "", a.get("description", "") or "").strip()
+                    if cd and desc:
+                        results.append({
+                            "code": cd,
+                            "description": desc,
+                            "declarable": bool(a.get("leaf")),
+                            "kind": "commodity",
+                            "duty": "—",
+                            "vat":  "0%",
+                        })
+
+        # 3) Heading level (4-digit)
+        if not results and len(code) >= 4:
+            heading_code = code[:4]
+            r3 = await client.get(
+                f"https://www.trade-tariff.service.gov.uk/api/v2/headings/{heading_code}",
+                headers=headers,
+            )
+            if r3.status_code == 200:
+                data = r3.json()
+                for item in data.get("included", []):
+                    if item.get("type") != "commodity":
+                        continue
+                    a = item.get("attributes", {})
+                    cd = a.get("goods_nomenclature_item_id", "")
+                    desc = re.sub(r"<[^>]+>", "", a.get("description", "") or "").strip()
+                    if cd and desc:
+                        results.append({
+                            "code": cd,
+                            "description": desc,
+                            "declarable": bool(a.get("leaf")),
+                            "kind": "commodity",
+                            "duty": "—",
+                            "vat":  "0%",
+                        })
+
+        # 4) Enrich top 8 declarable commodities with real duty rates
+        async def enrich(item):
+            if not item.get("declarable"):
+                return item
+            try:
+                info = await lookup_tariff(item["code"])
+                if info:
+                    item["duty"] = info.get("duty") or "—"
+                    item["vat"]  = info.get("vat")  or "0%"
+            except Exception:
+                pass
+            return item
+
+        import asyncio as _asyncio
+        top = results[:8]
+        enriched = await _asyncio.gather(*(enrich(it) for it in top), return_exceptions=True)
+        for i, e in enumerate(enriched):
+            if isinstance(e, dict):
+                results[i] = e
+
+    return results[:15]
+
+
 @app.get("/tariff/search")
 async def tariff_search(q: str = "", ctx: dict = Depends(require_auth)):
-    if not q.strip():
+    query = q.strip()
+    if not query:
         return []
-    url = f"https://www.trade-tariff.service.gov.uk/api/v2/search?q={q.strip()}"
+
+    # If the query is numeric (e.g. "0406", "04061030", "0406103090"), do a
+    # direct lookup instead of fuzzy text search. Users expect to find the
+    # exact code they typed, not a text-based match.
+    digits_only = re.sub(r"[\s.\-]", "", query)
+    if digits_only.isdigit() and 2 <= len(digits_only) <= 10:
+        return await _tariff_code_lookup(digits_only)
+
+    url = f"https://www.trade-tariff.service.gov.uk/api/v2/search?q={query}"
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             r = await client.get(url, headers={"Accept": "application/json"})
