@@ -1078,58 +1078,98 @@ def build_excel(rows: list[dict], tariff_data: dict | None, sheet_title: str) ->
 
     # ── Tariff sheet (full export only) ───────────────────────
     if tariff_data:
+        from openpyxl.styles import Border, Side
+        thick_top    = Border(top=Side(style="medium", color="1F3864"))
+        match_fill   = PatternFill("solid", fgColor="DCFCE7")   # green matched row
+        group_fill   = PatternFill("solid", fgColor="EEF1FF")   # group header band
+        section_fill = PatternFill("solid", fgColor="F8FAFF")   # sub-code options band
+
         ws2 = wb.create_sheet("Tariff Lookup")
-        tariff_cols = ["Commodity Code", "Description", "Duty Rate", "VAT Rate",
-                       "Sub-code", "Sub-code Description", "Sub-code Duty"]
-        tariff_widths = [18, 40, 18, 12, 18, 40, 18]
+        tariff_cols = ["Commodity Code", "Product", "Matched Sub-code",
+                       "Matched Description", "Duty", "VAT"]
+        tariff_widths = [18, 44, 20, 44, 22, 10]
         for ci, h in enumerate(tariff_cols, start=1):
             c = ws2.cell(row=1, column=ci, value=h)
             c.font = _FONT_HDR
             c.fill = _FILL_HEADER
             c.alignment = Alignment(horizontal="center", vertical="center")
-
-        row_idx = 2
-        for code, info in tariff_data.items():
-            subcodes = info.get("subcodes", [])
-            num_rows = max(1, len(subcodes))
-            fill = _FILL_ALT if row_idx % 2 == 0 else None
-
-            # Main commodity info (first row of this group)
-            for ci, v in enumerate([code, info.get("description",""),
-                                     info.get("duty",""), info.get("vat","")], start=1):
-                c = ws2.cell(row=row_idx, column=ci, value=v)
-                c.font = _FONT_CELL
-                if fill:
-                    c.fill = fill
-
-            # Sub-codes (one per row)
-            for si, sc in enumerate(subcodes):
-                r = row_idx + si
-                if si > 0:
-                    # Fill main columns with empty for merged look
-                    for ci in range(1, 5):
-                        c = ws2.cell(row=r, column=ci)
-                        if fill:
-                            c.fill = fill
-                ws2.cell(row=r, column=5, value=sc.get("code", "")).font = _FONT_CELL
-                ws2.cell(row=r, column=6, value=sc.get("description", "")).font = _FONT_CELL
-                ws2.cell(row=r, column=7, value=sc.get("duty", "")).font = _FONT_CELL
-                for ci in range(5, 8):
-                    if fill:
-                        ws2.cell(row=r, column=ci).fill = fill
-
-            # If no subcodes, still one empty row for sub-code columns
-            if not subcodes:
-                for ci in range(5, 8):
-                    c = ws2.cell(row=row_idx, column=ci, value="—")
-                    c.font = _FONT_CELL
-                    if fill:
-                        c.fill = fill
-
-            row_idx += num_rows
-
         for ci, w in enumerate(tariff_widths, start=1):
             ws2.column_dimensions[get_column_letter(ci)].width = w
+
+        # Group the invoice rows by commodity code so each group renders
+        # together with a clear separator.
+        from collections import OrderedDict
+        rows_by_code: OrderedDict[str, list[dict]] = OrderedDict()
+        for r in rows:
+            code = (r.get("Comm./imp. cod") or "").strip()
+            if not code:
+                continue
+            rows_by_code.setdefault(code, []).append(r)
+
+        row_idx = 2
+        for code, product_rows in rows_by_code.items():
+            info = tariff_data.get(code, {})
+            subcodes = info.get("subcodes", []) or []
+            group_desc = info.get("description", "")
+
+            # 1) Group header row — thick top border, bold, light-blue fill
+            for ci in range(1, 7):
+                c = ws2.cell(row=row_idx, column=ci)
+                c.fill = group_fill
+                c.border = thick_top
+            gh = ws2.cell(row=row_idx, column=1, value=code)
+            gh.font = _FONT_HDR
+            gh2 = ws2.cell(row=row_idx, column=2, value=f"{group_desc}  ({len(product_rows)} product{'s' if len(product_rows) != 1 else ''})")
+            gh2.font = _FONT_HDR
+            row_idx += 1
+
+            # 2) One row per invoice product line using this code
+            for pr in product_rows:
+                desc = pr.get("Description of Goods", "") or ""
+                matched_code = pr.get("_matched_code", "") or ""
+                matched_desc = pr.get("_matched_desc", "") or ""
+                matched_duty = pr.get("_matched_duty", "") or info.get("duty", "")
+                vat_val = info.get("vat", "") or ""
+                is_match = bool(matched_code)
+                row_fill = match_fill if is_match else None
+                cells = [code, desc, matched_code or "—", matched_desc or "—",
+                         matched_duty or "—", vat_val or "—"]
+                for ci, v in enumerate(cells, start=1):
+                    c = ws2.cell(row=row_idx, column=ci, value=v)
+                    c.font = _FONT_CELL
+                    if row_fill:
+                        c.fill = row_fill
+                row_idx += 1
+
+            # 3) Available sub-codes section for this group
+            if subcodes:
+                lbl = ws2.cell(row=row_idx, column=1, value="   All options:")
+                lbl.font = _FONT_CELL
+                lbl.fill = section_fill
+                for ci in range(2, 7):
+                    ws2.cell(row=row_idx, column=ci).fill = section_fill
+                row_idx += 1
+                for sc in subcodes:
+                    sc_code = sc.get("code", "")
+                    # Is this subcode matched by ANY product in this group?
+                    any_match = any(
+                        (pr.get("_matched_code") or "") == sc_code for pr in product_rows
+                    )
+                    row_fill = match_fill if any_match else section_fill
+                    suffix = "  ← matched" if any_match else ""
+                    cells = [
+                        "",                                             # empty col 1
+                        f"      {sc_code}",                             # indented code
+                        "",                                             # empty matched col
+                        sc.get("description", "") + suffix,             # description
+                        sc.get("duty", ""),                             # duty
+                        "",
+                    ]
+                    for ci, v in enumerate(cells, start=1):
+                        c = ws2.cell(row=row_idx, column=ci, value=v)
+                        c.font = _FONT_CELL
+                        c.fill = row_fill
+                    row_idx += 1
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -1334,6 +1374,26 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
         matched_codes: dict[str, dict] = {}
         if products_to_match:
             matched_codes = await match_subcodes(client, products_to_match, tariff_data)
+
+        # Enrich each row with its matched sub-code (from memory if already
+        # known, otherwise from this run's match_subcodes). This lets the
+        # Excel export and any consumer see the per-product match directly.
+        for row in final_rows:
+            code = row.get("Comm./imp. cod", "").strip()
+            desc = row.get("Description of Goods", "").strip()
+            if not code or not desc:
+                continue
+            key = f"{code}::{desc}"
+            existing = memory_by_key.get(key) or {}
+            if existing.get("matched_code"):
+                row["_matched_code"] = existing["matched_code"]
+                row["_matched_desc"] = existing.get("matched_desc", "")
+                row["_matched_duty"] = existing.get("matched_duty", "")
+            elif matched_codes.get(key):
+                m = matched_codes[key]
+                row["_matched_code"] = m.get("matched_code", "")
+                row["_matched_desc"] = m.get("matched_desc", "")
+                row["_matched_duty"] = m.get("duty", "")
 
         # Persist memory updates to database — BUT ONLY IF the invoice is verified.
         # Unverified / subcode_needed invoices don't touch product memory to avoid
