@@ -231,9 +231,28 @@ async function retryFailedJob(jobId) {
 }
 
 async function dismissFailedJob(id) {
-  delete knownJobs[id];
-  // Optional: could DELETE /jobs/{id} in future — for now just hide from view
-  refreshJobs();
+  try {
+    await api('DELETE', `/jobs/${id}`);
+    delete knownJobs[id];
+    toast('Dismissed', 'info');
+    refreshJobs();
+  } catch (e) {
+    toast('Failed to dismiss: ' + e.message, 'error');
+  }
+}
+
+async function deleteInvoice(invoiceId, supplier) {
+  const label = supplier ? `"${supplier}"` : 'this invoice';
+  if (!confirm(`Permanently delete ${label}?\n\nThis removes the invoice, its Excel exports and the original PDF. This cannot be undone.`)) return;
+  try {
+    await api('DELETE', `/invoices/${invoiceId}`);
+    toast('Invoice deleted', 'success');
+    refreshInvoices();
+    refreshInvoicesPage();
+    refreshStats();
+  } catch (e) {
+    toast('Delete failed: ' + e.message, 'error');
+  }
 }
 
 function cancelJob(id) {
@@ -324,21 +343,27 @@ function badgeHtml(status) {
 }
 
 function actionsHtml(inv) {
+  const sup = escHtml(inv.supplier || '');
+  const del = `<button class="btn-export btn-delete" title="Delete permanently" onclick="deleteInvoice('${inv.id}', '${sup}')">🗑</button>`;
   if (inv.status === 'verified') {
     return `
       <button class="btn-export btn-full"   onclick="exportFull('${inv.id}')">Full Excel</button>
-      <button class="btn-export btn-raw"    onclick="exportRaw('${inv.id}')">Raw only</button>`;
+      <button class="btn-export btn-raw"    onclick="exportRaw('${inv.id}')">Raw only</button>
+      ${del}`;
   }
   if (inv.status === 'subcode_needed') {
     return `
-      <button class="btn-export btn-resolve" onclick="openResolve('${inv.id}', '${escHtml(inv.supplier)}')">Resolve</button>
+      <button class="btn-export btn-resolve" onclick="openResolve('${inv.id}', '${sup}')">Resolve</button>
       <button class="btn-export btn-retry"   onclick="retryInvoice('${inv.id}')">↻ Retry</button>
-      <button class="btn-export btn-raw"     onclick="exportRaw('${inv.id}')">Raw only</button>`;
+      <button class="btn-export btn-raw"     onclick="exportRaw('${inv.id}')">Raw only</button>
+      ${del}`;
   }
   if (inv.status === 'failed') {
-    return `<button class="btn-export btn-retry" onclick="retryInvoice('${inv.id}')">Retry</button>`;
+    return `
+      <button class="btn-export btn-retry" onclick="retryInvoice('${inv.id}')">Retry</button>
+      ${del}`;
   }
-  return '';
+  return del;
 }
 
 function exportFull(id)  { window.open(`/invoices/${id}/export/full`, '_blank'); }

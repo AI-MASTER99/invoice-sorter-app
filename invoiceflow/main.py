@@ -1878,6 +1878,48 @@ async def retry_invoice(invoice_id: str, ctx: dict = Depends(require_auth)):
     return {"job_id": job["id"]}
 
 
+@app.delete("/jobs/{job_id}")
+async def delete_job(job_id: str, ctx: dict = Depends(require_auth)):
+    """Delete a job (used by Dismiss on failed jobs). Also cleans up the
+    stored PDF upload if it exists."""
+    job = db.get_job(job_id)
+    if not job or job.get("company_id") != ctx["company_id"]:
+        raise HTTPException(404, "Job not found")
+    # Best-effort cleanup of the stored upload
+    filename = job.get("filename") or ""
+    safe_name = re.sub(r"[^\w\-.]", "_", filename)
+    upload_path = f"{ctx['company_id']}/{job_id}_{safe_name}"
+    try:
+        db.storage_delete(db.BUCKET_UPLOADS, upload_path)
+    except Exception:
+        pass
+    # Delete the job record
+    db.sb.table("jobs").delete().eq("id", job_id).eq("company_id", ctx["company_id"]).execute()
+    return {"ok": True}
+
+
+@app.delete("/invoices/{invoice_id}")
+async def delete_invoice_endpoint(invoice_id: str, ctx: dict = Depends(require_auth)):
+    """Permanently delete an invoice and its stored Excel/PDF files."""
+    inv = db.get_invoice(invoice_id, ctx["company_id"])
+    if not inv:
+        raise HTTPException(404, "Invoice not found")
+    # Best-effort cleanup of storage objects
+    for path_field, bucket in (
+        ("full_xlsx_path", db.BUCKET_EXPORTS),
+        ("raw_xlsx_path",  db.BUCKET_EXPORTS),
+        ("upload_path",    db.BUCKET_UPLOADS),
+    ):
+        p = inv.get(path_field)
+        if p:
+            try:
+                db.storage_delete(bucket, p)
+            except Exception:
+                pass
+    db.delete_invoice(invoice_id, ctx["company_id"])
+    return {"ok": True}
+
+
 @app.post("/invoices/{invoice_id}/resolve")
 async def resolve_invoice(invoice_id: str, body: dict = {}, ctx: dict = Depends(require_auth)):
     """Mark a subcode_needed invoice as verified after manual review.

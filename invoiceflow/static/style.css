@@ -736,6 +736,19 @@ tbody tr:hover { background: var(--bg-soft); }
 }
 .btn-retry:hover { background: #FECACA; }
 
+.btn-delete {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  padding: 6px 10px;
+  font-size: 13px;
+}
+.btn-delete:hover {
+  background: var(--red-bg);
+  color: var(--red);
+  border-color: rgba(239,68,68,0.25);
+}
+
 /* ── Tabs (Invoices page) ───────────────────────────────── */
 .tab-bar {
   display: flex;
