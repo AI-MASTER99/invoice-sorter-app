@@ -1079,10 +1079,9 @@ def build_excel(rows: list[dict], tariff_data: dict | None, sheet_title: str) ->
     # ── Tariff sheet (full export only) ───────────────────────
     if tariff_data:
         from openpyxl.styles import Border, Side
-        thick_top    = Border(top=Side(style="medium", color="1F3864"))
-        match_fill   = PatternFill("solid", fgColor="DCFCE7")   # green matched row
-        group_fill   = PatternFill("solid", fgColor="EEF1FF")   # group header band
-        section_fill = PatternFill("solid", fgColor="F8FAFF")   # sub-code options band
+        thick_top  = Border(top=Side(style="medium", color="1F3864"))
+        match_fill = PatternFill("solid", fgColor="DCFCE7")   # green for matched cells
+        group_fill = PatternFill("solid", fgColor="EEF1FF")   # light-blue group header band
 
         ws2 = wb.create_sheet("Tariff Lookup")
         tariff_cols = ["Commodity Code", "Product", "Matched Sub-code",
@@ -1096,8 +1095,7 @@ def build_excel(rows: list[dict], tariff_data: dict | None, sheet_title: str) ->
         for ci, w in enumerate(tariff_widths, start=1):
             ws2.column_dimensions[get_column_letter(ci)].width = w
 
-        # Group the invoice rows by commodity code so each group renders
-        # together with a clear separator.
+        # Group invoice rows by commodity code so groups render with a separator
         from collections import OrderedDict
         rows_by_code: OrderedDict[str, list[dict]] = OrderedDict()
         for r in rows:
@@ -1109,21 +1107,22 @@ def build_excel(rows: list[dict], tariff_data: dict | None, sheet_title: str) ->
         row_idx = 2
         for code, product_rows in rows_by_code.items():
             info = tariff_data.get(code, {})
-            subcodes = info.get("subcodes", []) or []
             group_desc = info.get("description", "")
 
-            # 1) Group header row — thick top border, bold, light-blue fill
+            # 1) Group header row — thick top border + light-blue band
             for ci in range(1, 7):
                 c = ws2.cell(row=row_idx, column=ci)
                 c.fill = group_fill
                 c.border = thick_top
-            gh = ws2.cell(row=row_idx, column=1, value=code)
-            gh.font = _FONT_HDR
-            gh2 = ws2.cell(row=row_idx, column=2, value=f"{group_desc}  ({len(product_rows)} product{'s' if len(product_rows) != 1 else ''})")
-            gh2.font = _FONT_HDR
+            ws2.cell(row=row_idx, column=1, value=code).font = _FONT_HDR
+            ws2.cell(
+                row=row_idx, column=2,
+                value=f"{group_desc}  ({len(product_rows)} product{'s' if len(product_rows) != 1 else ''})",
+            ).font = _FONT_HDR
             row_idx += 1
 
-            # 2) One row per invoice product line using this code
+            # 2) One row per invoice product line — ONLY the matched-info cells
+            #    (cols 3-6: sub-code, description, duty, vat) get the green fill
             for pr in product_rows:
                 desc = pr.get("Description of Goods", "") or ""
                 matched_code = pr.get("_matched_code", "") or ""
@@ -1131,45 +1130,21 @@ def build_excel(rows: list[dict], tariff_data: dict | None, sheet_title: str) ->
                 matched_duty = pr.get("_matched_duty", "") or info.get("duty", "")
                 vat_val = info.get("vat", "") or ""
                 is_match = bool(matched_code)
-                row_fill = match_fill if is_match else None
-                cells = [code, desc, matched_code or "—", matched_desc or "—",
-                         matched_duty or "—", vat_val or "—"]
+
+                cells = [
+                    code,                            # col 1: never green
+                    desc,                            # col 2: never green
+                    matched_code or "—",             # col 3: green if matched
+                    matched_desc or "—",             # col 4: green if matched
+                    matched_duty or "—",             # col 5: green if matched
+                    vat_val or "—",                  # col 6: green if matched
+                ]
                 for ci, v in enumerate(cells, start=1):
                     c = ws2.cell(row=row_idx, column=ci, value=v)
                     c.font = _FONT_CELL
-                    if row_fill:
-                        c.fill = row_fill
+                    if is_match and ci >= 3:
+                        c.fill = match_fill
                 row_idx += 1
-
-            # 3) Available sub-codes section for this group
-            if subcodes:
-                lbl = ws2.cell(row=row_idx, column=1, value="   All options:")
-                lbl.font = _FONT_CELL
-                lbl.fill = section_fill
-                for ci in range(2, 7):
-                    ws2.cell(row=row_idx, column=ci).fill = section_fill
-                row_idx += 1
-                for sc in subcodes:
-                    sc_code = sc.get("code", "")
-                    # Is this subcode matched by ANY product in this group?
-                    any_match = any(
-                        (pr.get("_matched_code") or "") == sc_code for pr in product_rows
-                    )
-                    row_fill = match_fill if any_match else section_fill
-                    suffix = "  ← matched" if any_match else ""
-                    cells = [
-                        "",                                             # empty col 1
-                        f"      {sc_code}",                             # indented code
-                        "",                                             # empty matched col
-                        sc.get("description", "") + suffix,             # description
-                        sc.get("duty", ""),                             # duty
-                        "",
-                    ]
-                    for ci, v in enumerate(cells, start=1):
-                        c = ws2.cell(row=row_idx, column=ci, value=v)
-                        c.font = _FONT_CELL
-                        c.fill = row_fill
-                    row_idx += 1
 
     buf = io.BytesIO()
     wb.save(buf)
