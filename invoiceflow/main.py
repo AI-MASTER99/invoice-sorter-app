@@ -1029,7 +1029,7 @@ def build_excel(rows: list[dict], tariff_data: dict | None, sheet_title: str) ->
     # ── Tariff sheet (full export only) ───────────────────────
     if tariff_data:
         ws2 = wb.create_sheet("Tariff Lookup")
-        tariff_cols = ["Invoice Code", "Description", "Duty Rate", "VAT Rate",
+        tariff_cols = ["Commodity Code", "Description", "Duty Rate", "VAT Rate",
                        "Sub-code", "Sub-code Description", "Sub-code Duty"]
         tariff_widths = [18, 40, 18, 12, 18, 40, 18]
         for ci, h in enumerate(tariff_cols, start=1):

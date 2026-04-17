@@ -485,7 +485,7 @@ function renderMemoryTable(items) {
   container.innerHTML = `
     <table class="memory-table">
       <thead><tr>
-        <th>Invoice code</th>
+        <th>Commodity code</th>
         <th>Description</th>
         <th>Matched sub-code</th>
         <th>Duty</th>
