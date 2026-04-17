@@ -255,10 +255,15 @@ async function deleteInvoice(invoiceId, supplier) {
   }
 }
 
-function cancelJob(id) {
-  delete knownJobs[id];
-  refreshJobs();
-  toast('Job removed from view.', 'info');
+async function cancelJob(id) {
+  try {
+    await api('DELETE', `/jobs/${id}`);
+    delete knownJobs[id];
+    toast('Cancelled', 'info');
+    refreshJobs();
+  } catch (e) {
+    toast('Cancel failed: ' + e.message, 'error');
+  }
 }
 
 /* ── Dashboard invoice preview ────────────────────────────── */
