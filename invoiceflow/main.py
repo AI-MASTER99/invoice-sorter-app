@@ -1522,13 +1522,16 @@ app.add_middleware(
 )
 
 
-# Belt-and-braces noindex: the app subdomain (app.invoice-sorter.com) is a
-# private, login-gated tool. We never want it to appear in Google results.
-# Marketing traffic goes to www.invoice-sorter.com (a different repo).
+# The login page is public (Google can index it so returning users can find
+# the sign-in URL). Everything else on app.invoice-sorter.com is login-gated
+# and should not appear in search results.
 @app.middleware("http")
 async def add_noindex_header(request: Request, call_next):
     response = await call_next(request)
-    response.headers["X-Robots-Tag"] = "noindex, nofollow"
+    path = request.url.path
+    is_login = path in ("/login", "/login.html") or path.startswith("/static/login")
+    if not is_login:
+        response.headers["X-Robots-Tag"] = "noindex, nofollow"
     return response
 
 MIME_MAP = {

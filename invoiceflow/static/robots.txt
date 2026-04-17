@@ -1,5 +1,6 @@
+# app.invoice-sorter.com — the login page is public so Google may index it,
+# but everything else is login-gated and should not appear in search results.
 User-agent: *
+Allow: /login
+Allow: /login.html
 Disallow: /
-
-# The marketing site is at https://www.invoice-sorter.com/
-# This subdomain (app.invoice-sorter.com) hosts the private app — please do not index.
