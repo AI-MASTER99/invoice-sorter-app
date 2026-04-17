@@ -479,6 +479,7 @@ function renderMemoryTable(items) {
         <td class="tariff-cell">${escHtml(m.tariff?.vat || '—')}</td>
         <td class="subcodes-cell">${subsHtml}</td>
         <td>${statusBadge}</td>
+        <td><button class="btn-delete" title="Delete from memory" onclick="deleteMemoryEntry('${m.id}', '${escHtml(m.description)}')">🗑</button></td>
       </tr>`;
   }
 
@@ -492,9 +493,34 @@ function renderMemoryTable(items) {
         <th>VAT</th>
         <th>All possible sub-codes</th>
         <th>Status</th>
+        <th></th>
       </tr></thead>
       <tbody>${rows}</tbody>
     </table>`;
+}
+
+async function deleteMemoryEntry(entryId, desc) {
+  if (!confirm(`Remove "${desc}" from product memory?\n\nIt will be re-learned if it appears on a future verified invoice.`)) return;
+  try {
+    await api('DELETE', `/memory/${entryId}`);
+    toast('Removed from memory', 'success');
+    refreshMemoryPage();
+    refreshStats();
+  } catch (e) {
+    toast('Delete failed: ' + e.message, 'error');
+  }
+}
+
+async function cleanupInvalidMemory() {
+  if (!confirm('Remove all memory entries where the code is not a real HS/commodity code (e.g. internal SKUs like 22.289)?\n\nReal customs codes (6-10 digits starting with a number) are kept.')) return;
+  try {
+    const r = await api('POST', '/memory/cleanup-invalid');
+    toast(`Removed ${r.removed} invalid entries`, 'success');
+    refreshMemoryPage();
+    refreshStats();
+  } catch (e) {
+    toast('Cleanup failed: ' + e.message, 'error');
+  }
 }
 
 document.getElementById('memory-search')?.addEventListener('input', () => {

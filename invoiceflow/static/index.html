@@ -261,6 +261,7 @@
           <div style="display:flex;gap:8px;align-items:center">
             <input class="memory-search" id="memory-search" type="text" placeholder="Search products…" />
             <button class="btn-refresh-tariff" id="btn-refresh-tariff" title="Refresh tariff data for all entries">↻ Refresh tariff</button>
+            <button class="btn-refresh-tariff" onclick="cleanupInvalidMemory()" title="Remove entries whose code is not a real HS/commodity code">🧹 Clean invalid</button>
           </div>
         </div>
         <div id="memory-list"></div>
@@ -413,6 +414,6 @@
 <!-- TOAST CONTAINER -->
 <div id="toast-container"></div>
 
-<script src="/app.js?v=8"></script>
+<script src="/app.js?v=9"></script>
 </body>
 </html>

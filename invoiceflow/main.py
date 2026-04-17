@@ -668,6 +668,24 @@ def _row_key(r: dict) -> tuple:
     )
 
 
+def is_real_commodity_code(code: str) -> bool:
+    """Return True only for strings that look like real HS/commodity codes.
+    Real codes: 6-10 digits, possibly with spaces or dots but mostly numeric.
+    Rejected: SKU patterns (22.289, CC0455.025, 115.201), text-heavy codes,
+    or anything shorter than 6 digits. This prevents internal article numbers
+    from polluting product memory."""
+    if not code:
+        return False
+    digits = re.sub(r"\D", "", code)
+    if len(digits) < 6 or len(digits) > 10:
+        return False
+    # Reject codes that start with letters (like "CC0455.025")
+    stripped = code.strip()
+    if stripped and not stripped[0].isdigit():
+        return False
+    return True
+
+
 def rows_match(a: list[dict], b: list[dict]) -> tuple[bool, list[str]]:
     """Check if two extractions match on key numeric/code fields,
     after sorting rows so order differences don't cause false mismatches.
@@ -1293,6 +1311,9 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
                 code = row.get("Comm./imp. cod", "").strip()
                 desc = row.get("Description of Goods", "").strip()
                 if not code or not desc:
+                    continue
+                # Skip rows whose "code" is actually an internal SKU
+                if not is_real_commodity_code(code):
                     continue
                 key = f"{code}::{desc}"
                 existing = memory_by_key.get(key)
@@ -1937,6 +1958,8 @@ async def resolve_invoice(invoice_id: str, body: dict = {}, ctx: dict = Depends(
         desc = (row.get("Description of Goods") or "").strip()
         if not code or not desc:
             continue
+        if not is_real_commodity_code(code):
+            continue  # Skip internal SKUs
         existing = db.get_memory_entry(ctx["company_id"], code, desc)
         tariff_info = tariff_data.get(code) or {}
         if existing:
@@ -1979,6 +2002,34 @@ def confirm_memory(entry_id: str, body: dict = {}, ctx: dict = Depends(require_a
         updates["matched_code"] = subcode
     db.update_memory(entry_id, ctx["company_id"], updates)
     return {"ok": True}
+
+
+@app.delete("/memory/{entry_id}")
+def delete_memory_entry(entry_id: str, ctx: dict = Depends(require_auth)):
+    (db.sb.table("product_memory")
+     .delete()
+     .eq("id", entry_id)
+     .eq("company_id", ctx["company_id"])
+     .execute())
+    return {"ok": True}
+
+
+@app.post("/memory/cleanup-invalid")
+def cleanup_invalid_memory(ctx: dict = Depends(require_auth)):
+    """Remove memory entries whose 'code' is not a real commodity code
+    (SKUs, short strings, alphanumeric article numbers)."""
+    entries = db.list_memory(ctx["company_id"])
+    removed = 0
+    for e in entries:
+        code = (e.get("code") or "").strip()
+        if not is_real_commodity_code(code):
+            (db.sb.table("product_memory")
+             .delete()
+             .eq("id", e["id"])
+             .eq("company_id", ctx["company_id"])
+             .execute())
+            removed += 1
+    return {"removed": removed}
 
 
 # ---------------------------------------------------------------------------
