@@ -1521,6 +1521,16 @@ app.add_middleware(
     allow_credentials=True,
 )
 
+
+# Belt-and-braces noindex: the app subdomain (app.invoice-sorter.com) is a
+# private, login-gated tool. We never want it to appear in Google results.
+# Marketing traffic goes to www.invoice-sorter.com (a different repo).
+@app.middleware("http")
+async def add_noindex_header(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Robots-Tag"] = "noindex, nofollow"
+    return response
+
 MIME_MAP = {
     ".pdf": "application/pdf",
     ".jpg": "image/jpeg",

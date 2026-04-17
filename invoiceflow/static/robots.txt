@@ -1,0 +1,5 @@
+User-agent: *
+Disallow: /
+
+# The marketing site is at https://www.invoice-sorter.com/
+# This subdomain (app.invoice-sorter.com) hosts the private app — please do not index.
