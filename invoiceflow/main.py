@@ -410,9 +410,26 @@ Columns (exactly in this order)
                       NOT a monetary amount. It is usually a short alphanumeric code
                       (e.g. "SE 2692", "FAT/2026/001", "INV-12345").
                       Use the SAME invoice number for every row from the same document.
-2. Comm./imp. cod     HS/commodity code — see formatting rules below.
+2. Comm./imp. cod     HS/commodity code — ONLY the customs tariff code, NOT internal SKUs.
+                      Valid examples: "07020010", "04061030", "nomenclatura 07094000", HS codes.
+                      Invalid — DO NOT use these: "22.289", "115.201", "CC0455.025", "453.000",
+                      article/product/SKU numbers that contain a dot or start with letters.
+                      These are internal item codes from the supplier, NOT customs codes.
+                      If the invoice line does not show a real customs/HS/nomenclature code,
+                      LEAVE THIS CELL BLANK. Do NOT use the article number as a fallback.
+                      See the formatting rules below for valid code handling.
 3. Description of Goods   Product description exactly as written. Blank if absent.
-4. Origin             Country of origin — ISO Alpha-2 (e.g. IT, ES, CN).
+4. Origin             Country of origin — ISO Alpha-2 code (e.g. IT, ES, CN, JP, TW, CH).
+                      IMPORTANT: On many invoices the origin is written as a bare 2-letter
+                      code between the description and the unit price (no column header).
+                      Examples of lines from a Swiss/Caran d'Ache style invoice:
+                        "0005 115.201 50 BRUSH WITH WATER RESERVOIR LARGE JP 2.05 102.50"
+                         → Origin = JP
+                        "0009 117.103 30 ARTIST PLEXIGLASS PALETTE WHITE 26x13MM CN 3.17 95.10"
+                         → Origin = CN
+                      A 2-letter capitalized token immediately before the unit price is
+                      ALWAYS the origin code. Extract it. If no such code exists and the
+                      invoice also has no explicit origin column, leave blank.
 5. Country            Full English country name matching the ISO code.
 6. Number of Packages     Number of SHIPPING PACKAGES / CARTONS / COLLI for that line.
                           This is the physical package count — look for columns labelled
@@ -426,10 +443,15 @@ Columns (exactly in this order)
                       ("Peso Lordo", "Gross Weight", "Brutto", "Poids Brut", "G.W.").
                       In KG only. Do NOT calculate from unit weight × quantity.
                       Blank if the line has no gross weight column entry.
+                      If the invoice only reports a single TOTAL gross weight at the
+                      bottom (e.g. "GROSS WEIGHT : 1'081.790 KGS") and no per-line
+                      weights, leave this BLANK for every line — Run C will pick up
+                      the total separately.
 8. Net Weight (KG)    Take the value from the invoice's NET WEIGHT column only
                       ("Peso Netto", "Net Weight", "Netto", "Poids Net", "N.W.").
                       In KG only. Do NOT calculate from unit weight × quantity.
                       Blank if the line has no net weight column entry.
+                      Same rule as Gross Weight: blank if only a total is shown.
 9. Value              Line total with currency symbol (€ / $ / £). 2 decimals.
 
 Commodity code formatting rules
