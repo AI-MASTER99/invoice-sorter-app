@@ -670,18 +670,17 @@ def _row_key(r: dict) -> tuple:
 
 def is_real_commodity_code(code: str) -> bool:
     """Return True only for strings that look like real HS/commodity codes.
-    Real codes: 6-10 digits, possibly with spaces or dots but mostly numeric.
-    Rejected: SKU patterns (22.289, CC0455.025, 115.201), text-heavy codes,
-    or anything shorter than 6 digits. This prevents internal article numbers
-    from polluting product memory."""
+    Real codes: 6-10 contiguous digits with NO dots, NO letters, NO slashes.
+    Our extraction pipeline stores them as plain digits ("07094000",
+    "04061030"). Anything else is almost certainly an internal SKU
+    (22.289, 999.190, CC0455.025, 115.201, PRD-123)."""
     if not code:
         return False
-    digits = re.sub(r"\D", "", code)
-    if len(digits) < 6 or len(digits) > 10:
-        return False
-    # Reject codes that start with letters (like "CC0455.025")
     stripped = code.strip()
-    if stripped and not stripped[0].isdigit():
+    # Must be all digits (possibly with surrounding whitespace we already stripped)
+    if not stripped.isdigit():
+        return False
+    if len(stripped) < 6 or len(stripped) > 10:
         return False
     return True
 
