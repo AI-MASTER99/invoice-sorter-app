@@ -787,7 +787,9 @@ async def run_extraction_text(client: anthropic.AsyncAnthropic, pdf_text: str, p
         try:
             message = await client.messages.create(
                 model=model,
-                max_tokens=16000,
+                # 32000 tokens ≈ ~1600 invoice rows. Safe headroom for even the
+                # biggest invoices (Caran d'Ache at 490 rows used ~10K tokens).
+                max_tokens=32000,
                 messages=[{
                     "role": "user",
                     "content": [
@@ -854,7 +856,7 @@ async def run_extraction(client: anthropic.AsyncAnthropic, file_bytes: bytes, mi
 
     message = await client.messages.create(
         model=model,
-        max_tokens=4096,
+        max_tokens=32000,
         messages=[{"role": "user", "content": content_blocks}],
     )
     return message.content[0].text
