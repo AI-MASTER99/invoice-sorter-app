@@ -417,153 +417,254 @@ async def _lookup_tariff_raw(commodity_code: str) -> dict:
 # ---------------------------------------------------------------------------
 # Claude extraction
 # ---------------------------------------------------------------------------
-PROMPT_EXTRACT = """DATA EXTRACTION — STEP 1
+PROMPT_EXTRACT = """INVOICE LINE-ITEM EXTRACTION
 
-CRITICAL OUTPUT RULE — READ FIRST
-Your entire response must be ONLY a TSV table. No thinking, no explanations,
-no comments, no lists, no prose, no markdown. The very first character of
-your response must be the letter "I" (from "Invoice" in the header row).
-The very last character must be the final value of the last row.
-If you write ANY text outside the TSV table, the output is unusable.
-Do not describe what you are doing. Just output the table.
+You MUST call the `record_invoice_lines` tool exactly once with the full
+structured result. Do not output any other text — just the tool call.
 
-Goal
-Extract all line items from the attached invoice into ONE TSV table,
-following the exact column order and rules below.
+Your task
+Read the invoice intelligently. Understand its structure — what columns mean,
+where the totals are, which numbers represent prices vs weights vs quantities.
+Extract ONE object per line item in `rows`. This includes fee/charge rows
+(transport, insurance, stamp duties, handling, pallet/packaging charges)
+— they are line items too, because their monetary value is part of the
+invoice total. Do NOT include a "totals" or "grand total" row — totals
+are extracted separately elsewhere.
 
-Hard rules (strict — no guessing)
-- Extract only information explicitly present on the invoice.
-- Do NOT invent commodity codes, descriptions, quantities,
-  weights, values, currencies, or countries.
-- If a field is missing, leave the cell BLANK.
-- Never infer or assume missing information.
+Use judgment, not rigid pattern matching. Different invoices have different
+layouts and languages.
 
-Output format
-- TAB-SEPARATED VALUES (TSV) only.
-- First row = header row exactly: Invoice\tComm./imp. cod\tDescription of Goods\tOrigin\tCountry\tNumber of Packages\tGross Weight (KG)\tNet Weight (KG)\tValue
-- EVERY data row MUST have exactly 9 TAB-separated fields (blank cells allowed,
-  but there must still be the correct number of tabs). NEVER shift columns:
-  if the invoice has no per-line weight, Gross Weight and Net Weight are BOTH
-  BLANK and the line total goes in the Value column — never cascade values
-  up through empty columns.
-- No explanations, comments, or text outside the table.
-- No markdown code fences. No ``` anywhere.
+Field semantics
 
-Columns (exactly in this order)
-1. Invoice            The invoice/document number (Fattura Nr, Invoice No, Nr, Rechnung-Nr).
-                      Look near headers like "FATTURA", "INVOICE", "Fattura Accompagnatoria".
-                      It is NOT the client reference (ns/rif), NOT the customer number (cliente),
-                      NOT a monetary amount. It is usually a short alphanumeric code
-                      (e.g. "SE 2692", "FAT/2026/001", "INV-12345").
-                      Use the SAME invoice number for every row from the same document.
-2. Comm./imp. cod     HS/commodity code — ONLY the customs tariff code, NOT internal SKUs.
-                      Valid examples: "07020010", "04061030", "nomenclatura 07094000", HS codes.
-                      Invalid — DO NOT use these: "22.289", "115.201", "CC0455.025", "453.000",
-                      article/product/SKU numbers that contain a dot or start with letters.
-                      These are internal item codes from the supplier, NOT customs codes.
-                      If the invoice line does not show a real customs/HS/nomenclature code,
-                      LEAVE THIS CELL BLANK. Do NOT use the article number as a fallback.
-                      See the formatting rules below for valid code handling.
-3. Description of Goods   Product description exactly as written. Blank if absent.
-4. Origin             Country of origin — ISO Alpha-2 code (e.g. IT, ES, CN, JP, TW, CH).
-                      IMPORTANT: On many invoices the origin is written as a bare 2-letter
-                      code between the description and the unit price (no column header).
-                      Examples of lines from a Swiss/Caran d'Ache style invoice:
-                        "0005 115.201 50 BRUSH WITH WATER RESERVOIR LARGE JP 2.05 102.50"
-                         → Origin = JP
-                        "0009 117.103 30 ARTIST PLEXIGLASS PALETTE WHITE 26x13MM CN 3.17 95.10"
-                         → Origin = CN
-                      A 2-letter capitalized token immediately before the unit price is
-                      ALWAYS the origin code. Extract it. If no such code exists and the
-                      invoice also has no explicit origin column, leave blank.
-5. Country            Full English country name matching the ISO code.
-6. Number of Packages     Number of SHIPPING PACKAGES / CARTONS / COLLI for that line.
-                          This is the physical package count — look for columns labelled
-                          "Colli", "Numero Colli", "Cartons", "Packages", "Pkgs", "Colis",
-                          "Kartons", "Pallets", "CT", "Boxes". It is NOT the unit quantity
-                          (pieces, bottles, pcs, stuks, pz, units) and NOT the order qty.
-                          If the invoice only shows a total NUMERO COLLI at the bottom and
-                          no per-line package count, leave this BLANK for every line.
-                          Never compute it from unit quantity.
-7. Gross Weight (KG)  Take the value from the invoice's GROSS WEIGHT column only
-                      ("Peso Lordo", "Gross Weight", "Brutto", "Poids Brut", "G.W.").
-                      In KG only. Do NOT calculate from unit weight × quantity.
-                      Blank if the line has no gross weight column entry.
-                      If the invoice only reports a single TOTAL gross weight at the
-                      bottom (e.g. "GROSS WEIGHT : 1'081.790 KGS") and no per-line
-                      weights, leave this BLANK for every line — Run C will pick up
-                      the total separately.
-8. Net Weight (KG)    Take the value from the invoice's NET WEIGHT column only
-                      ("Peso Netto", "Net Weight", "Netto", "Poids Net", "N.W.").
-                      In KG only. Do NOT calculate from unit weight × quantity.
-                      Blank if the line has no net weight column entry.
-                      Same rule as Gross Weight: blank if only a total is shown.
-9. Value              Line total with currency symbol (€ / $ / £ / CHF). 2 decimals.
-                      The Value is the LAST/RIGHTMOST numeric amount on the line —
-                      the line total (not unit price, not quantity, not weight).
-                      On Swiss/Caran d'Ache style invoices:
-                        "0005 115.201 50 BRUSH WITH WATER RESERVOIR JP 2.05 102.50"
-                        → Value = CHF 102.50 (the last number, line total)
-                        → 2.05 is unit price (ignore)
-                        → 50 is quantity (ignore)
-                      Value is ALWAYS filled unless the line is a note or a header.
-                      Never confuse Value with Gross/Net Weight. If the invoice has no
-                      per-line weight column, the weight cells stay BLANK — never put
-                      the price there.
+invoice_number
+  The invoice/document number printed on the invoice (Fattura, Invoice,
+  Rechnung, Facture, Numero Documento). Same value for every row. NOT the
+  client reference, customer number, or a monetary amount.
 
-CONCRETE EXAMPLES — match these patterns exactly
+currency_symbol
+  The invoice's currency: €, $, £, or CHF. Used for display only.
 
-Example 1 — Italian invoice with per-line weights + commodity codes:
-Input line:
-  "30  CIMA RAPA  IT KG  1  8,80  ,70  8,10  4,000  32,40
-   nomenclatura 07049010"
-Expected TSV row (9 columns, tab-separated):
-  91021436<TAB>07049010<TAB>CIMA RAPA<TAB>IT<TAB>Italy<TAB>1<TAB>8.80<TAB>8.10<TAB>€32.40
+For each row:
 
-Example 2 — Swiss Caran d'Ache invoice, NO commodity code, NO per-line weight:
-Input line:
-  "0001 3.289 30 FIXPENCIL MECH.PEN BLACK 3MM ASS. 8.22 246.60"
-Expected TSV row (9 columns, tab-separated):
-  91021436<TAB><TAB>FIXPENCIL MECH.PEN BLACK 3MM ASS.<TAB><TAB><TAB><TAB><TAB><TAB>CHF 246.60
-(Notice: commodity code blank, origin blank, country blank, packages blank,
-gross weight blank, net weight blank. The line total CHF 246.60 goes in the
-LAST column — Value — never in Gross Weight.)
+commodity_code  — HS/customs/commodity/nomenclature code.
+  ABSOLUTE RULE: include a code ONLY if it is LITERALLY PRINTED on the
+  invoice for that line (or immediately near it, e.g. "nomenclatura
+  07049010" under the description). NEVER derive or guess a code from
+  the product description, product name, product category, or your own
+  knowledge of what HS code a product "should" have. If no code is
+  printed on the invoice, use an empty string. Full stop. Customs fraud
+  risk — a guessed code is worse than a blank one.
 
-Example 3 — Swiss line WITH origin:
-Input line:
-  "0005 115.201 50 BRUSH WITH WATER RESERVOIR LARGE JP 2.05 102.50"
-Expected TSV row:
-  91021436<TAB><TAB>BRUSH WITH WATER RESERVOIR LARGE<TAB>JP<TAB>Japan<TAB><TAB><TAB><TAB>CHF 102.50
+  Do NOT use internal SKUs / article numbers. SKUs typically contain
+  dots or letters ("22.289", "CC0455.025", "115.201", "100002",
+  "110011") — those are supplier product codes, NOT customs codes.
+  Leave empty.
 
-Remember: 9 columns always. Value is ALWAYS the last column and contains the
-line total with currency symbol. Weight columns are ONLY for real weight data
-from a weight column on the invoice — NEVER for monetary values.
+  Real customs codes are 6–10 plain digits ("07020010", "04061030"),
+  often labelled "HS", "Nomenclatura", "Tariff code",
+  "Warenverzeichnis", "Code douanier", "NC", "Zolltarifnummer", or
+  similar.
 
-Commodity code formatting rules
-Step 1 — Determine supplier country from VAT number prefix or address:
-  • VAT prefix IT, ES, FR, DE, NL, BE, PL, PT, … → EU supplier
-  • VAT prefix GB → UK supplier
-  • All others → Unknown
+  If (and ONLY if) a valid printed code is found: format it as —
+  EU supplier (VAT prefix IT/ES/FR/DE/NL/BE/PL/PT/…) → 8 digits
+  (pad with zeros or truncate). UK supplier (GB) → 10 digits.
+  Unknown → copy exactly. Never change the digits themselves.
 
-Step 2 — Apply the correct digit length:
-  • EU supplier  → 8 digits. Truncate to 8 if longer, right-pad with zeros if shorter.
-  • UK supplier  → 10 digits. Right-pad with zeros if shorter.
-  • Unknown      → Copy exactly as printed, no modification.
-  Never invent or change the digits themselves — only pad or truncate.
+description  — product description as written on the invoice.
+  Do NOT prepend the supplier's SKU / article code / product code from
+  a separate Code column onto the description. If the invoice has two
+  columns "Code" (e.g. "P007", "B08", "K110", "C11", "22.289", "CC0455")
+  and "Description" (e.g. "PRECOOKED TORTELLONI W.RICOTTA, SPINACH"),
+  the description field contains ONLY the description text — NOT the
+  code. The SKU is supplier-internal and never needed in the output.
+  If the product name and the SKU are clearly on the same text line
+  with no column separation (e.g. "P007 PRECOOKED TORTELLONI"), use
+  judgment: usually the leading token is still an SKU prefix and should
+  be dropped.
+  Keep secondary labels that ARE genuinely part of the product name
+  (like an old name "ex TORTELLACCI RICOTTA E SPINACI", flavour, size).
 
-Sorting: by Invoice (ascending) → Commodity code (ascending, numeric).
+origin_iso2  — country of origin as ISO Alpha-2 (IT, ES, CN, JP, …).
+  Sources, in order of preference:
+    a) Per-line origin code printed on the line itself (e.g. a bare
+       2-letter code between description and price, or an explicit
+       "Origin" column).
+    b) A blanket origin declaration elsewhere on the invoice that
+       covers all goods — e.g. "goods of ITALY preferential origin",
+       "Country of origin: Germany", "Made in Taiwan", supplier
+       address + no other origin info. Apply it to every GOODS row.
+  If nothing is stated anywhere, leave empty.
+  Do NOT apply origin to fee/charge rows (transport, insurance,
+  certificate fees, stamp duties) — leave empty for those.
 
-Grouping: merge rows where Invoice + Commodity code + Description + Origin are identical.
-For merged rows SUM: gross weight, net weight, value, and packages (only if
-packages were filled per line — otherwise keep blank).
-All numeric values: 2 decimals. Values must be numbers (positive or negative).
+country_name  — full English country name matching origin_iso2. Empty
+  whenever origin_iso2 is empty. (If you leave it, the server will
+  fill it in from the ISO code, so you may also leave it empty.)
+
+num_packages  — physical shipping packages / cartons / colli for that
+  line. NOT unit quantity (pieces, bottles, pcs). If only a total colli
+  count appears at the bottom of the invoice, use null for each line
+  (the total is captured separately).
+
+  EXCEPTION — pallet / packaging lines: when the line itself IS the
+  shipping unit (PALLET, PLT, EUR PALLET, EPAL, CHEP, wooden crate,
+  container), the quantity on that line IS the package count. Treat
+  the quantity as num_packages. Examples:
+    "PLT PALLET          2 No ..."     → num_packages = 2
+    "EUR PALLET          5 PCS ..."    → num_packages = 5
+    "ADDEBITO COSTO PALLETS (DDT 933)" → num_packages = 0 if no qty
+       printed (this is a charge row, not a pallet count row).
+
+gross_kg  — gross weight of that line in KG. Null if not shown.
+  NEVER put a monetary amount into this field.
+
+net_kg  — net weight of that line in KG.
+  If the UM / unit-of-measure for the line is a mass unit (KG, kg, g,
+  gr, lb, lbs, oz, t, ton — these abbreviations are universal across
+  languages), then the quantity IS the net weight. Convert to KG.
+  If the UM is a piece unit (NR, PZ, PCS, UND, EACH, pieces, stuks,
+  bottles, cartons, pallets), set net_kg = null for that line.
+  NEVER put a monetary amount into this field.
+
+value  — the line TOTAL as a plain number (e.g. 3549.18, 240.00, 0.70).
+  Always the LINE TOTAL, never the unit price or quantity.
+  The schema forces this to be a number — do NOT include currency
+  symbols, commas, or thousand separators. Just the numeric value.
+  Required for every row, including fee/charge rows. For a row like
+  "Contributo spese / UM=NR / Qty=1 / Prezzo=240 / Importo=240",
+  value=240 and net_kg=null.
+
+Number parsing
+The invoice may use any of these notations:
+  "3.549,18" (EU thousand + comma decimal) → 3549.18
+  "3,549.18" (US thousand + dot decimal)   → 3549.18
+  "1'234.56" (Swiss apostrophe thousand)   → 1234.56
+  "192,890"  (EU 3-decimal weight)         → 192.89
+  "239,95"   (EU short)                    → 239.95
+Understand the notation THIS invoice uses, then pass a plain float.
+
+Anti-hallucination (strict)
+- Do NOT invent commodity codes, origins, countries, or invoice numbers.
+- Do NOT mistake an SKU/article number for a commodity code.
+- Blank/null is always better than guessed.
+
+Sorting
+Sort rows by invoice_number, then by commodity_code (numeric).
+
+Do NOT merge or sum rows. Keep each invoice line as its own row, even if
+two lines share the same description, commodity code, and origin. The
+user wants the original line-by-line detail preserved for customs
+declaration. Only exception: if a single line item is visually split
+across two rows on the invoice purely for layout reasons (e.g. long
+description wraps to a second row with no new data), treat that as one
+row — but do not sum separate line-items.
 """
 
 PROMPT_VERIFY = (
-    "This is a second independent extraction. "
+    "This is a second INDEPENDENT extraction of the same invoice. "
     "Read the invoice fresh — do not reference any previous result.\n\n"
     + PROMPT_EXTRACT
 )
+
+# Structured output schema for invoice line-item extraction.
+# Using tool_use makes column mis-mapping structurally impossible (fields
+# are keyed, not positional) and numbers are real numbers (no EU/US
+# comma-vs-dot parsing bugs). Forced via tool_choice on the API call.
+EXTRACTION_TOOL = {
+    "name": "record_invoice_lines",
+    "description": (
+        "Record all extracted line items from the invoice into a structured "
+        "table. Call this tool exactly once, with all line items included."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "invoice_number": {
+                "type": "string",
+                "description": (
+                    "The invoice / document number printed on the invoice. "
+                    "NOT a client reference or monetary amount."
+                ),
+            },
+            "currency_symbol": {
+                "type": "string",
+                "description": "The invoice's currency symbol: €, $, £, or CHF.",
+            },
+            "rows": {
+                "type": "array",
+                "description": (
+                    "One object per line item. Include fee / charge rows "
+                    "(transport, insurance, stamp duties, handling). Do NOT "
+                    "include a totals / grand total row."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "commodity_code": {
+                            "type": "string",
+                            "description": (
+                                "HS / customs / commodity code LITERALLY "
+                                "PRINTED on the invoice for this line. 6-10 "
+                                "plain digits. Empty string if not printed — "
+                                "NEVER guess from description."
+                            ),
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Product description as written on the invoice.",
+                        },
+                        "origin_iso2": {
+                            "type": "string",
+                            "description": (
+                                "ISO Alpha-2 country code (IT, ES, DE, CN, …). "
+                                "Empty string for fee / charge rows."
+                            ),
+                        },
+                        "country_name": {
+                            "type": "string",
+                            "description": (
+                                "Full English country name matching origin_iso2. "
+                                "Empty if origin_iso2 is empty. May be left "
+                                "empty — the server will fill it from the ISO code."
+                            ),
+                        },
+                        "num_packages": {
+                            "type": ["number", "null"],
+                            "description": (
+                                "Physical packages / cartons / colli for this "
+                                "line. Null if only a total is shown."
+                            ),
+                        },
+                        "gross_kg": {
+                            "type": ["number", "null"],
+                            "description": "Gross weight of this line in KG. Null if unknown. NEVER a monetary amount.",
+                        },
+                        "net_kg": {
+                            "type": ["number", "null"],
+                            "description": (
+                                "Net weight of this line in KG. If UM is a "
+                                "mass unit (KG/g/lb/oz/t), the quantity IS "
+                                "the net weight — convert to KG. Null if UM "
+                                "is a piece unit (NR/PZ/PCS/EACH). NEVER a "
+                                "monetary amount."
+                            ),
+                        },
+                        "value": {
+                            "type": ["number", "null"],
+                            "description": (
+                                "Line TOTAL as a plain number (e.g. 3549.18). "
+                                "Never the unit price. NO currency symbol, NO "
+                                "thousand separators."
+                            ),
+                        },
+                    },
+                    "required": ["description"],
+                },
+            },
+        },
+        "required": ["invoice_number", "rows"],
+    },
+}
 
 PROMPT_TOTALS = """INVOICE TOTALS EXTRACTION
 
@@ -578,11 +679,65 @@ the invoice reports its own grand totals. Common labels:
 Report the values EXACTLY as they appear in that summary — do NOT compute or
 sum them yourself from line items.
 
-Special case — pallet arithmetic:
-  If the invoice says "4 X BOX PALLETS + 1 X PALLET", that is 4 + 1 = 5 pallets.
-  Output total_packages\\t5.
-  If it says "3 PALLETS", output total_packages\\t3.
-  Treat pallets, boxes, cartons, and colli as interchangeable for the package count.
+CRITICAL — match the total to what the line items actually contain.
+The totals you report are cross-checked against the sum of the line
+items. So the figure you pick must correspond to the SAME scope as
+what's in the line-item table.
+
+Decision procedure — do this for EACH quantity (gross, net, packages,
+value) independently, because one invoice can mix scopes (e.g. a pallet
+has a value but no gross weight):
+
+STEP 1 — Look at the invoice's line-item block. Is there a dedicated
+pallet / packaging / imballo line printed there, and — if yes — does
+THAT line show a value in this column (a weight, a colli count, a
+monetary amount)?
+
+STEP 2 — Based on that, pick the matching total:
+
+  (a) Line items DO include a pallet/packaging row AND it has a value
+      in this column → the line-item sum INCLUDES packaging for this
+      quantity. Report the GRAND TOTAL that includes packaging
+      (e.g. "TOTAL GROSS 1022.60 (PALLETS INCLUDED)",
+      "TOTAL COLLI 288 incl. pallets", "GRAND TOTAL 5,425.48").
+
+  (b) Line items do NOT include a pallet row, OR the pallet row is
+      blank for this column → the line-item sum is GOODS-ONLY for this
+      quantity. Report the goods-only total. When the invoice splits
+      it into sub-sections (EU / Non-EU, country A / country B), the
+      goods-only total is the SUM of those subtotals. Do NOT pick the
+      "(pallets included)" figure — it will not match.
+
+Worked examples
+
+  Surgital-style invoice:
+    Line items: 15 goods rows with per-line gross + a PLT PALLET row
+    with no gross weight but value €36.00.
+    Footer:   "EU gross 834.20", "Non-EU gross 148.40",
+              "TOTAL GROSS 1022.60 (PALLETS INCLUDED)",
+              "GRAND TOTAL 5,425.48".
+    → total_gross_kg = 982.60 (EU+Non-EU sum; PLT row had no gross)
+    → total_packages = 288 (234 + 52 goods colli + PLT row num=2)
+    → total_net_kg = 876 (footer net, matches per-line)
+    → total_value = 5425.48 (grand total, matches per-line incl. €36)
+
+  Invoice where pallets are in line items WITH gross weight:
+    Line items: 10 goods rows + "PALLET EUR 40 kg, €50.00".
+    Footer:   "TOTAL GROSS 1022.60", "GRAND TOTAL 5,475.48".
+    → total_gross_kg = 1022.60 (line-item sum includes the 40 kg)
+    → total_value = 5475.48
+
+  Invoice with only one gross total (no subtotals, no pallet row):
+    Line items: 5 goods rows, no pallet row anywhere.
+    Footer:   "TOTAL GROSS 240.00", "TOTAL VALUE 1,800.00".
+    → total_gross_kg = 240.00, total_value = 1800.00
+
+Special case — pallet arithmetic for invoices WITHOUT a separate pallet
+line item in the extraction:
+  If the footer says "4 X BOX PALLETS + 1 X PALLET" and no dedicated
+  pallet row is in the line items, that is 4 + 1 = 5 pallets — output
+  total_packages\\t5 as part of the grand colli count. Treat pallets,
+  boxes, cartons, and colli as interchangeable here.
 
 OUTPUT FORMAT — STRICT
 Your entire response must be ONLY these 4 lines, in this exact order,
@@ -639,8 +794,100 @@ def parse_tsv(tsv: str) -> list[dict]:
     return rows
 
 
+_ISO2_TO_COUNTRY = {
+    "IT": "Italy", "ES": "Spain", "FR": "France", "DE": "Germany",
+    "NL": "Netherlands", "BE": "Belgium", "PL": "Poland", "PT": "Portugal",
+    "GB": "United Kingdom", "UK": "United Kingdom", "IE": "Ireland",
+    "CH": "Switzerland", "AT": "Austria", "US": "United States",
+    "CN": "China", "JP": "Japan", "KR": "South Korea", "IN": "India",
+    "TR": "Turkey", "GR": "Greece", "CZ": "Czech Republic", "SK": "Slovakia",
+    "HU": "Hungary", "RO": "Romania", "BG": "Bulgaria", "SE": "Sweden",
+    "DK": "Denmark", "FI": "Finland", "NO": "Norway", "TW": "Taiwan",
+    "TH": "Thailand", "VN": "Vietnam", "SG": "Singapore", "MY": "Malaysia",
+    "ID": "Indonesia", "PH": "Philippines", "AU": "Australia", "NZ": "New Zealand",
+    "CA": "Canada", "MX": "Mexico", "BR": "Brazil", "AR": "Argentina",
+    "ZA": "South Africa", "EG": "Egypt", "MA": "Morocco", "IL": "Israel",
+    "AE": "United Arab Emirates", "SA": "Saudi Arabia", "RU": "Russia",
+    "UA": "Ukraine", "HR": "Croatia", "SI": "Slovenia", "LT": "Lithuania",
+    "LV": "Latvia", "EE": "Estonia", "LU": "Luxembourg", "MT": "Malta",
+    "CY": "Cyprus",
+}
+
+
+def parse_structured_rows(data: dict) -> list[dict]:
+    """Convert tool_use structured output → list of canonical column dicts.
+
+    Numbers come through as floats (no EU/US comma parsing needed) and
+    keyed fields cannot swap columns — the main payoff of tool_use.
+    """
+    if not isinstance(data, dict):
+        return []
+    invoice_num = (data.get("invoice_number") or "").strip()
+    currency = (data.get("currency_symbol") or "€").strip() or "€"
+    rows = data.get("rows") or []
+    if not isinstance(rows, list):
+        return []
+
+    def _fmt_num(v):
+        if v is None or v == "":
+            return ""
+        try:
+            return f"{float(v):.2f}"
+        except (TypeError, ValueError):
+            return ""
+
+    def _fmt_value(v):
+        if v is None or v == "":
+            return ""
+        try:
+            return f"{currency}{float(v):.2f}"
+        except (TypeError, ValueError):
+            return ""
+
+    out: list[dict] = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        desc = (r.get("description") or "").strip()
+        origin = (r.get("origin_iso2") or "").strip().upper()[:2]
+        country = (r.get("country_name") or "").strip()
+        if origin and not country:
+            country = _ISO2_TO_COUNTRY.get(origin, "")
+        if not origin:
+            country = ""
+        out.append({
+            "Invoice": invoice_num,
+            "Comm./imp. cod": (r.get("commodity_code") or "").strip(),
+            "Description of Goods": desc,
+            "Origin": origin,
+            "Country": country,
+            "Number of Packages": _fmt_num(r.get("num_packages")),
+            "Gross Weight (KG)": _fmt_num(r.get("gross_kg")),
+            "Net Weight (KG)": _fmt_num(r.get("net_kg")),
+            "Value": _fmt_value(r.get("value")),
+        })
+    return out
+
+
+_FEE_KEYWORDS = (
+    "contributo", "spese", "transport", "trasporto", "insurance",
+    "assicurazione", "certificate", "certificato", "stamp", "bollo",
+    "handling", "imballo", "imballaggio", "packaging", "delivery",
+    "consegna", "fee", "charge", "frais", "gebühr", "verzend",
+)
+
+
+def _is_fee_row(description: str) -> bool:
+    if not description:
+        return False
+    desc = description.lower()
+    return any(kw in desc for kw in _FEE_KEYWORDS)
+
+
 def normalise_row(row: dict) -> dict:
-    """Map any variant header names to canonical COLUMNS."""
+    """Map any variant header names to canonical COLUMNS, and repair a
+    common Claude mistake where non-goods fee rows have their line total
+    written into a weight column instead of Value."""
     mapping = {
         "invoice": "Invoice",
         "comm./imp. cod": "Comm./imp. cod",
@@ -662,6 +909,25 @@ def normalise_row(row: dict) -> dict:
     for k, v in row.items():
         canon = mapping.get(k.lower().strip(), k)
         out[canon] = v
+
+    # Repair: fee/service rows sometimes get their line total put into a
+    # weight column by mistake. If this row looks like a fee AND Value is
+    # empty but Net or Gross Weight has a number, move it to Value.
+    if _is_fee_row(out.get("Description of Goods", "")):
+        value = (out.get("Value") or "").strip()
+        if not value:
+            for weight_col in ("Net Weight (KG)", "Gross Weight (KG)"):
+                w = (out.get(weight_col) or "").strip()
+                if w and _norm_num(w):
+                    out["Value"] = w
+                    out[weight_col] = ""
+                    break
+        # Fee rows never have weight.
+        out["Net Weight (KG)"] = ""
+        out["Gross Weight (KG)"] = ""
+        # Fee rows have no origin.
+        out["Origin"] = ""
+        out["Country"] = ""
     return out
 
 
@@ -681,9 +947,10 @@ def _norm_num(s: str) -> str:
         else:
             cleaned = cleaned.replace(",", "")
     elif "," in cleaned:
-        # Comma only — treat as decimal if 1-2 digits after, else thousands
+        # Comma only — treat as decimal if 1–3 digits after (weights on food
+        # invoices often use 3 decimals, e.g. "192,890" kg), else thousands
         parts = cleaned.split(",")
-        if len(parts) == 2 and len(parts[1]) <= 2:
+        if len(parts) == 2 and 1 <= len(parts[1]) <= 3:
             cleaned = cleaned.replace(",", ".")
         else:
             cleaned = cleaned.replace(",", "")
@@ -716,6 +983,125 @@ def is_real_commodity_code(code: str) -> bool:
     if len(stripped) < 6 or len(stripped) > 10:
         return False
     return True
+
+
+def _norm_desc_for_match(s: str) -> str:
+    """Aggressive description normalizer for A/B row matching only.
+    Lowercase, keep alphanumerics only, truncate to 25 chars. Two runs
+    often produce tiny textual differences (extra space, punctuation,
+    trailing asterisk) — normalize those away before keying.
+    """
+    s = re.sub(r"[^a-z0-9]", "", (s or "").lower())
+    return s[:25]
+
+
+def _loose_row_key(r: dict) -> tuple:
+    return (
+        re.sub(r"\D", "", r.get("Comm./imp. cod", "") or ""),
+        _norm_desc_for_match(r.get("Description of Goods", "")),
+    )
+
+
+def find_cell_disagreements(rows_a: list[dict], rows_b: list[dict]) -> list[set[str]]:
+    """For each row in rows_a, return the set of column names whose value
+    disagrees with the best-matching row in rows_b.
+
+    Matching strategy — similarity-based within each commodity-code
+    group (so small textual drift between the two runs doesn't trigger
+    false orphans when multiple rows share the same code):
+
+      1. For each ra, collect all rb candidates with the same
+         commodity-code digits.
+      2. Score each candidate by description similarity (SequenceMatcher
+         ratio on aggressively normalized descriptions).
+      3. Consume the highest-scoring candidate. Description is only
+         flagged when the similarity is below 0.6 — a genuine textual
+         disagreement, not just a "WITH" vs "W." abbreviation.
+
+    Rows with no same-code counterpart in rows_b are flagged across
+    every data column — those are the genuinely uncertain ones.
+    """
+    from difflib import SequenceMatcher
+
+    all_cols = (
+        "Comm./imp. cod", "Description of Goods", "Origin", "Country",
+        "Number of Packages", "Gross Weight (KG)", "Net Weight (KG)", "Value",
+    )
+
+    b_by_code: dict[str, list[dict]] = {}
+    for rb in rows_b:
+        code = re.sub(r"\D", "", rb.get("Comm./imp. cod", "") or "")
+        b_by_code.setdefault(code, []).append(rb)
+    # Track remaining candidates per code (mutated as we consume matches).
+    remaining = {k: list(v) for k, v in b_by_code.items()}
+
+    def _compare(ra: dict, rb: dict, desc_score: float) -> set[str]:
+        cols: set[str] = set()
+        ca = re.sub(r"\D", "", ra.get("Comm./imp. cod", "") or "")
+        cb = re.sub(r"\D", "", rb.get("Comm./imp. cod", "") or "")
+        if ca != cb:
+            cols.add("Comm./imp. cod")
+        for field in ("Number of Packages", "Gross Weight (KG)",
+                      "Net Weight (KG)", "Value"):
+            va = _norm_num(ra.get(field, ""))
+            vb = _norm_num(rb.get(field, ""))
+            if va != vb:
+                cols.add(field)
+        oa = (ra.get("Origin", "") or "").strip().upper()
+        ob = (rb.get("Origin", "") or "").strip().upper()
+        if oa != ob:
+            cols.add("Origin")
+            cols.add("Country")
+        # Only flag Description when similarity is genuinely low. A score
+        # of 0.6+ means abbreviation/punctuation drift, not a different
+        # product.
+        if desc_score < 0.6:
+            cols.add("Description of Goods")
+        return cols
+
+    flagged: list[set[str]] = []
+    for ra in rows_a:
+        ca = re.sub(r"\D", "", ra.get("Comm./imp. cod", "") or "")
+        pool = remaining.get(ca) or []
+        if not pool:
+            # No rb with matching code — genuine orphan.
+            flagged.append(set(all_cols))
+            continue
+
+        norm_a = _norm_desc_for_match(ra.get("Description of Goods", ""))
+        best_rb = None
+        best_desc_score = -1.0
+        best_combined = -1.0
+        for rb in pool:
+            norm_b = _norm_desc_for_match(rb.get("Description of Goods", ""))
+            # Empty vs empty = perfect match; empty vs non-empty = 0.
+            if not norm_a and not norm_b:
+                desc_score = 1.0
+            elif not norm_a or not norm_b:
+                desc_score = 0.0
+            else:
+                desc_score = SequenceMatcher(None, norm_a, norm_b).ratio()
+            # Numeric-field tiebreaker: when two rows share the same
+            # commodity code and their normalized descriptions collide
+            # (e.g. "ADDEBITO COSTO PALLETS (DDT 933)" vs "... (DDT 934)"
+            # both truncate to the same 25-char prefix), prefer the
+            # candidate whose numeric fields also match. Weight the
+            # tiebreaker small so description similarity still dominates.
+            num_matches = 0
+            for field in ("Number of Packages", "Gross Weight (KG)",
+                          "Net Weight (KG)", "Value"):
+                if _norm_num(ra.get(field, "")) == _norm_num(rb.get(field, "")):
+                    num_matches += 1
+            combined = desc_score + num_matches * 0.01
+            if combined > best_combined:
+                best_combined = combined
+                best_desc_score = desc_score
+                best_rb = rb
+
+        pool.remove(best_rb)
+        flagged.append(_compare(ra, best_rb, best_desc_score))
+
+    return flagged
 
 
 def rows_match(a: list[dict], b: list[dict]) -> tuple[bool, list[str]]:
@@ -819,12 +1205,8 @@ def compare_totals(rows: list[dict], totals: dict) -> dict:
         reported = totals.get(tkey, "")
         computed = sum_rows_numeric(rows, rfield)
         if not reported:
-            # Invoice didn't report this total — can't verify, treat as N/A
             checks[tkey] = {"reported": "", "computed": computed, "match": None}
         elif not computed:
-            # Invoice reports a total but there's no per-line data to sum.
-            # This is common on invoices that only show totals in the footer
-            # (e.g. Swiss Caran d'Ache style). Not a mismatch — just unverifiable.
             checks[tkey] = {"reported": reported, "computed": "", "match": None}
         else:
             checks[tkey] = {
@@ -836,11 +1218,36 @@ def compare_totals(rows: list[dict], totals: dict) -> dict:
 
 
 def extract_value_number(val_str: str) -> float | None:
+    """Parse a numeric cell from Claude's TSV. Claude is instructed to
+    output numbers in normalised form (dot decimal, no thousand separator),
+    so this is a simple strip-and-float. Defensive fallback handles a few
+    common legacy / EU forms in case Claude slips up.
+    """
     if not val_str:
         return None
-    cleaned = re.sub(r"[^\d.\-]", "", val_str)
+    s = re.sub(r"[^\d,\.\-]", "", str(val_str))
+    if not s:
+        return None
+    # Normalised path: pure dot-decimal — try float first.
+    if "," not in s:
+        try:
+            return float(s)
+        except ValueError:
+            return None
+    # Defensive fallback if Claude slipped and used EU notation.
+    if "." in s:
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    else:
+        parts = s.split(",")
+        if len(parts) == 2 and 1 <= len(parts[1]) <= 3:
+            s = s.replace(",", ".")
+        else:
+            s = s.replace(",", "")
     try:
-        return float(cleaned)
+        return float(s)
     except ValueError:
         return None
 
@@ -931,7 +1338,8 @@ async def run_extraction(client: anthropic.AsyncAnthropic, file_bytes: bytes, mi
 
     if mime == "application/pdf":
         pdf_text = extract_pdf_text(file_bytes)
-        if pdf_text.strip():
+        meaningful = re.sub(r"[\s\-]|PAGE\s*BREAK", "", pdf_text or "")
+        if len(meaningful) >= 100:
             # Send extracted text — cheap and fits within rate limits
             content_blocks.append({
                 "type": "text",
@@ -972,6 +1380,117 @@ async def run_extraction(client: anthropic.AsyncAnthropic, file_bytes: bytes, mi
     return message.content[0].text
 
 
+async def run_extraction_structured_text(
+    client: anthropic.AsyncAnthropic,
+    pdf_text: str,
+    prompt: str,
+    model: str | None = None,
+    file_bytes: bytes | None = None,
+    mime: str | None = None,
+) -> dict:
+    """Structured extraction using tool_use.
+
+    Hybrid input: when file_bytes + mime (PDF) are provided alongside
+    pdf_text, Claude receives BOTH the pdfplumber-extracted text (exact
+    digits) AND the original PDF as a document block (visual layout).
+    Claude can cross-reference — e.g. visually confirm that "240" sits
+    in the Prezzo column, not the Peso column. Costs ~$0.05-0.10 extra
+    per invoice for typical 2-page documents, in exchange for far more
+    robust column assignment.
+    """
+    model = model or AI_MODEL_PRIMARY
+    blocks: list = [
+        {"type": "text", "text": f"INVOICE TEXT:\n\n{pdf_text}"},
+    ]
+    if file_bytes and mime == "application/pdf":
+        b64 = base64.standard_b64encode(file_bytes).decode()
+        blocks.append({
+            "type": "document",
+            "source": {"type": "base64", "media_type": mime, "data": b64},
+        })
+    # Cache up to and including the last reference block so Run B
+    # reuses it at ~10% of normal input cost.
+    blocks[-1]["cache_control"] = {"type": "ephemeral"}
+    blocks.append({"type": "text", "text": prompt})
+
+    for attempt in range(5):
+        try:
+            message = await client.messages.create(
+                model=model,
+                max_tokens=32000,
+                tools=[EXTRACTION_TOOL],
+                tool_choice={"type": "tool", "name": "record_invoice_lines"},
+                messages=[{"role": "user", "content": blocks}],
+            )
+            for block in message.content:
+                if getattr(block, "type", None) == "tool_use":
+                    return block.input or {}
+            return {}
+        except anthropic.RateLimitError:
+            if attempt == 4:
+                raise
+            await asyncio.sleep(30 + attempt * 15)
+    return {}
+
+
+async def run_extraction_structured(
+    client: anthropic.AsyncAnthropic,
+    file_bytes: bytes,
+    mime: str,
+    prompt: str,
+    model: str | None = None,
+) -> dict:
+    """Structured extraction using tool_use on a raw file (used when
+    pdfplumber can't recover text — scans, images, DOCX)."""
+    model = model or AI_MODEL_PRIMARY
+    content_blocks: list = []
+
+    if mime == "application/pdf":
+        pdf_text = extract_pdf_text(file_bytes)
+        meaningful = re.sub(r"[\s\-]|PAGE\s*BREAK", "", pdf_text or "")
+        if len(meaningful) >= 100:
+            content_blocks.append({
+                "type": "text",
+                "text": f"INVOICE TEXT (extracted from PDF):\n\n{pdf_text}",
+                "cache_control": {"type": "ephemeral"},
+            })
+        else:
+            b64 = base64.standard_b64encode(file_bytes).decode()
+            content_blocks.append({
+                "type": "document",
+                "source": {"type": "base64", "media_type": mime, "data": b64},
+                "cache_control": {"type": "ephemeral"},
+            })
+    elif mime.startswith("image/"):
+        b64 = base64.standard_b64encode(file_bytes).decode()
+        content_blocks.append({
+            "type": "image",
+            "source": {"type": "base64", "media_type": mime, "data": b64},
+            "cache_control": {"type": "ephemeral"},
+        })
+    else:
+        b64 = base64.standard_b64encode(file_bytes).decode()
+        content_blocks.append({
+            "type": "document",
+            "source": {"type": "base64", "media_type": "application/pdf", "data": b64},
+            "cache_control": {"type": "ephemeral"},
+        })
+
+    content_blocks.append({"type": "text", "text": prompt})
+
+    message = await client.messages.create(
+        model=model,
+        max_tokens=32000,
+        tools=[EXTRACTION_TOOL],
+        tool_choice={"type": "tool", "name": "record_invoice_lines"},
+        messages=[{"role": "user", "content": content_blocks}],
+    )
+    for block in message.content:
+        if getattr(block, "type", None) == "tool_use":
+            return block.input or {}
+    return {}
+
+
 # ---------------------------------------------------------------------------
 # Excel export — matches reference format exactly
 # Colors: header fill #1F3864, alt row #DCE6F1, totals fill #2E75B6
@@ -979,6 +1498,7 @@ async def run_extraction(client: anthropic.AsyncAnthropic, file_bytes: bytes, mi
 _FILL_HEADER = PatternFill("solid", fgColor="1F3864")   # dark navy header
 _FILL_ALT    = PatternFill("solid", fgColor="DCE6F1")   # light blue alt rows
 _FILL_TOTALS = PatternFill("solid", fgColor="2E75B6")   # medium blue totals
+_FILL_FLAG   = PatternFill("solid", fgColor="FFEB9C")   # warning yellow — A/B disagreement
 _FONT_TITLE  = Font(name="Calibri", bold=True, color="1F3864", size=12)
 _FONT_HDR    = Font(name="Calibri", bold=True, color="FFFFFF",  size=10)
 _FONT_CELL   = Font(name="Calibri", color="000000", size=10)
@@ -998,7 +1518,13 @@ _COL_CFG = [
 ]
 
 
-def build_excel(rows: list[dict], tariff_data: dict | None, sheet_title: str) -> bytes:
+def build_excel(
+    rows: list[dict],
+    tariff_data: dict | None,
+    sheet_title: str,
+    totals: dict | None = None,
+    flagged_cells: list[set[str]] | None = None,
+) -> bytes:
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = sheet_title
@@ -1028,15 +1554,22 @@ def build_excel(rows: list[dict], tariff_data: dict | None, sheet_title: str) ->
     ws.freeze_panes = "A3"
 
     # ── Data rows ─────────────────────────────────────────────
+    flagged_cells = flagged_cells or []
     data_start = 3
-    for row_idx, row in enumerate(rows, start=data_start):
-        fill = _FILL_ALT if (row_idx % 2 == 0) else None   # even = light blue, odd = white
+    for data_i, row in enumerate(rows):
+        row_idx = data_start + data_i
+        alt_fill = _FILL_ALT if (row_idx % 2 == 0) else None   # even = light blue, odd = white
+        flags = flagged_cells[data_i] if data_i < len(flagged_cells) else set()
         for col_idx, (col_name, width, fmt, align) in enumerate(_COL_CFG, start=1):
             c   = ws.cell(row=row_idx, column=col_idx)
             raw = row.get(col_name, "") or ""
 
-            if fill:
-                c.fill = fill
+            # Yellow = the two independent extractions disagreed on this
+            # cell — user should verify. Yellow wins over alt-row blue.
+            if col_name in flags:
+                c.fill = _FILL_FLAG
+            elif alt_fill:
+                c.fill = alt_fill
             c.font      = _FONT_CELL
             c.alignment = Alignment(horizontal=align, vertical="center")
             c.number_format = fmt
@@ -1057,6 +1590,28 @@ def build_excel(rows: list[dict], tariff_data: dict | None, sheet_title: str) ->
     tc.fill      = _FILL_TOTALS
     tc.alignment = Alignment(horizontal="left", vertical="center")
 
+    # Fallback to Run C footer totals when per-line data is missing.
+    # Many invoices (e.g. food wholesalers) only report gross weight and
+    # package count as a grand total in the summary, not per line.
+    totals = totals or {}
+    col_to_total_key = {
+        "Number of Packages": "total_packages",
+        "Gross Weight (KG)":  "total_gross_kg",
+        "Net Weight (KG)":    "total_net_kg",
+        "Value":              "total_value",
+    }
+
+    def _sum_col(col_name: str) -> float:
+        total = 0.0
+        for r in rows:
+            n = _norm_num(r.get(col_name, ""))
+            if n:
+                try:
+                    total += float(n)
+                except ValueError:
+                    pass
+        return total
+
     for col_idx, (col_name, width, fmt, align) in enumerate(_COL_CFG, start=1):
         if col_idx < 6:   # already merged
             ws.cell(row=total_row, column=col_idx).fill = _FILL_TOTALS
@@ -1067,7 +1622,17 @@ def build_excel(rows: list[dict], tariff_data: dict | None, sheet_title: str) ->
         c.font      = _FONT_TOTALS
         c.alignment = Alignment(horizontal="right", vertical="center")
         c.number_format = fmt
-        if col_name in ("Gross Weight (KG)", "Net Weight (KG)", "Value"):
+
+        # If per-line data exists → use SUM formula (dynamic).
+        # If per-line empty but Run C footer has a total → use Run C value.
+        per_line_total = _sum_col(col_name) if col_name in col_to_total_key else 0.0
+        run_c_val = _norm_num(totals.get(col_to_total_key.get(col_name, ""), ""))
+        if per_line_total == 0 and run_c_val:
+            try:
+                c.value = float(run_c_val)
+            except ValueError:
+                c.value = f"=SUM({col_letter}{data_start}:{col_letter}{data_end})"
+        elif col_name in ("Gross Weight (KG)", "Net Weight (KG)", "Value"):
             c.value = f"=ROUND(SUM({col_letter}{data_start}:{col_letter}{data_end}),2)"
         else:
             c.value = f"=SUM({col_letter}{data_start}:{col_letter}{data_end})"
@@ -1082,8 +1647,8 @@ def build_excel(rows: list[dict], tariff_data: dict | None, sheet_title: str) ->
         thick_top = Border(top=Side(style="medium", color="1F3864"))
 
         ws2 = wb.create_sheet("Tariff Lookup")
-        tariff_cols = ["Commodity Code", "Product", "Matched Sub-code", "Duty", "VAT"]
-        tariff_widths = [18, 46, 20, 22, 10]
+        tariff_cols = ["Code", "Product", "Sub-code", "Sub-code Description", "Duty"]
+        tariff_widths = [12, 42, 14, 26, 24]
         for ci, h in enumerate(tariff_cols, start=1):
             c = ws2.cell(row=1, column=ci, value=h)
             c.font = _FONT_HDR
@@ -1091,6 +1656,8 @@ def build_excel(rows: list[dict], tariff_data: dict | None, sheet_title: str) ->
             c.alignment = Alignment(horizontal="center", vertical="center")
         for ci, w in enumerate(tariff_widths, start=1):
             ws2.column_dimensions[get_column_letter(ci)].width = w
+        ws2.row_dimensions[1].height = 22
+        ws2.freeze_panes = "A2"
 
         row_idx = 2
         prev_code = None
@@ -1102,19 +1669,26 @@ def build_excel(rows: list[dict], tariff_data: dict | None, sheet_title: str) ->
 
             info = tariff_data.get(code, {})
             matched_code = r.get("_matched_code", "") or ""
+            matched_desc = r.get("_matched_desc", "") or ""
             matched_duty = r.get("_matched_duty", "") or info.get("duty", "")
-            vat_val = info.get("vat", "") or ""
 
+            alt_fill = _FILL_ALT if (row_idx % 2 == 0) else None
             cells = [
                 code,
                 desc,
                 matched_code or "—",
+                matched_desc or "—",
                 matched_duty or "—",
-                vat_val or "—",
             ]
             for ci, v in enumerate(cells, start=1):
                 c = ws2.cell(row=row_idx, column=ci, value=v)
                 c.font = _FONT_CELL
+                c.alignment = Alignment(
+                    horizontal="left" if ci in (2, 4) else "center",
+                    vertical="center",
+                )
+                if alt_fill:
+                    c.fill = alt_fill
                 # Thick top border marks a new commodity-code group
                 if prev_code is not None and code != prev_code:
                     c.border = thick_top
@@ -1233,47 +1807,95 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
         else:
             pdf_text = ""
 
+        # Scanned / image-based PDFs: pdfplumber returns only page breaks
+        # and whitespace. Don't send that to Claude — fall back to vision.
+        meaningful = re.sub(r"[\s\-]|PAGE\s*BREAK", "", pdf_text or "")
+        has_usable_text = len(meaningful) >= 100
+
         update(10, "Extracting data (Run A)…")
-        if pdf_text:
-            raw_a = await run_extraction_text(client, pdf_text, PROMPT_EXTRACT)
+        if has_usable_text:
+            # Hybrid: pdfplumber text + PDF document (vision). Claude sees
+            # both and can visually verify which column a number belongs to.
+            data_a = await run_extraction_structured_text(
+                client, pdf_text, PROMPT_EXTRACT,
+                file_bytes=file_bytes, mime=mime,
+            )
         else:
-            raw_a = await run_extraction(client, file_bytes, mime, PROMPT_EXTRACT)
+            # Scanned PDF — send the raw file so Claude can OCR it via vision
+            data_a = await run_extraction_structured(client, file_bytes, mime, PROMPT_EXTRACT)
 
         update(40, "Verifying (Run B, cached)…")
-        if pdf_text:
-            raw_b = await run_extraction_text(client, pdf_text, PROMPT_VERIFY)
+        if has_usable_text:
+            data_b = await run_extraction_structured_text(
+                client, pdf_text, PROMPT_VERIFY,
+                file_bytes=file_bytes, mime=mime,
+            )
         else:
-            raw_b = await run_extraction(client, file_bytes, mime, PROMPT_VERIFY)
+            data_b = await run_extraction_structured(client, file_bytes, mime, PROMPT_VERIFY)
 
-        rows_a = [normalise_row(r) for r in parse_tsv(raw_a)]
-        rows_b = [normalise_row(r) for r in parse_tsv(raw_b)]
+        rows_a = [normalise_row(r) for r in parse_structured_rows(data_a)]
+        rows_b = [normalise_row(r) for r in parse_structured_rows(data_b)]
 
         update(55, "Cross-checking extractions…")
         ab_match, ab_reasons = rows_match(rows_a, rows_b)
+        # Per-cell disagreement map — parallel to rows_a, used to paint
+        # uncertain cells yellow in the Excel output.
+        flagged_cells = find_cell_disagreements(rows_a, rows_b)
         final_rows = rows_a
 
-        # Run C — totals from footer (simpler task, uses lighter/cheaper model)
-        update(65, "Reading invoice totals (Run C)…")
+        # Run C — totals from footer, done twice independently for cross-check.
+        # Two runs catch digit-reading mistakes (e.g. "226" misread as "22,6").
+        # Only values that match across both runs are kept; mismatches → blank.
+        update(65, "Reading invoice totals (Run C1)…")
+        prompt_c2 = (
+            "This is a second independent totals extraction. "
+            "Read the invoice fresh — do not reference any previous result.\n\n"
+            + PROMPT_TOTALS
+        )
         try:
-            if pdf_text:
-                raw_c = await run_extraction_text(client, pdf_text, PROMPT_TOTALS, model=AI_MODEL_LIGHT)
+            if has_usable_text:
+                raw_c1 = await run_extraction_text(client, pdf_text, PROMPT_TOTALS, model=AI_MODEL_PRIMARY)
             else:
-                raw_c = await run_extraction(client, file_bytes, mime, PROMPT_TOTALS, model=AI_MODEL_LIGHT)
+                raw_c1 = await run_extraction(client, file_bytes, mime, PROMPT_TOTALS, model=AI_MODEL_PRIMARY)
         except Exception:
-            raw_c = ""
-        totals = parse_totals(raw_c)
+            raw_c1 = ""
+        update(70, "Reading invoice totals (Run C2, cached)…")
+        try:
+            if has_usable_text:
+                raw_c2 = await run_extraction_text(client, pdf_text, prompt_c2, model=AI_MODEL_PRIMARY)
+            else:
+                raw_c2 = await run_extraction(client, file_bytes, mime, prompt_c2, model=AI_MODEL_PRIMARY)
+        except Exception:
+            raw_c2 = ""
+        totals_1 = parse_totals(raw_c1)
+        totals_2 = parse_totals(raw_c2)
+        # Only keep a total if both runs agree (normalised numeric compare).
+        # If one is blank, accept the other (can't disagree with nothing).
+        totals: dict = {}
+        for key in ("total_packages", "total_gross_kg", "total_net_kg", "total_value", "total_value_raw"):
+            v1, v2 = totals_1.get(key, ""), totals_2.get(key, "")
+            if v1 and v2:
+                totals[key] = v1 if v1 == v2 else ""
+            else:
+                totals[key] = v1 or v2
         totals_check = compare_totals(final_rows, totals)
 
         totals_ok = all(c["match"] is not False for c in totals_check.values())
         totals_confirmed = sum(1 for c in totals_check.values() if c["match"] is True)
-        if not totals_ok:
+        if not final_rows:
+            # Empty extraction — cannot possibly verify. Flag as failed so the
+            # user notices and can retry / investigate the PDF, rather than
+            # treating two empty runs as a "match".
             verified = False
-        elif totals_confirmed >= 2:
-            verified = True
+            status = "failed"
         else:
-            verified = ab_match
-
-        status = "verified" if verified else "subcode_needed"
+            if not totals_ok:
+                verified = False
+            elif totals_confirmed >= 2:
+                verified = True
+            else:
+                verified = ab_match
+            status = "verified" if verified else "subcode_needed"
 
         # Step 4 — Tariff lookup (use product memory cache first)
         update(80, "Looking up tariff codes…")
@@ -1418,8 +2040,8 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_stem = re.sub(r"[^\w\-]", "_", stem)
 
-        full_bytes = build_excel(final_rows, tariff_data, "Invoice Data")
-        raw_bytes  = build_excel(final_rows, None, "Raw Extraction")
+        full_bytes = build_excel(final_rows, tariff_data, "Invoice Data", totals=totals, flagged_cells=flagged_cells)
+        raw_bytes  = build_excel(final_rows, None, "Raw Extraction", totals=totals, flagged_cells=flagged_cells)
 
         xlsx_mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         full_storage = f"{company_id}/{safe_stem}_{ts}_full.xlsx"

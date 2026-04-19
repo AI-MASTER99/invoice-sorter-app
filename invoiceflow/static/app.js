@@ -360,6 +360,7 @@ function actionsHtml(inv) {
     return `
       <button class="btn-export btn-resolve" onclick="openResolve('${inv.id}', '${sup}')">Resolve</button>
       <button class="btn-export btn-retry"   onclick="retryInvoice('${inv.id}')">↻ Retry</button>
+      <button class="btn-export btn-full"    onclick="exportFull('${inv.id}')">Full Excel</button>
       <button class="btn-export btn-raw"     onclick="exportRaw('${inv.id}')">Raw only</button>
       ${del}`;
   }
