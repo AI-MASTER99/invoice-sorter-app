@@ -539,9 +539,13 @@ The invoice may use any of these notations:
   "3.549,18" (EU thousand + comma decimal) → 3549.18
   "3,549.18" (US thousand + dot decimal)   → 3549.18
   "1'234.56" (Swiss apostrophe thousand)   → 1234.56
-  "192,890"  (EU 3-decimal weight)         → 192.89
+  "192,890"  (EU 3-decimal weight)         → 192.890
   "239,95"   (EU short)                    → 239.95
 Understand the notation THIS invoice uses, then pass a plain float.
+PRESERVE PRECISION — do not round. If the invoice prints "1.928 kg"
+or "0.129 kg", output 1.928 and 0.129 exactly, not 1.93 / 0.13.
+Rounding each line to 2 decimals causes the summed total to drift
+from the invoice footer, which then fails the cross-check.
 
 Anti-hallucination (strict)
 - Do NOT invent commodity codes, origins, countries, or invoice numbers.
@@ -755,7 +759,8 @@ Rules:
 - Thousand separators: accept both comma and apostrophe (1,081.79 or 1'081.79).
   Always output with dot as decimal separator: 1081.79.
 - If the invoice shows "NUMERO COLLI 705", output: total_packages\t705
-- If it shows "GROSS WEIGHT : 1'081.790 KGS", output: total_gross_kg\t1081.79
+- If it shows "GROSS WEIGHT : 1'081.790 KGS", output: total_gross_kg\t1081.790
+  Preserve all decimals shown on the invoice — do not round.
 - Never guess. Blank is better than wrong.
 """
 
@@ -832,7 +837,12 @@ def parse_structured_rows(data: dict) -> list[dict]:
         if v is None or v == "":
             return ""
         try:
-            return f"{float(v):.2f}"
+            # Preserve up to 3 decimals (weight precision on food/equipment
+            # invoices), strip trailing zeros so integers stay integers.
+            # Do NOT round — 1.928 must stay 1.928, not 1.93, otherwise
+            # per-line sums drift from the invoice footer totals.
+            s = f"{float(v):.3f}".rstrip("0").rstrip(".")
+            return s if s else "0"
         except (TypeError, ValueError):
             return ""
 
@@ -1512,8 +1522,11 @@ _COL_CFG = [
     ("Origin",               8,  "General", "center"),
     ("Country",             12,  "General", "left"),
     ("Number of Packages",   8,  "#,##0.00","right"),
-    ("Gross Weight (KG)",   18,  "#,##0.00","right"),
-    ("Net Weight (KG)",     16,  "#,##0.00","right"),
+    # Weight formats show 2 forced + 1 optional decimal so "1.928"
+    # renders as 1.928 and "1.2" as 1.20 — weights on food/equipment
+    # invoices routinely have 3-decimal precision we must not drop.
+    ("Gross Weight (KG)",   18,  "#,##0.00#","right"),
+    ("Net Weight (KG)",     16,  "#,##0.00#","right"),
     ("Value",               14,  '\u20ac#,##0.00', "right"),
 ]
 
@@ -1632,9 +1645,11 @@ def build_excel(
                 c.value = float(run_c_val)
             except ValueError:
                 c.value = f"=SUM({col_letter}{data_start}:{col_letter}{data_end})"
-        elif col_name in ("Gross Weight (KG)", "Net Weight (KG)", "Value"):
-            c.value = f"=ROUND(SUM({col_letter}{data_start}:{col_letter}{data_end}),2)"
         else:
+            # Plain SUM — never ROUND. Rounding here drops the 3rd
+            # decimal on weight totals (e.g. 1.928+0.129+0.081=2.138
+            # becomes 2.14, but a 2-decimal ROUND on already-rounded
+            # per-line values drifts from the invoice footer).
             c.value = f"=SUM({col_letter}{data_start}:{col_letter}{data_end})"
 
     # ── Column widths ─────────────────────────────────────────
