@@ -8,6 +8,7 @@ import asyncio
 import base64
 import io
 import json
+import logging
 import os
 import queue
 import re
@@ -16,6 +17,11 @@ import time
 import uuid
 from pathlib import Path
 from dotenv import load_dotenv
+
+# Module-level logger — used for security-relevant events (rate-limit
+# triggers, auth failures). uvicorn/Render captures stderr, so a plain
+# getLogger() is enough; we don't need a custom handler here.
+logger = logging.getLogger("invoiceflow")
 
 load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=True)
 
@@ -1860,8 +1866,11 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
         except Exception:
             pass
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    client = anthropic.AsyncAnthropic(api_key=api_key)
+    # Use the validated module constant — _require_env() at startup has
+    # already verified the key is set and non-default, so reading from
+    # os.environ a second time would just hide misconfigurations behind
+    # an empty string and surface as a confusing 401 from Anthropic.
+    client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
     try:
         file_bytes = file_path.read_bytes()
@@ -2350,6 +2359,13 @@ def _check_login_rate_limit(username: str, ip: str) -> None:
         _LOGIN_ATTEMPTS_IP[ip] = ip_attempts
         if len(ip_attempts) >= _LOGIN_MAX_PER_IP:
             retry_in = int(_LOGIN_WINDOW_SECONDS - (now - ip_attempts[0]))
+            # Log without the username — we don't want a brute-force
+            # attempt against a real account name to leak that account's
+            # existence into the logs (which may be shipped off-host).
+            logger.warning(
+                "login rate limit hit (per-IP) ip=%s attempts=%d window=%ds",
+                ip, len(ip_attempts), _LOGIN_WINDOW_SECONDS,
+            )
             raise HTTPException(
                 status_code=429,
                 detail=f"Too many failed login attempts. Try again in {max(1, retry_in // 60 + 1)} minute(s).",
@@ -2360,6 +2376,10 @@ def _check_login_rate_limit(username: str, ip: str) -> None:
         _LOGIN_ATTEMPTS_USER[user_key] = user_attempts
         if len(user_attempts) >= _LOGIN_MAX_PER_USER:
             retry_in = int(_LOGIN_WINDOW_SECONDS - (now - user_attempts[0]))
+            logger.warning(
+                "login rate limit hit (per-user+IP) ip=%s attempts=%d window=%ds",
+                ip, len(user_attempts), _LOGIN_WINDOW_SECONDS,
+            )
             raise HTTPException(
                 status_code=429,
                 detail=f"Too many failed login attempts. Try again in {max(1, retry_in // 60 + 1)} minute(s).",
@@ -2367,6 +2387,10 @@ def _check_login_rate_limit(username: str, ip: str) -> None:
 
 
 def _record_login_failure(username: str, ip: str) -> None:
+    """Record a failed attempt in both buckets. The SAME timestamp is
+    pushed into both lists so a later success can subtract this user's
+    contributions from the IP bucket without taking other users with it.
+    """
     now = time.time()
     with _LOGIN_LOCK:
         _LOGIN_ATTEMPTS_USER.setdefault((username, ip), []).append(now)
@@ -2376,11 +2400,26 @@ def _record_login_failure(username: str, ip: str) -> None:
 
 
 def _clear_login_failures(username: str, ip: str) -> None:
+    """On successful login, drop this user's attempts from BOTH buckets.
+
+    Naive impl (`pop((username, ip))` only) leaves the IP-bucket list
+    intact, so an office of NAT'd users behind one IP can still get
+    collectively locked out: each typo'd password counts toward the IP
+    cap, and there's no way to credit a successful login back. By
+    pulling the user's timestamps (recorded with the same float in both
+    buckets) out of the IP list, we let the legitimate-user signal
+    relieve pressure on the shared bucket without weakening it for
+    actual attackers (their attempts have different timestamps).
+    """
     with _LOGIN_LOCK:
-        _LOGIN_ATTEMPTS_USER.pop((username, ip), None)
-        # Don't clear the IP-level bucket — a successful login on user A
-        # shouldn't reset the IP cap that protects other users on the
-        # same machine.
+        user_timestamps = _LOGIN_ATTEMPTS_USER.pop((username, ip), [])
+        if user_timestamps and ip in _LOGIN_ATTEMPTS_IP:
+            ts_set = set(user_timestamps)
+            remaining = [t for t in _LOGIN_ATTEMPTS_IP[ip] if t not in ts_set]
+            if remaining:
+                _LOGIN_ATTEMPTS_IP[ip] = remaining
+            else:
+                del _LOGIN_ATTEMPTS_IP[ip]
 
 
 @app.post("/api/login")
