@@ -2,6 +2,9 @@
 .env
 *.env
 .env.*
+# ...except the documented example, which has no real values:
+!.env.example
+!**/.env.example
 
 # ── Legacy local data (now in Supabase) ────────────────
 invoiceflow/users.json
