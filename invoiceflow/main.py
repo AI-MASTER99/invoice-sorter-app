@@ -2332,21 +2332,29 @@ def _prune_attempts(arr: list[float], now: float) -> list[float]:
     return [t for t in arr if now - t < _LOGIN_WINDOW_SECONDS]
 
 
-def _evict_if_full(d: dict) -> None:
+def _evict_if_full(d: dict) -> list[tuple]:
     """When we hit the size cap, drop empty entries first, then oldest.
-    Caller must hold _LOGIN_LOCK."""
+
+    Returns a list of (key, timestamps) for every evicted entry so the
+    caller can do paired cleanup (e.g. drop the same timestamps from a
+    paired bucket). Caller must hold _LOGIN_LOCK.
+    """
     if len(d) <= _MAX_TRACKED_KEYS:
-        return
+        return []
+    evicted: list[tuple] = []
     # Drop empty lists (likely already-pruned entries).
     for k in [k for k, v in d.items() if not v]:
+        evicted.append((k, list(d[k])))
         del d[k]
         if len(d) <= _MAX_TRACKED_KEYS:
-            return
+            return evicted
     # Still full — drop entries with the oldest most-recent attempt.
     if len(d) > _MAX_TRACKED_KEYS:
         ordered = sorted(d.items(), key=lambda kv: kv[1][-1] if kv[1] else 0)
-        for k, _ in ordered[: len(d) - _MAX_TRACKED_KEYS]:
+        for k, ts in ordered[: len(d) - _MAX_TRACKED_KEYS]:
+            evicted.append((k, list(ts)))
             del d[k]
+    return evicted
 
 
 def _check_login_rate_limit(username: str, ip: str) -> None:
@@ -2390,12 +2398,29 @@ def _record_login_failure(username: str, ip: str) -> None:
     """Record a failed attempt in both buckets. The SAME timestamp is
     pushed into both lists so a later success can subtract this user's
     contributions from the IP bucket without taking other users with it.
+
+    Eviction cascade: if the user dict overflows and we drop a
+    (uname, uip) entry, also subtract those timestamps from
+    _LOGIN_ATTEMPTS_IP[uip] — otherwise the user's eventual successful
+    login can't recover them (pop returns []) and they linger as
+    orphans in the IP bucket until natural 15-min pruning. Under a
+    DDoS that overflows the user dict, that orphaning would silently
+    inflate IP-cap pressure on legitimate co-tenants of a NAT'd IP.
     """
     now = time.time()
     with _LOGIN_LOCK:
         _LOGIN_ATTEMPTS_USER.setdefault((username, ip), []).append(now)
         _LOGIN_ATTEMPTS_IP.setdefault(ip, []).append(now)
-        _evict_if_full(_LOGIN_ATTEMPTS_USER)
+        for (_uname, uip), ts_list in _evict_if_full(_LOGIN_ATTEMPTS_USER):
+            if not ts_list or uip not in _LOGIN_ATTEMPTS_IP:
+                continue
+            ts_set = set(ts_list)
+            remaining = [t for t in _LOGIN_ATTEMPTS_IP[uip] if t not in ts_set]
+            if remaining:
+                _LOGIN_ATTEMPTS_IP[uip] = remaining
+            else:
+                del _LOGIN_ATTEMPTS_IP[uip]
+        # IP dict is the leaf bucket — nothing downstream to cascade to.
         _evict_if_full(_LOGIN_ATTEMPTS_IP)
 
 
