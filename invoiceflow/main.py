@@ -2406,6 +2406,19 @@ def _record_login_failure(username: str, ip: str) -> None:
     orphans in the IP bucket until natural 15-min pruning. Under a
     DDoS that overflows the user dict, that orphaning would silently
     inflate IP-cap pressure on legitimate co-tenants of a NAT'd IP.
+
+    Trade-off & threat-model notes:
+      • Overflow requires _MAX_TRACKED_KEYS (10K) distinct (uname, ip)
+        pairs in a 15-min window. With per-IP cap of 50, that's >=200
+        distinct attacker IPs hitting their cap simultaneously.
+      • Cascade slightly weakens the IP cap during sustained attack:
+        an attacker can rotate fake usernames to trigger cascades that
+        drain old entries from a shared IP bucket. Bounded — they
+        still can't fail >50 times per IP per window. Preferred over
+        permanent orphan-induced lockout of legitimate NAT users.
+      • CPU cost is dominated by bcrypt(12) verify (~250ms/login).
+        sorted() over 10K keys is ~1ms in Python — well below 1% of
+        per-request cost. No meaningful CPU-amplification vector.
     """
     now = time.time()
     with _LOGIN_LOCK:
