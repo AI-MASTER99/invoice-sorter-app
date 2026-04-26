@@ -20,6 +20,19 @@ services:
         sync: false
       - key: SUPABASE_KEY
         sync: false
+      # Phase B: per-request user-scoped Supabase client.
+      # SUPABASE_ANON_KEY is the public anon JWT — combined with the user
+      # JWT (signed below), PostgREST switches to the `authenticated` role
+      # and RLS policies become effective.
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      # Phase B: HS256 secret for minting per-request user JWTs.
+      # Must match the JWT secret configured in the Supabase project
+      # (Settings → API → JWT Settings → JWT secret). Rotating it
+      # invalidates every in-flight JWT — but since they're 30-min and
+      # never leave the server, that's only a brief window.
+      - key: SUPABASE_JWT_SECRET
+        sync: false
       - key: SECRET_KEY
         sync: false
       - key: APP_PASSWORD

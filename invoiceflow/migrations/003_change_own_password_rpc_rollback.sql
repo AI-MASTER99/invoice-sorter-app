@@ -1,0 +1,22 @@
+-- ============================================================
+-- Migration 003 — ROLLBACK
+-- ============================================================
+-- Drops the change_own_password RPC.
+--
+-- ⚠️  WHEN TO USE: only AFTER the Phase B Python code is also rolled
+-- back. The pre-Phase-B code path uses db.update_user_password()
+-- directly (service-role); the post-Phase-B code routes self-changes
+-- through this RPC. Dropping the RPC while Phase B code is live
+-- breaks every self-password-change with a 500.
+--
+-- Recommended order on rollback:
+--   1. git revert the Phase B deploy commit (Render redeploys old code)
+--   2. Confirm rollback succeeded and no self-password-change traffic
+--      is hitting the now-missing RPC
+--   3. Then run this rollback (optional — leaving the RPC in place is
+--      harmless if no caller invokes it)
+--
+-- Run via: Supabase Dashboard → SQL Editor → paste → Run
+-- ============================================================
+
+DROP FUNCTION IF EXISTS public.change_own_password(text);

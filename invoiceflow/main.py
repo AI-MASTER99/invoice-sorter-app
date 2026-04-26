@@ -43,6 +43,9 @@ from starlette.middleware.sessions import SessionMiddleware
 # Database layer (Supabase)
 import database as db
 
+# JWT minting for per-request user-scoped Supabase client (Phase B)
+from auth_jwt import mint_user_jwt
+
 # ---------------------------------------------------------------------------
 # Required environment configuration — fail fast on any misconfiguration.
 # Setting these via the deployment dashboard (Render → Environment) is
@@ -151,30 +154,71 @@ def ensure_default_admin():
 ensure_default_admin()
 
 
-def require_auth(request: Request) -> dict:
-    """Returns {user_id, username, company_id, role}."""
-    sess_user_id = request.session.get("user_id")
-    if not sess_user_id:
+async def authed(request: Request):
+    """Authenticated dep — binds a per-request user-scoped Supabase client.
+
+    1. Reads session fields (user_id, company_id, role) — 401 if missing.
+       No silent fallbacks: empty company_id would crash UUID casts in RLS
+       policies, so we fail loud at the boundary.
+    2. Mints a 30-minute HS256 JWT with the user's claims (see auth_jwt.py).
+    3. Builds a per-request user-scoped Supabase client (anon key + JWT)
+       and binds it on db._current_client (ContextVar). All DAL calls in
+       this request now hit Postgres as the `authenticated` role with
+       the JWT's claims visible to RLS via auth.jwt().
+    4. On response, resets the ContextVar so the next request starts clean.
+
+    Yields a {user_id, username, company_id, role} dict — the same shape
+    handlers consume via `ctx = Depends(authed)`. Pre-Phase-B this came
+    from a non-yielding helper of the same role; the contract is preserved.
+
+    ⚠️ DO NOT use this dep with a `StreamingResponse(generator)` handler.
+    FastAPI tears down `Depends` generators (this `authed` included) when
+    the handler returns the Response object — which is BEFORE the
+    streaming generator yields its first chunk. The contextvar would
+    reset mid-stream, and any DAL call inside the generator would fall
+    back to `_sb_service`, bypassing RLS. All current responses are
+    buffered (`Response`/`JSONResponse`/`FileResponse`) so this is
+    dormant; if you ever introduce a streaming handler, bind a fresh
+    user-scoped client inside the generator manually. See
+    `migrations/PHASE_B_PLAN.md` §7/§8 (H2).
+    """
+    sess = request.session
+    user_id    = sess.get("user_id")
+    company_id = sess.get("company_id")
+    role       = sess.get("role")
+    if not user_id or not company_id or not role:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    return {
-        "user_id":    sess_user_id,
-        "username":   request.session.get("username", ""),
-        "company_id": request.session.get("company_id", ""),
-        "role":       request.session.get("role", "user"),
+
+    ctx = {
+        "user_id":    user_id,
+        "username":   sess.get("username", ""),
+        "company_id": company_id,
+        "role":       role,
     }
 
+    jwt = mint_user_jwt(ctx)
+    client = db.make_user_client(jwt)
+    token = db._current_client.set(client)
+    logger.info(
+        "authed user_id=%s company_id=%s app_role=%s",
+        ctx["user_id"], ctx["company_id"], ctx["role"],
+    )
+    try:
+        yield ctx
+    finally:
+        db._current_client.reset(token)
 
-def require_admin(request: Request) -> dict:
-    """Admin OR super_admin can access."""
-    ctx = require_auth(request)
+
+async def admin_authed(ctx: dict = Depends(authed)) -> dict:
+    """Admin OR super_admin. Chains off `authed` so the user-scoped client
+    is bound for the whole request."""
     if ctx["role"] not in ("admin", "super_admin"):
         raise HTTPException(status_code=403, detail="Admin required")
     return ctx
 
 
-def require_super_admin(request: Request) -> dict:
+async def super_admin_authed(ctx: dict = Depends(authed)) -> dict:
     """Only super_admin — manages all companies."""
-    ctx = require_auth(request)
     if ctx["role"] != "super_admin":
         raise HTTPException(status_code=403, detail="Super admin required")
     return ctx
@@ -2215,7 +2259,14 @@ app = FastAPI(title="Invoice Sorter")
 app.add_middleware(
     SessionMiddleware,
     secret_key=SECRET_KEY,
-    session_cookie="is_session",
+    # Phase B: cookie name bumped from "is_session" → "is_session_v2".
+    # On deploy, every existing browser presents the old cookie, the new
+    # middleware doesn't recognize it, and the user is forced to log in
+    # again. This forces every active session through the new `authed` dep
+    # and JWT-minting path. Cleaner than rotating SECRET_KEY (which would
+    # also rotate the signing key for FUTURE cookies and is unrelated to
+    # Phase B).
+    session_cookie="is_session_v2",
     max_age=60 * 60 * 12,
     https_only=not DEV_MODE,
     same_site="strict",
@@ -2520,7 +2571,7 @@ async def api_login(request: Request, body: dict = {}):
 
 
 @app.post("/api/admin/companies")
-async def api_create_company(body: dict = {}, _: dict = Depends(require_super_admin)):
+async def api_create_company(body: dict = {}, _: dict = Depends(super_admin_authed)):
     """Super-admin only: provision a new customer company + first admin user."""
     company_name = (body.get("company") or "").strip()
     username     = (body.get("username") or "").strip().lower()
@@ -2537,7 +2588,7 @@ async def api_create_company(body: dict = {}, _: dict = Depends(require_super_ad
 
 
 @app.get("/api/admin/companies")
-async def api_list_all_companies(_: dict = Depends(require_super_admin)):
+async def api_list_all_companies(_: dict = Depends(super_admin_authed)):
     """Super-admin: list every company with its users."""
     companies = db.list_companies()
     result = []
@@ -2548,12 +2599,14 @@ async def api_list_all_companies(_: dict = Depends(require_super_admin)):
 
 
 @app.delete("/api/admin/companies/{company_id}")
-async def api_delete_company(company_id: str, _: dict = Depends(require_super_admin)):
+async def api_delete_company(company_id: str, _: dict = Depends(super_admin_authed)):
     """Super-admin: delete a company (cascades to users, invoices, memory, jobs)."""
     if company_id == db.DEFAULT_COMPANY_ID:
         raise HTTPException(400, "Cannot delete the default company")
-    # Find super-admin's own company to prevent self-deletion
-    db.sb.table("companies").delete().eq("id", company_id).execute()
+    # Phase B: routed through DAL wrapper. Under user JWT, RLS policy
+    # `companies_super_admin` permits the delete (this endpoint is gated
+    # by Depends(super_admin_authed), so the JWT carries app_role=super_admin).
+    db.delete_company(company_id)
     return {"ok": True}
 
 
@@ -2564,14 +2617,16 @@ async def api_logout(request: Request):
 
 
 @app.get("/api/me")
-async def api_me(request: Request):
-    user_id = request.session.get("user_id")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    # Enrich with company name
-    user = db.get_user_by_id(user_id)
+async def api_me(ctx: dict = Depends(authed)):
+    """Current user's profile + company name. Phase B: under `Depends(authed)`,
+    so DB calls run under the user JWT. RLS on `companies` (tenant_select)
+    means `db.list_companies()` returns only the user's own row, making
+    the `next()` filter redundant but safe."""
+    user = db.get_user_by_id(ctx["user_id"])
     if not user:
-        request.session.clear()
+        # User row deleted out from under an active session — surface 401.
+        # Don't `request.session.clear()` here: keeping the cookie around
+        # makes /api/logout still work cleanly.
         raise HTTPException(status_code=401, detail="User no longer exists")
     company = next(
         (c for c in db.list_companies() if c["id"] == user["company_id"]),
@@ -2586,12 +2641,12 @@ async def api_me(request: Request):
 
 
 @app.get("/api/users")
-def api_list_users(ctx: dict = Depends(require_admin)):
+def api_list_users(ctx: dict = Depends(admin_authed)):
     return db.list_users(ctx["company_id"])
 
 
 @app.post("/api/users")
-async def api_add_user(body: dict = {}, ctx: dict = Depends(require_admin)):
+async def api_add_user(body: dict = {}, ctx: dict = Depends(admin_authed)):
     username = (body.get("username") or "").strip().lower()
     password = body.get("password") or ""
     role = (body.get("role") or "user").strip().lower()
@@ -2615,7 +2670,7 @@ async def api_add_user(body: dict = {}, ctx: dict = Depends(require_admin)):
 
 
 @app.delete("/api/users/{username}")
-async def api_delete_user(username: str, ctx: dict = Depends(require_admin)):
+async def api_delete_user(username: str, ctx: dict = Depends(admin_authed)):
     if username == ctx["username"]:
         raise HTTPException(400, "Cannot delete your own account")
     target = db.get_user(username, ctx["company_id"])
@@ -2626,17 +2681,48 @@ async def api_delete_user(username: str, ctx: dict = Depends(require_admin)):
 
 
 @app.put("/api/users/{username}/password")
-async def api_change_password(username: str, body: dict = {}, ctx: dict = Depends(require_auth)):
-    # Admins can change anyone in their company; users can only change their own
-    if username != ctx["username"] and ctx["role"] != "admin":
-        raise HTTPException(403, "Forbidden")
-    target = db.get_user(username, ctx["company_id"])
-    if not target:
-        raise HTTPException(404, "User not found")
+async def api_change_password(
+    username: str,
+    body: dict = {},
+    ctx: dict = Depends(authed),
+):
+    """Change a user's password.
+
+    Self-change goes through the SECURITY DEFINER RPC `change_own_password`
+    — under user JWT, RLS doesn't permit column-restricted UPDATEs on
+    `users.password_hash`. Admin/super_admin reset of another user goes
+    through `update_user_password` and relies on RLS `users_admin_update`
+    (with the migration 002 USING role-clamp preventing admins from
+    touching super_admin rows).
+    """
     new_pw = body.get("password") or ""
     if not new_pw:
         raise HTTPException(400, "Password required")
-    db.update_user_password(target["id"], _pwd_ctx.hash(new_pw))
+    new_hash = _pwd_ctx.hash(new_pw)
+
+    # --- self-change path -------------------------------------------------
+    if username == ctx["username"]:
+        # RPC validates the bcrypt hash format server-side and writes
+        # under SECURITY DEFINER, bypassing RLS for this single column.
+        db._client().rpc("change_own_password", {"new_hash": new_hash}).execute()
+        return {"ok": True}
+
+    # --- admin reset path -------------------------------------------------
+    if ctx["role"] not in ("admin", "super_admin"):
+        raise HTTPException(403, "Forbidden")
+
+    target = db.get_user(username, ctx["company_id"])
+    if not target:
+        raise HTTPException(404, "User not found")
+
+    # Migration 002's USING role-clamp: an admin cannot UPDATE a super_admin
+    # row (the RLS filter returns 0 rows, leaving the password unchanged
+    # but reporting 200 OK). Surface that as a clear 403 rather than a
+    # silent no-op success.
+    if target["role"] == "super_admin" and ctx["role"] != "super_admin":
+        raise HTTPException(403, "Cannot reset super_admin password")
+
+    db.update_user_password(target["id"], new_hash)
     return {"ok": True}
 
 
@@ -2754,7 +2840,7 @@ async def _tariff_code_lookup(code: str) -> list[dict]:
 
 
 @app.get("/tariff/search")
-async def tariff_search(q: str = "", ctx: dict = Depends(require_auth)):
+async def tariff_search(q: str = "", ctx: dict = Depends(authed)):
     query = q.strip()
     if not query:
         return []
@@ -2846,7 +2932,7 @@ def _auto_match_from_tariff(entry: dict, tariff: dict) -> dict:
 
 @app.post("/memory/refresh-tariff")
 async def refresh_memory_tariff(
-    ctx: dict = Depends(require_auth),
+    ctx: dict = Depends(authed),
     only_stale: bool = False,
 ):
     """Refresh tariff data from gov.uk for all memory entries.
@@ -2888,7 +2974,7 @@ async def refresh_memory_tariff(
 
 
 @app.post("/memory/refresh-stale")
-async def refresh_stale_tariff(ctx: dict = Depends(require_auth)):
+async def refresh_stale_tariff(ctx: dict = Depends(authed)):
     """Refetch tariff data for entries whose cache is older than 30 days,
     and auto-fill matched_code for single-option codes at the same time."""
     memory = db.list_memory(ctx["company_id"])
@@ -2914,7 +3000,7 @@ async def refresh_stale_tariff(ctx: dict = Depends(require_auth)):
 
 
 @app.post("/upload")
-async def upload_invoice(file: UploadFile = File(...), ctx: dict = Depends(require_auth)):
+async def upload_invoice(file: UploadFile = File(...), ctx: dict = Depends(authed)):
     ext = Path(file.filename).suffix.lower()
     mime = MIME_MAP.get(ext)
     if not mime:
@@ -2944,7 +3030,7 @@ async def upload_invoice(file: UploadFile = File(...), ctx: dict = Depends(requi
 
 
 @app.get("/jobs")
-def list_jobs(ctx: dict = Depends(require_auth)):
+def list_jobs(ctx: dict = Depends(authed)):
     raw = db.list_jobs(ctx["company_id"])
     queued = [j for j in raw if j["status"] == "queued"]
     queued_ids = [j["id"] for j in queued]
@@ -2961,7 +3047,7 @@ def list_jobs(ctx: dict = Depends(require_auth)):
 
 
 @app.get("/stats")
-def get_stats(ctx: dict = Depends(require_auth)):
+def get_stats(ctx: dict = Depends(authed)):
     cid = ctx["company_id"]
     all_invoices = db.list_invoices(cid)
     total = len(all_invoices)
@@ -2978,7 +3064,7 @@ def get_stats(ctx: dict = Depends(require_auth)):
 
 
 @app.get("/invoices")
-def list_invoices(ctx: dict = Depends(require_auth)):
+def list_invoices(ctx: dict = Depends(authed)):
     invoices_list = db.list_invoices(ctx["company_id"])
     return [{
         "id":       inv["id"],
@@ -2991,7 +3077,7 @@ def list_invoices(ctx: dict = Depends(require_auth)):
 
 
 @app.get("/invoices/{invoice_id}/debug")
-def invoice_debug(invoice_id: str, ctx: dict = Depends(require_auth)):
+def invoice_debug(invoice_id: str, ctx: dict = Depends(authed)):
     inv = db.get_invoice(invoice_id, ctx["company_id"])
     if not inv:
         raise HTTPException(404, "Invoice not found")
@@ -3023,7 +3109,7 @@ def _stream_storage_file(storage_path: str, suggested_name: str):
 
 
 @app.get("/invoices/{invoice_id}/export/full")
-def export_full(invoice_id: str, ctx: dict = Depends(require_auth)):
+def export_full(invoice_id: str, ctx: dict = Depends(authed)):
     inv = db.get_invoice(invoice_id, ctx["company_id"])
     if not inv:
         raise HTTPException(404, "Invoice not found")
@@ -3034,7 +3120,7 @@ def export_full(invoice_id: str, ctx: dict = Depends(require_auth)):
 
 
 @app.get("/invoices/{invoice_id}/export/raw")
-def export_raw(invoice_id: str, ctx: dict = Depends(require_auth)):
+def export_raw(invoice_id: str, ctx: dict = Depends(authed)):
     inv = db.get_invoice(invoice_id, ctx["company_id"])
     if not inv:
         raise HTTPException(404, "Invoice not found")
@@ -3045,7 +3131,7 @@ def export_raw(invoice_id: str, ctx: dict = Depends(require_auth)):
 
 
 @app.post("/jobs/{job_id}/retry")
-async def retry_job(job_id: str, ctx: dict = Depends(require_auth)):
+async def retry_job(job_id: str, ctx: dict = Depends(authed)):
     """Retry a failed job by re-downloading its upload from Supabase Storage.
     Used when a job failed before producing an invoice (e.g. out-of-credit)."""
     job = db.get_job(job_id)
@@ -3082,16 +3168,17 @@ async def retry_job(job_id: str, ctx: dict = Depends(require_auth)):
 
     _enqueue_job(new_job["id"], ctx["company_id"], tmp_local, original_file, mime, new_storage_path)
 
-    # Remove the old failed job from view
+    # Remove the old failed job from view. Phase B: through DAL wrapper,
+    # filtered by company_id (RLS `jobs_tenant_delete` also applies).
     try:
-        db.sb.table("jobs").delete().eq("id", job_id).execute()
+        db.delete_job(job_id, ctx["company_id"])
     except Exception:
         pass
     return {"job_id": new_job["id"]}
 
 
 @app.post("/invoices/{invoice_id}/retry")
-async def retry_invoice(invoice_id: str, ctx: dict = Depends(require_auth)):
+async def retry_invoice(invoice_id: str, ctx: dict = Depends(authed)):
     inv = db.get_invoice(invoice_id, ctx["company_id"])
     if not inv:
         raise HTTPException(404, "Invoice not found")
@@ -3125,7 +3212,7 @@ async def retry_invoice(invoice_id: str, ctx: dict = Depends(require_auth)):
 
 
 @app.delete("/jobs/{job_id}")
-async def delete_job(job_id: str, ctx: dict = Depends(require_auth)):
+async def delete_job(job_id: str, ctx: dict = Depends(authed)):
     """Delete a job (used by Dismiss on failed jobs). Also cleans up the
     stored PDF upload if it exists."""
     job = db.get_job(job_id)
@@ -3139,13 +3226,14 @@ async def delete_job(job_id: str, ctx: dict = Depends(require_auth)):
         db.storage_delete(db.BUCKET_UPLOADS, upload_path)
     except Exception:
         pass
-    # Delete the job record
-    db.sb.table("jobs").delete().eq("id", job_id).eq("company_id", ctx["company_id"]).execute()
+    # Delete the job record. Phase B: through DAL wrapper, filtered by
+    # company_id (RLS `jobs_tenant_delete` also applies under user JWT).
+    db.delete_job(job_id, ctx["company_id"])
     return {"ok": True}
 
 
 @app.delete("/invoices/{invoice_id}")
-async def delete_invoice_endpoint(invoice_id: str, ctx: dict = Depends(require_auth)):
+async def delete_invoice_endpoint(invoice_id: str, ctx: dict = Depends(authed)):
     """Permanently delete an invoice and its stored Excel/PDF files."""
     inv = db.get_invoice(invoice_id, ctx["company_id"])
     if not inv:
@@ -3167,7 +3255,7 @@ async def delete_invoice_endpoint(invoice_id: str, ctx: dict = Depends(require_a
 
 
 @app.post("/invoices/{invoice_id}/resolve")
-async def resolve_invoice(invoice_id: str, body: dict = {}, ctx: dict = Depends(require_auth)):
+async def resolve_invoice(invoice_id: str, body: dict = {}, ctx: dict = Depends(authed)):
     """Mark a subcode_needed invoice as verified after manual review.
     This also adds the invoice's products to product memory (they were
     held back during processing because the invoice wasn't verified)."""
@@ -3236,7 +3324,7 @@ async def resolve_invoice(invoice_id: str, body: dict = {}, ctx: dict = Depends(
 
 
 @app.get("/memory")
-def list_memory(ctx: dict = Depends(require_auth)):
+def list_memory(ctx: dict = Depends(authed)):
     entries = db.list_memory(ctx["company_id"])
     # Expose a stable "key" field for backward compat with frontend
     for e in entries:
@@ -3245,7 +3333,7 @@ def list_memory(ctx: dict = Depends(require_auth)):
 
 
 @app.post("/memory/{entry_id}/confirm")
-def confirm_memory(entry_id: str, body: dict = {}, ctx: dict = Depends(require_auth)):
+def confirm_memory(entry_id: str, body: dict = {}, ctx: dict = Depends(authed)):
     updates: dict = {"confirmed": True}
     subcode = body.get("subcode", "")
     if subcode:
@@ -3255,17 +3343,15 @@ def confirm_memory(entry_id: str, body: dict = {}, ctx: dict = Depends(require_a
 
 
 @app.delete("/memory/{entry_id}")
-def delete_memory_entry(entry_id: str, ctx: dict = Depends(require_auth)):
-    (db.sb.table("product_memory")
-     .delete()
-     .eq("id", entry_id)
-     .eq("company_id", ctx["company_id"])
-     .execute())
+def delete_memory_entry(entry_id: str, ctx: dict = Depends(authed)):
+    """Phase B: through DAL wrapper. RLS `memory_tenant_all` also
+    filters by company_id under user JWT."""
+    db.delete_memory_entry(entry_id, ctx["company_id"])
     return {"ok": True}
 
 
 @app.post("/memory/cleanup-invalid")
-def cleanup_invalid_memory(ctx: dict = Depends(require_auth)):
+def cleanup_invalid_memory(ctx: dict = Depends(authed)):
     """Remove memory entries whose 'code' is not a real commodity code
     (SKUs, short strings, alphanumeric article numbers)."""
     entries = db.list_memory(ctx["company_id"])
@@ -3273,11 +3359,8 @@ def cleanup_invalid_memory(ctx: dict = Depends(require_auth)):
     for e in entries:
         code = (e.get("code") or "").strip()
         if not is_real_commodity_code(code):
-            (db.sb.table("product_memory")
-             .delete()
-             .eq("id", e["id"])
-             .eq("company_id", ctx["company_id"])
-             .execute())
+            # Phase B: routed through DAL wrapper for RLS coverage.
+            db.delete_memory_entry(e["id"], ctx["company_id"])
             removed += 1
     return {"removed": removed}
 
