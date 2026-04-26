@@ -5,7 +5,11 @@ services:
     region: frankfurt
     plan: free
     buildCommand: pip install -r invoiceflow/requirements.txt
-    startCommand: cd invoiceflow && uvicorn main:app --host 0.0.0.0 --port $PORT
+    # --proxy-headers + --forwarded-allow-ips='*' so request.client.host
+    # reflects the real client IP behind Render's edge proxy. The login
+    # rate limiter relies on this; without it every request appears to
+    # come from the proxy and the per-IP cap is global.
+    startCommand: cd invoiceflow && uvicorn main:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips='*'
     envVars:
       - key: PYTHON_VERSION
         value: "3.12.5"

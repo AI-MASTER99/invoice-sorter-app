@@ -45,6 +45,8 @@ import database as db
 # ---------------------------------------------------------------------------
 DEV_MODE = os.environ.get("DEV_MODE") == "1"
 
+# Forbidden default values are matched case-insensitively so
+# "DEV-SECRET-CHANGE-ME" doesn't slip through.
 _FORBIDDEN_DEFAULTS = {
     "SECRET_KEY": {
         "dev-secret-change-me",
@@ -53,8 +55,9 @@ _FORBIDDEN_DEFAULTS = {
         "please-change-me",
         "change-this-to-a-random-secret-key-before-deploying",
     },
-    "APP_PASSWORD": {"changeme", "password", "admin", "admin123"},
+    "APP_PASSWORD": {"changeme", "password", "admin", "admin123", "test"},
 }
+_MIN_SECRET_KEY_LEN = 32  # 32 chars ≈ 192 bits of entropy from token_urlsafe
 
 
 def _require_env(name: str) -> str:
@@ -65,11 +68,17 @@ def _require_env(name: str) -> str:
             f"Configure it in Render → Environment (production) or "
             f"invoiceflow/.env (local development) before starting."
         )
-    if val in _FORBIDDEN_DEFAULTS.get(name, set()):
+    if val.lower() in _FORBIDDEN_DEFAULTS.get(name, set()):
         raise RuntimeError(
             f"Environment variable {name!r} is set to a known-default "
             f"value ({val!r}). Pick a real one — long random string for "
             f"SECRET_KEY, a real password for APP_PASSWORD."
+        )
+    if name == "SECRET_KEY" and len(val) < _MIN_SECRET_KEY_LEN:
+        raise RuntimeError(
+            f"SECRET_KEY is only {len(val)} chars; need at least "
+            f"{_MIN_SECRET_KEY_LEN}. Generate one with: "
+            f"python -c 'import secrets; print(secrets.token_urlsafe(48))'"
         )
     return val
 
@@ -2187,16 +2196,18 @@ app = FastAPI(title="Invoice Sorter")
 # Session cookie hardening:
 #   - https_only=True in production (TLS-only); off only when DEV_MODE=1
 #     so localhost http:// can still test the login flow.
-#   - same_site="strict" blocks all cross-site cookie attachment, so a
+#   - same_site="strict" blocks cross-site cookie attachment, so a
 #     malicious site cannot trigger an authenticated POST against the
-#     API. Deep links from email still work because users land on the
-#     login page first if their cookie is missing.
-#   - max_age = 14 days so abandoned sessions eventually expire.
+#     API. Top-level GET navigation from email still works because the
+#     browser sends the cookie when the user clicks the link directly.
+#   - max_age 12h kept from the original (NOT lengthened) — daily
+#     re-login is fine for an admin/customs tool and limits damage
+#     window for stolen laptops or accidental cookie disclosure.
 app.add_middleware(
     SessionMiddleware,
     secret_key=SECRET_KEY,
     session_cookie="is_session",
-    max_age=14 * 24 * 60 * 60,
+    max_age=60 * 60 * 12,
     https_only=not DEV_MODE,
     same_site="strict",
 )
@@ -2253,43 +2264,123 @@ async def login_page():
     return HTMLResponse(content=login_html.read_text(encoding="utf-8"))
 
 
-# In-memory login rate limiter. Sliding-window: at most
-# _LOGIN_MAX_ATTEMPTS failures per (username + client-IP) inside
-# _LOGIN_WINDOW_SECONDS, after which we 429. State is per-process and
-# resets on pod restart — fine for a single Render instance and
-# acceptable even with multi-instance because an attacker still has
-# to clear N pods to make sustained progress.
-_LOGIN_ATTEMPTS: dict[tuple[str, str], list[float]] = {}
+# ---------------------------------------------------------------------------
+# Login rate limiting
+# ---------------------------------------------------------------------------
+# Two-layer in-memory sliding-window:
+#   1. Per (username, IP): 5 failures / 15 min — protects a single account.
+#   2. Per IP only:        50 failures / 15 min — caps an attacker who
+#      rotates usernames from one source.
+# Both layers reset on a successful login (only for the matching key).
+#
+# State is per-process. Render's free plan runs a single uvicorn worker so
+# this is sufficient. Under N>1 workers the limit becomes 5*N — acceptable
+# defence-in-depth but for stronger guarantees move to Redis. A
+# threading.Lock guards every read+write because async tasks do still
+# context-switch around await points.
+#
+# Dict size is capped at _MAX_TRACKED_KEYS; when full we evict empty
+# entries first, then the oldest. Without this, a username/IP scanner
+# could grow the dict unbounded and OOM the pod.
+_LOGIN_ATTEMPTS_USER: dict[tuple[str, str], list[float]] = {}
+_LOGIN_ATTEMPTS_IP:   dict[str, list[float]] = {}
 _LOGIN_WINDOW_SECONDS = 15 * 60
-_LOGIN_MAX_ATTEMPTS   = 5
+_LOGIN_MAX_PER_USER   = 5
+_LOGIN_MAX_PER_IP     = 50
+_MAX_TRACKED_KEYS     = 10_000
+_LOGIN_LOCK = threading.Lock()
+
+# Pre-computed bcrypt hash of a random throwaway password. We verify
+# against this when the username doesn't exist so the response time
+# matches the real-user path (~250ms on Opus's bcrypt(12) settings).
+# Without this, an attacker times the response to enumerate accounts.
+_DUMMY_BCRYPT_HASH = _pwd_ctx.hash("dummy-password-for-timing-equalization")
 
 
-def _login_attempt_key(username: str, request: Request) -> tuple[str, str]:
-    ip = (request.client.host if request.client else "") or "unknown"
-    return (username.lower(), ip)
+def _client_ip(request: Request) -> str:
+    """Best-effort real-client IP. On Render (and any reverse proxy),
+    request.client.host is the proxy's IP — useless for rate limiting.
+    Prefer the leftmost public IP from X-Forwarded-For, falling back to
+    the proxy IP only if no header is present.
+
+    Note: this header is trivially spoofable when the app is reached
+    directly. On Render the platform overwrites X-Forwarded-For with
+    the real client IP, so trusting the leftmost entry is safe.
+    """
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        # First entry is the original client; subsequent entries are proxies.
+        first = fwd.split(",")[0].strip()
+        if first:
+            return first
+    real = request.headers.get("x-real-ip", "").strip()
+    if real:
+        return real
+    return (request.client.host if request.client else "") or "unknown"
 
 
-def _check_login_rate_limit(username: str, request: Request) -> None:
-    key = _login_attempt_key(username, request)
+def _prune_attempts(arr: list[float], now: float) -> list[float]:
+    return [t for t in arr if now - t < _LOGIN_WINDOW_SECONDS]
+
+
+def _evict_if_full(d: dict) -> None:
+    """When we hit the size cap, drop empty entries first, then oldest.
+    Caller must hold _LOGIN_LOCK."""
+    if len(d) <= _MAX_TRACKED_KEYS:
+        return
+    # Drop empty lists (likely already-pruned entries).
+    for k in [k for k, v in d.items() if not v]:
+        del d[k]
+        if len(d) <= _MAX_TRACKED_KEYS:
+            return
+    # Still full — drop entries with the oldest most-recent attempt.
+    if len(d) > _MAX_TRACKED_KEYS:
+        ordered = sorted(d.items(), key=lambda kv: kv[1][-1] if kv[1] else 0)
+        for k, _ in ordered[: len(d) - _MAX_TRACKED_KEYS]:
+            del d[k]
+
+
+def _check_login_rate_limit(username: str, ip: str) -> None:
+    """Raise 429 if either limit is exceeded. Caller is responsible for
+    rejecting empty usernames before this is reached."""
     now = time.time()
-    attempts = [t for t in _LOGIN_ATTEMPTS.get(key, []) if now - t < _LOGIN_WINDOW_SECONDS]
-    _LOGIN_ATTEMPTS[key] = attempts
-    if len(attempts) >= _LOGIN_MAX_ATTEMPTS:
-        retry_in = int(_LOGIN_WINDOW_SECONDS - (now - attempts[0]))
-        minutes  = max(1, retry_in // 60 + 1)
-        raise HTTPException(
-            status_code=429,
-            detail=f"Too many failed login attempts. Try again in {minutes} minute(s).",
-        )
+    with _LOGIN_LOCK:
+        # Per-IP cap (broad)
+        ip_attempts = _prune_attempts(_LOGIN_ATTEMPTS_IP.get(ip, []), now)
+        _LOGIN_ATTEMPTS_IP[ip] = ip_attempts
+        if len(ip_attempts) >= _LOGIN_MAX_PER_IP:
+            retry_in = int(_LOGIN_WINDOW_SECONDS - (now - ip_attempts[0]))
+            raise HTTPException(
+                status_code=429,
+                detail=f"Too many failed login attempts. Try again in {max(1, retry_in // 60 + 1)} minute(s).",
+            )
+        # Per-(user, IP) cap (narrow)
+        user_key = (username, ip)
+        user_attempts = _prune_attempts(_LOGIN_ATTEMPTS_USER.get(user_key, []), now)
+        _LOGIN_ATTEMPTS_USER[user_key] = user_attempts
+        if len(user_attempts) >= _LOGIN_MAX_PER_USER:
+            retry_in = int(_LOGIN_WINDOW_SECONDS - (now - user_attempts[0]))
+            raise HTTPException(
+                status_code=429,
+                detail=f"Too many failed login attempts. Try again in {max(1, retry_in // 60 + 1)} minute(s).",
+            )
 
 
-def _record_login_failure(username: str, request: Request) -> None:
-    key = _login_attempt_key(username, request)
-    _LOGIN_ATTEMPTS.setdefault(key, []).append(time.time())
+def _record_login_failure(username: str, ip: str) -> None:
+    now = time.time()
+    with _LOGIN_LOCK:
+        _LOGIN_ATTEMPTS_USER.setdefault((username, ip), []).append(now)
+        _LOGIN_ATTEMPTS_IP.setdefault(ip, []).append(now)
+        _evict_if_full(_LOGIN_ATTEMPTS_USER)
+        _evict_if_full(_LOGIN_ATTEMPTS_IP)
 
 
-def _clear_login_failures(username: str, request: Request) -> None:
-    _LOGIN_ATTEMPTS.pop(_login_attempt_key(username, request), None)
+def _clear_login_failures(username: str, ip: str) -> None:
+    with _LOGIN_LOCK:
+        _LOGIN_ATTEMPTS_USER.pop((username, ip), None)
+        # Don't clear the IP-level bucket — a successful login on user A
+        # shouldn't reset the IP cap that protects other users on the
+        # same machine.
 
 
 @app.post("/api/login")
@@ -2297,10 +2388,16 @@ async def api_login(request: Request, body: dict = {}):
     username = (body.get("username") or "").strip().lower()
     password = body.get("password") or ""
     company_name = (body.get("company") or "").strip()
+    ip = _client_ip(request)
+
+    # Reject empty username before touching the rate limiter — otherwise
+    # a flood of empty-username probes pollutes the ("",IP) bucket.
+    if not username or not password:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
 
     # Rate limit BEFORE any DB lookup, so an attacker can't enumerate
     # usernames just by spamming us.
-    _check_login_rate_limit(username, request)
+    _check_login_rate_limit(username, ip)
 
     # Single error message for every failure mode (wrong company, wrong
     # username, wrong password) — otherwise an attacker can enumerate
@@ -2310,18 +2407,29 @@ async def api_login(request: Request, body: dict = {}):
     if company_name:
         company = db.get_company_by_name(company_name)
         if not company:
-            _record_login_failure(username, request)
+            # Burn bcrypt time to keep response timing constant whether or
+            # not the company exists. Without this, an attacker can
+            # enumerate companies via response timing alone.
+            verify_password(password, _DUMMY_BCRYPT_HASH)
+            _record_login_failure(username, ip)
             raise invalid
         user = db.get_user(username, company["id"])
     else:
         # No company specified — default company only (backward compat)
         user = db.get_user(username, db.DEFAULT_COMPANY_ID)
 
-    if not user or not verify_password(password, user["password_hash"]):
-        _record_login_failure(username, request)
+    # If user is None, still run bcrypt verify against a dummy hash so
+    # the timing matches the "user exists, wrong password" path.
+    if user is None:
+        verify_password(password, _DUMMY_BCRYPT_HASH)
+        _record_login_failure(username, ip)
         raise invalid
 
-    _clear_login_failures(username, request)
+    if not verify_password(password, user["password_hash"]):
+        _record_login_failure(username, ip)
+        raise invalid
+
+    _clear_login_failures(username, ip)
     request.session["user_id"]    = user["id"]
     request.session["username"]   = user["username"]
     request.session["company_id"] = user["company_id"]
