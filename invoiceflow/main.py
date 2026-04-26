@@ -2594,9 +2594,20 @@ def api_list_users(ctx: dict = Depends(require_admin)):
 async def api_add_user(body: dict = {}, ctx: dict = Depends(require_admin)):
     username = (body.get("username") or "").strip().lower()
     password = body.get("password") or ""
-    role = body.get("role", "user")
+    role = (body.get("role") or "user").strip().lower()
     if not username or not password:
         raise HTTPException(400, "Username and password required")
+
+    # Role whitelist + privilege gate. Without this, a regular `admin`
+    # could POST {"role":"super_admin"} and self-elevate cross-tenant
+    # access — super_admin can list/create/delete ANY company. Lock it
+    # down: admins create only user|admin in their own company; only an
+    # existing super_admin can mint another super_admin.
+    if role not in {"user", "admin", "super_admin"}:
+        raise HTTPException(400, "Invalid role")
+    if role == "super_admin" and ctx["role"] != "super_admin":
+        raise HTTPException(403, "Only a super admin can create super admins")
+
     if db.get_user(username, ctx["company_id"]):
         raise HTTPException(409, "User already exists in this company")
     db.create_user(ctx["company_id"], username, _pwd_ctx.hash(password), role)
