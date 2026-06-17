@@ -751,14 +751,26 @@ tbody tr:hover { background: var(--bg-soft); }
 .btn-items:hover { background: rgba(124,58,237,0.18); }
 
 /* ── Review modal ─────────────────────────────────────────── */
-.modal-review { width: 580px; }
+/* Bound the whole modal to the screen so the title + Close button always stay
+   visible; the issues list scrolls inside the remaining space. */
+.modal-review {
+  width: 580px;
+  max-height: 85vh;
+  display: flex;
+  flex-direction: column;
+}
+.modal-review .modal-title,
+.modal-review .modal-sub,
+.modal-review .modal-actions { flex-shrink: 0; }
 .review-issues {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  max-height: 52vh;
+  flex: 1 1 auto;
+  min-height: 0;        /* lets the flex child shrink so overflow-y can scroll */
   overflow-y: auto;
   margin-bottom: 18px;
+  padding-right: 4px;   /* breathing room for the scrollbar */
 }
 .review-issue {
   border: 1px solid var(--border);
