@@ -1926,44 +1926,72 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
         sym = m.group(1) if m else ""
         return _CURRENCY_CODE.get(sym, sym)
 
-    out_row = 4
-    MAX_ROW = 102  # template processes Items rows 4..102
+    def _num(row, field):
+        return extract_value_number(row.get(field, "")) or 0.0
+
+    # ── Collect goods lines, splitting the code (8-digit + 2-digit TARIC) and
+    #    merging lines that share the SAME commodity code + TARIC + origin
+    #    (the client pays per line, so identical codes must be one summed line).
+    #    NOT-IN-LIST lines are never merged — a human still has to resolve each.
+    groups: list[dict] = []
+    index: dict[tuple, dict] = {}
     for row in final_rows:
         desc = (row.get("Description of Goods", "") or "").strip()
         if _is_fee_row(desc):
             continue          # fee/charge rows are not commodity item lines
+        digits = re.sub(r"\D", "", row.get("Comm./imp. cod", "") or "")
+        c8 = digits[:8]
+        taric = digits[8:10] if len(digits) >= 10 else ""
+        origin = (row.get("Origin", "") or "").strip().upper()
+        not_in_list = bool(row.get("_not_in_list")) or desc.startswith(review.NOT_IN_LIST_MARKER)
+        entry = {
+            "c8": c8, "taric": taric, "origin": origin, "desc": desc,
+            "country": row.get("Country", ""), "currency": currency_of(row),
+            "cds": row.get("_cds") or {},
+            "gross": _num(row, "Gross Weight (KG)"), "net": _num(row, "Net Weight (KG)"),
+            "value": _num(row, "Value"), "packages": _num(row, "Number of Packages"),
+        }
+        key = (c8, taric, origin)
+        if not not_in_list and key in index:
+            g = index[key]
+            g["gross"] += entry["gross"]; g["net"] += entry["net"]
+            g["value"] += entry["value"]; g["packages"] += entry["packages"]
+        else:
+            if not not_in_list:
+                index[key] = entry
+            groups.append(entry)
+
+    out_row = 4
+    MAX_ROW = 102  # template processes Items rows 4..102
+    for g in groups:
         if out_row > MAX_ROW:
             break
-        cds = row.get("_cds") or {}
+        cds = g["cds"]
         docs = cds.get("documents") or []
 
-        # ── From the invoice ──
-        put(out_row, "[6/14] Commodity Code", row.get("Comm./imp. cod", ""), as_text=True)
-        put(out_row, "[6/8] Description of Goods", desc)
-        put(out_row, "[6/5] Gross Mass (kg)", extract_value_number(row.get("Gross Weight (KG)", "")))
-        put(out_row, "[6/1] Net Mass (kg)", extract_value_number(row.get("Net Weight (KG)", "")))
-        put(out_row, "[4/14] Item Price", extract_value_number(row.get("Value", "")))
-        put(out_row, "[4/14] Item Price Currency", currency_of(row))
-        put(out_row, "[5/15] Country of Origin", row.get("Origin", ""))
-        put(out_row, "[6/10] Packages - Number of Packages (01)",
-            extract_value_number(row.get("Number of Packages", "")))
-
-        # ── From the client list (rich CDS fields; blank when the list lacks them) ──
-        put(out_row, "[6/14] TARIC Code", cds.get("taric_code"), as_text=True)
+        # ── Commodity code split: 8 digits here, last 2 in the TARIC column ──
+        put(out_row, "[6/14] Commodity Code", g["c8"], as_text=True)
+        put(out_row, "[6/14] TARIC Code", g["taric"] or cds.get("taric_code"), as_text=True)
+        put(out_row, "[6/8] Description of Goods", g["desc"])
+        # ── Summed invoice figures ──
+        put(out_row, "[6/5] Gross Mass (kg)", round(g["gross"], 3) or None)
+        put(out_row, "[6/1] Net Mass (kg)", round(g["net"], 3) or None)
+        put(out_row, "[4/14] Item Price", round(g["value"], 2) or None)
+        put(out_row, "[4/14] Item Price Currency", g["currency"])
+        put(out_row, "[5/15] Country of Origin", g["origin"])
+        put(out_row, "[6/10] Packages - Number of Packages (01)", int(round(g["packages"])) or None)
+        # ── CDS rule fields from the client list (blank when absent) ──
         put(out_row, "[1/10] Procedure", cds.get("procedure"), as_text=True)
         put(out_row, "[4/17] Preference", cds.get("pref"), as_text=True)
         put(out_row, "[4/8] Method of Payment", cds.get("mop"), as_text=True)
         put(out_row, "[4/16] Valuation Method", cds.get("val_method"), as_text=True)
         put(out_row, "[5/16] Country of Preferential Origin", cds.get("cop"))
         put(out_row, "[6/17] National Additional Codes - Code (01)", cds.get("nat_add_code"), as_text=True)
-
-        # ── Documents (up to 3 slots: codes 01/02/03) ──
         for di, doc in enumerate(docs[:3], start=1):
             put(out_row, f"[2/3] Documents - Code (0{di})", doc.get("code"), as_text=True)
             put(out_row, f"[2/3] Documents - ID (0{di})", doc.get("id"), as_text=True)
             put(out_row, f"[2/3] Documents - Status (0{di})", doc.get("status"), as_text=True)
             put(out_row, f"[2/3] Documents - Reason (0{di})", doc.get("reason"))
-
         out_row += 1
 
     buf = io.BytesIO()
