@@ -736,6 +736,57 @@ tbody tr:hover { background: var(--bg-soft); }
 }
 .btn-retry:hover { background: #FECACA; }
 
+.btn-review {
+  background: rgba(67,97,238,0.10);
+  color: var(--primary);
+  border: 1px solid rgba(67,97,238,0.25);
+}
+.btn-review:hover { background: rgba(67,97,238,0.18); }
+
+.btn-items {
+  background: rgba(124,58,237,0.10);
+  color: var(--purple);
+  border: 1px solid rgba(124,58,237,0.25);
+}
+.btn-items:hover { background: rgba(124,58,237,0.18); }
+
+/* ── Review modal ─────────────────────────────────────────── */
+.modal-review { width: 580px; }
+.review-issues {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 52vh;
+  overflow-y: auto;
+  margin-bottom: 18px;
+}
+.review-issue {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--muted);
+  border-radius: 10px;
+  padding: 11px 14px;
+  background: var(--bg-soft);
+}
+.review-issue.sev-high   { border-left-color: var(--red);   background: var(--red-bg); }
+.review-issue.sev-medium { border-left-color: var(--amber); background: var(--amber-bg); }
+.review-issue.sev-info   { border-left-color: var(--muted); }
+.review-issue-head {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  margin-bottom: 4px;
+}
+.review-loc   { font-weight: 700; font-size: 13px; color: var(--text); }
+.review-field { font-size: 12px; color: var(--muted); }
+.review-msg   { font-size: 13px; color: var(--text); line-height: 1.5; }
+.review-action { font-size: 12.5px; color: var(--muted); margin-top: 5px; }
+.review-empty {
+  text-align: center;
+  color: var(--muted);
+  padding: 26px 10px;
+  font-size: 14px;
+}
+
 .btn-delete {
   background: transparent;
   color: var(--muted);

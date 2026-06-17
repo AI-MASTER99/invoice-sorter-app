@@ -352,28 +352,32 @@ function actionsHtml(inv) {
   const del = `<button class="btn-export btn-delete" title="Delete permanently" onclick="deleteInvoice('${inv.id}', '${sup}')">🗑</button>`;
   if (inv.status === 'verified') {
     return `
-      <button class="btn-export btn-full"   onclick="exportFull('${inv.id}')">Full Excel</button>
+      <button class="btn-export btn-review" onclick="openReview('${inv.id}', '${sup}')">🔍 Review</button>
+      <button class="btn-export btn-full"   onclick="exportItems('${inv.id}')">Full Excel</button>
       <button class="btn-export btn-raw"    onclick="exportRaw('${inv.id}')">Raw only</button>
       ${del}`;
   }
   if (inv.status === 'subcode_needed') {
     return `
+      <button class="btn-export btn-review"  onclick="openReview('${inv.id}', '${sup}')">🔍 Review</button>
       <button class="btn-export btn-resolve" onclick="openResolve('${inv.id}', '${sup}')">Resolve</button>
       <button class="btn-export btn-retry"   onclick="retryInvoice('${inv.id}')">↻ Retry</button>
-      <button class="btn-export btn-full"    onclick="exportFull('${inv.id}')">Full Excel</button>
+      <button class="btn-export btn-full"    onclick="exportItems('${inv.id}')">Full Excel</button>
       <button class="btn-export btn-raw"     onclick="exportRaw('${inv.id}')">Raw only</button>
       ${del}`;
   }
   if (inv.status === 'failed') {
     return `
-      <button class="btn-export btn-retry" onclick="retryInvoice('${inv.id}')">Retry</button>
+      <button class="btn-export btn-review" onclick="openReview('${inv.id}', '${sup}')">🔍 Review</button>
+      <button class="btn-export btn-retry"  onclick="retryInvoice('${inv.id}')">Retry</button>
       ${del}`;
   }
   return del;
 }
 
-function exportFull(id)  { window.open(`/invoices/${id}/export/full`, '_blank'); }
-function exportRaw(id)   { window.open(`/invoices/${id}/export/raw`,  '_blank'); }
+function exportFull(id)  { window.open(`/invoices/${id}/export/full`,  '_blank'); }
+function exportRaw(id)   { window.open(`/invoices/${id}/export/raw`,   '_blank'); }
+function exportItems(id) { window.open(`/invoices/${id}/export/items`, '_blank'); }
 
 async function retryInvoice(id) {
   try {
@@ -413,6 +417,54 @@ document.getElementById('modal-confirm').addEventListener('click', async () => {
   await refreshInvoices();
   await refreshInvoicesPage();
   refreshStats();
+});
+
+/* ── Review modal ─────────────────────────────────────────── */
+async function openReview(invoiceId, supplierName) {
+  const overlay = document.getElementById('modal-review-overlay');
+  document.getElementById('review-supplier').textContent = supplierName || invoiceId;
+  document.getElementById('review-summary').textContent = 'Loading…';
+  document.getElementById('review-issues').innerHTML = '';
+  overlay.classList.remove('hidden');
+  try {
+    const data = await api('GET', `/invoices/${invoiceId}/review`);
+    renderReview(data);
+  } catch (e) {
+    document.getElementById('review-summary').textContent = 'Could not load review: ' + e.message;
+  }
+}
+
+function renderReview(data) {
+  const s = (data && data.summary) || {};
+  const issues = (data && data.issues) || [];
+  const sumEl = document.getElementById('review-summary');
+  if (s.status === 'verified') {
+    sumEl.innerHTML = `<span style="color:var(--green);font-weight:600">✓ Verified</span> — everything reconciles with the invoice. Nothing to review.`;
+  } else {
+    const parts = [];
+    if (s.high)   parts.push(`<strong>${s.high}</strong> to fix`);
+    if (s.medium) parts.push(`<strong>${s.medium}</strong> to check`);
+    if (s.info)   parts.push(`${s.info} note${s.info > 1 ? 's' : ''}`);
+    sumEl.innerHTML = `<span style="color:var(--amber);font-weight:600">⚠ Needs review</span> — ${parts.join(' · ')}.`;
+  }
+  const cont = document.getElementById('review-issues');
+  if (!issues.length) {
+    cont.innerHTML = `<div class="review-empty">No problems found — all lines matched and all totals reconcile. ✅</div>`;
+    return;
+  }
+  cont.innerHTML = issues.map(i => `
+    <div class="review-issue sev-${escHtml(i.severity)}">
+      <div class="review-issue-head">
+        <span class="review-loc">${escHtml(i.location)}</span>
+        <span class="review-field">${escHtml(i.field)}</span>
+      </div>
+      <div class="review-msg">${escHtml(i.message)}</div>
+      ${i.action ? `<div class="review-action">→ ${escHtml(i.action)}</div>` : ''}
+    </div>`).join('');
+}
+
+document.getElementById('review-close').addEventListener('click', () => {
+  document.getElementById('modal-review-overlay').classList.add('hidden');
 });
 
 /* ── Memory page ──────────────────────────────────────────── */

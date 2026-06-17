@@ -20,6 +20,7 @@ storage.objects has no RLS policies; tenant isolation comes from the
 {company_id}/… path-prefix in app code. See migrations/PHASE_B_PLAN.md
 for full rationale.
 """
+import json as _json
 import os
 from contextvars import ContextVar
 from pathlib import Path
@@ -306,6 +307,113 @@ def delete_memory_entry(memory_id: str, company_id: str) -> None:
      .eq("id", memory_id)
      .eq("company_id", company_id)
      .execute())
+
+
+# ═══════════════════════════════════════════════════════════════
+# CLIENTS + CLIENT PRODUCT LISTS
+# Per-supplier commodity-code lists that replace the gov.uk tariff
+# lookup. A "client" is the supplier/exporter; client_products is that
+# client's code list (general code -> full code + description + CDS fields).
+# ═══════════════════════════════════════════════════════════════
+def list_clients(company_id: str) -> list[dict]:
+    r = (_client().table("clients").select("*")
+         .eq("company_id", company_id).order("name").execute())
+    return r.data
+
+
+def get_client(company_id: str, client_id: str) -> Optional[dict]:
+    r = (_client().table("clients").select("*")
+         .eq("company_id", company_id).eq("id", client_id).limit(1).execute())
+    return r.data[0] if r.data else None
+
+
+def create_client_record(company_id: str, entry: dict) -> dict:
+    # NOTE: named *_record (not create_client) so it does NOT shadow the
+    # supabase `create_client` imported at the top of this module.
+    r = _client().table("clients").insert({"company_id": company_id, **entry}).execute()
+    return r.data[0] if r.data else {}
+
+
+def update_client(company_id: str, client_id: str, updates: dict) -> None:
+    (_client().table("clients").update(updates)
+     .eq("company_id", company_id).eq("id", client_id).execute())
+
+
+def delete_client(company_id: str, client_id: str) -> None:
+    """Deletes the client; client_products rows cascade (FK ON DELETE CASCADE)."""
+    (_client().table("clients").delete()
+     .eq("company_id", company_id).eq("id", client_id).execute())
+
+
+def find_client_by_identity(company_id: str, *, rex: str = "",
+                            eori: str = "", name: str = "") -> Optional[dict]:
+    """Resolve which client an invoice belongs to. Prefer the stable REX/EORI
+    identifiers; fall back to an exact (case-insensitive) name or alias match."""
+    def base():
+        return _client().table("clients").select("*").eq("company_id", company_id)
+    if rex:
+        r = base().eq("rex", rex).limit(1).execute()
+        if r.data:
+            return r.data[0]
+    if eori:
+        r = base().eq("eori", eori).limit(1).execute()
+        if r.data:
+            return r.data[0]
+    if name:
+        r = base().ilike("name", name).limit(1).execute()
+        if r.data:
+            return r.data[0]
+        # aliases is jsonb — containment needs a JSON-encoded value, not a
+        # Postgres array literal (which raises 22P02).
+        r = base().contains("aliases", _json.dumps([name])).limit(1).execute()
+        if r.data:
+            return r.data[0]
+    return None
+
+
+def get_or_create_client(company_id: str, name: str,
+                         rex: str = "", eori: str = "") -> dict:
+    existing = find_client_by_identity(company_id, rex=rex, eori=eori, name=name)
+    if existing:
+        return existing
+    return create_client_record(company_id, {
+        "name": name, "rex": rex or None, "eori": eori or None,
+    })
+
+
+def list_client_products(company_id: str, client_id: str) -> list[dict]:
+    r = (_client().table("client_products").select("*")
+         .eq("company_id", company_id).eq("client_id", client_id)
+         .order("general_code").execute())
+    return r.data
+
+
+def get_client_products_by_general_code(company_id: str, client_id: str,
+                                        general_code: str) -> list[dict]:
+    """The VLOOKUP: candidate subcodes for a general code in this client's list."""
+    r = (_client().table("client_products").select("*")
+         .eq("company_id", company_id).eq("client_id", client_id)
+         .eq("general_code", general_code).execute())
+    return r.data
+
+
+def upsert_client_product(company_id: str, client_id: str, entry: dict) -> dict:
+    """Insert/update one list row, keyed on (company_id, client_id, full_code)."""
+    payload = {"company_id": company_id, "client_id": client_id, **entry}
+    r = (_client().table("client_products")
+         .upsert(payload, on_conflict="company_id,client_id,full_code").execute())
+    return r.data[0] if r.data else {}
+
+
+def count_client_products(company_id: str, client_id: str) -> int:
+    r = (_client().table("client_products").select("id", count="exact")
+         .eq("company_id", company_id).eq("client_id", client_id).execute())
+    return r.count or 0
+
+
+def delete_client_products(company_id: str, client_id: str) -> None:
+    (_client().table("client_products").delete()
+     .eq("company_id", company_id).eq("client_id", client_id).execute())
 
 
 # ═══════════════════════════════════════════════════════════════

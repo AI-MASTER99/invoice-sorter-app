@@ -42,6 +42,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 # Database layer (Supabase)
 import database as db
+import review
 
 # JWT minting for per-request user-scoped Supabase client (Phase B)
 from auth_jwt import mint_user_jwt
@@ -121,6 +122,11 @@ AI_MODEL_LIGHT   = os.environ.get("AI_MODEL_LIGHT",   "claude-sonnet-4-6")
 if os.environ.get("AI_MODEL"):
     AI_MODEL_PRIMARY = os.environ["AI_MODEL"]
     AI_MODEL_LIGHT   = os.environ["AI_MODEL"]
+
+# Feature flag: source commodity sub-codes from the per-client list in the DB
+# instead of the gov.uk trade-tariff website. Off by default → unchanged
+# behaviour; flip to 1 in .env to use the client lists (Spoor C).
+USE_CLIENT_LIST = os.environ.get("USE_CLIENT_LIST") == "1"
 
 for d in (UPLOADS_DIR, OUTPUT_DIR):
     d.mkdir(parents=True, exist_ok=True)
@@ -376,6 +382,45 @@ async def lookup_tariff(commodity_code: str) -> dict:
     if isinstance(result, dict):
         result["fetched_at"] = datetime.now(timezone.utc).isoformat()
     return result
+
+
+def _norm_general_code(commodity_code: str) -> str:
+    """Digits-only key for the client-list VLOOKUP. Lists store the general
+    code zero-padded to 8 (e.g. '07049010'); pad short codes to match."""
+    digits = re.sub(r"\D", "", commodity_code or "")
+    if digits and len(digits) < 8:
+        digits = digits.zfill(8)
+    return digits
+
+
+def lookup_client_list(company_id: str, client_id: str, commodity_code: str) -> dict:
+    """Client-list equivalent of lookup_tariff.
+
+    VLOOKUP the invoice's general commodity code in this client's product list
+    and return the SAME shape (description / duty / vat / subcodes[]), so
+    match_subcodes() and the enrichment loop work unchanged. Each list row
+    becomes a subcode carrying the COMPLETE code and the LIST description.
+    An empty subcodes list means the code is not in this client's list, which
+    the enrichment marks as NOT IN LIST.
+    """
+    from datetime import datetime, timezone
+    general = _norm_general_code(commodity_code)
+    products = (db.get_client_products_by_general_code(company_id, client_id, general)
+                if general else [])
+    subcodes = [{
+        "code": p.get("full_code") or "",
+        "description": p.get("description") or "",
+        "duty": "",
+        "product": p,             # keep the full row for later CDS-field use
+    } for p in products if p.get("full_code")]
+    return {
+        "description": subcodes[0]["description"] if subcodes else "",
+        "duty": "N/A",
+        "vat": "0%",
+        "subcodes": subcodes,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "source": "client_list",
+    }
 
 
 async def _lookup_tariff_raw(commodity_code: str) -> dict:
@@ -688,6 +733,29 @@ EXTRACTION_TOOL = {
                 "description": (
                     "The invoice / document number printed on the invoice. "
                     "NOT a client reference or monetary amount."
+                ),
+            },
+            "supplier_name": {
+                "type": "string",
+                "description": (
+                    "The SUPPLIER / SELLER / EXPORTER name — the company that "
+                    "ISSUED the invoice (usually at the top / letterhead, e.g. "
+                    "'APICELLA LORENZO S.A.S.'). NOT the buyer/consignee. "
+                    "Empty string if not clear."
+                ),
+            },
+            "supplier_rex": {
+                "type": "string",
+                "description": (
+                    "The supplier's REX number if printed (e.g. "
+                    "'ITREXIT06167560157'). Empty string if absent."
+                ),
+            },
+            "supplier_eori": {
+                "type": "string",
+                "description": (
+                    "The supplier's EORI / VAT number if printed (e.g. "
+                    "'IT 06167560157'). Empty string if absent."
                 ),
             },
             "currency_symbol": {
@@ -1816,6 +1884,94 @@ def build_excel(
 
 
 # ---------------------------------------------------------------------------
+# MultiFreight CDS "Items" tab output (Spoor D)
+# ---------------------------------------------------------------------------
+_ITEMS_TEMPLATE = Path(__file__).resolve().parent / "assets" / "MULTIFREIGHT_template.xlsx"
+_CURRENCY_CODE = {"€": "EUR", "£": "GBP", "$": "USD", "CHF": "CHF"}
+
+
+def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> bytes:
+    """Fill the MultiFreight CDS 'Items' tab from the processed rows.
+
+    Loads the real MultiFreight template, keeps ONLY the Items sheet (drops
+    Header + Tips and Tricks), leaves the row-3 column headers untouched
+    (renaming them = import rejection), and writes one goods line per row from
+    row 4. Invoice-derived columns come from the rows; the CDS rule columns
+    (procedure, preference, documents…) come from the matched client-list row
+    (row['_cds']) when present.
+    """
+    wb = openpyxl.load_workbook(_ITEMS_TEMPLATE)
+    for name in list(wb.sheetnames):
+        if name != "Items":
+            del wb[name]
+    ws = wb["Items"]
+
+    # Map exact row-3 header text -> column index.
+    col: dict[str, int] = {}
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(row=3, column=c).value
+        if v not in (None, ""):
+            col[str(v).strip()] = c
+
+    def put(row_idx: int, header: str, value, as_text: bool = False):
+        ci = col.get(header)
+        if ci is None or value in (None, ""):
+            return
+        cell = ws.cell(row=row_idx, column=ci, value=value)
+        if as_text:
+            cell.number_format = "@"
+
+    def currency_of(row) -> str:
+        m = re.match(r"^\s*([^\d\-.,\s]+)", str(row.get("Value", "") or ""))
+        sym = m.group(1) if m else ""
+        return _CURRENCY_CODE.get(sym, sym)
+
+    out_row = 4
+    MAX_ROW = 102  # template processes Items rows 4..102
+    for row in final_rows:
+        desc = (row.get("Description of Goods", "") or "").strip()
+        if _is_fee_row(desc):
+            continue          # fee/charge rows are not commodity item lines
+        if out_row > MAX_ROW:
+            break
+        cds = row.get("_cds") or {}
+        docs = cds.get("documents") or []
+
+        # ── From the invoice ──
+        put(out_row, "[6/14] Commodity Code", row.get("Comm./imp. cod", ""), as_text=True)
+        put(out_row, "[6/8] Description of Goods", desc)
+        put(out_row, "[6/5] Gross Mass (kg)", extract_value_number(row.get("Gross Weight (KG)", "")))
+        put(out_row, "[6/1] Net Mass (kg)", extract_value_number(row.get("Net Weight (KG)", "")))
+        put(out_row, "[4/14] Item Price", extract_value_number(row.get("Value", "")))
+        put(out_row, "[4/14] Item Price Currency", currency_of(row))
+        put(out_row, "[5/15] Country of Origin", row.get("Origin", ""))
+        put(out_row, "[6/10] Packages - Number of Packages (01)",
+            extract_value_number(row.get("Number of Packages", "")))
+
+        # ── From the client list (rich CDS fields; blank when the list lacks them) ──
+        put(out_row, "[6/14] TARIC Code", cds.get("taric_code"), as_text=True)
+        put(out_row, "[1/10] Procedure", cds.get("procedure"), as_text=True)
+        put(out_row, "[4/17] Preference", cds.get("pref"), as_text=True)
+        put(out_row, "[4/8] Method of Payment", cds.get("mop"), as_text=True)
+        put(out_row, "[4/16] Valuation Method", cds.get("val_method"), as_text=True)
+        put(out_row, "[5/16] Country of Preferential Origin", cds.get("cop"))
+        put(out_row, "[6/17] National Additional Codes - Code (01)", cds.get("nat_add_code"), as_text=True)
+
+        # ── Documents (up to 3 slots: codes 01/02/03) ──
+        for di, doc in enumerate(docs[:3], start=1):
+            put(out_row, f"[2/3] Documents - Code (0{di})", doc.get("code"), as_text=True)
+            put(out_row, f"[2/3] Documents - ID (0{di})", doc.get("id"), as_text=True)
+            put(out_row, f"[2/3] Documents - Status (0{di})", doc.get("status"), as_text=True)
+            put(out_row, f"[2/3] Documents - Reason (0{di})", doc.get("reason"))
+
+        out_row += 1
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
 # Subcode matching — ask Claude which sub-code fits the product
 # ---------------------------------------------------------------------------
 async def match_subcodes(
@@ -2015,8 +2171,21 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
                 verified = ab_match
             status = "verified" if verified else "subcode_needed"
 
-        # Step 4 — Tariff lookup (use product memory cache first)
-        update(80, "Looking up tariff codes…")
+        # Step 4 — Commodity-code lookup.
+        # Resolve which client this invoice belongs to (Spoor C). When the flag
+        # is on AND a client matches, codes come from that client's list instead
+        # of the gov.uk website.
+        update(80, "Looking up commodity codes…")
+        client_row = None
+        if USE_CLIENT_LIST:
+            client_row = db.find_client_by_identity(
+                company_id,
+                rex=(data_a.get("supplier_rex") or "").strip(),
+                eori=(data_a.get("supplier_eori") or "").strip(),
+                name=(data_a.get("supplier_name") or "").strip(),
+            )
+        use_list = bool(USE_CLIENT_LIST and client_row)
+
         memory_entries = db.list_memory(company_id)
         memory_by_key = {
             f"{m.get('code','')}::{m.get('description','')}": m for m in memory_entries
@@ -2032,6 +2201,10 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
             if not code or code in seen_codes:
                 continue
             seen_codes.add(code)
+            if use_list:
+                # Client list is authoritative — bypass the gov.uk cache/site.
+                tariff_data[code] = lookup_client_list(company_id, client_row["id"], code)
+                continue
             cached = None
             for m in memory_by_code.get(code, []):
                 t = m.get("tariff") or {}
@@ -2065,42 +2238,73 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
         if products_to_match:
             matched_codes = await match_subcodes(client, products_to_match, tariff_data)
 
-        # Enrich each row with its matched sub-code. Priority:
-        #   1. Existing memory entry
-        #   2. Fresh match from this run's match_subcodes (for codes with >=2 options)
-        #   3. Single-subcode auto-match (when the invoice code IS the only leaf —
-        #      common for 8-digit codes like 07031019 → 0703101900 "Other")
-        for row in final_rows:
-            code = row.get("Comm./imp. cod", "").strip()
-            desc = row.get("Description of Goods", "").strip()
-            if not code or not desc:
-                continue
-            key = f"{code}::{desc}"
-            existing = memory_by_key.get(key) or {}
-            if existing.get("matched_code"):
-                row["_matched_code"] = existing["matched_code"]
-                row["_matched_desc"] = existing.get("matched_desc", "")
-                row["_matched_duty"] = existing.get("matched_duty", "")
-            elif matched_codes.get(key):
-                m = matched_codes[key]
-                row["_matched_code"] = m.get("matched_code", "")
-                row["_matched_desc"] = m.get("matched_desc", "")
-                row["_matched_duty"] = m.get("duty", "")
-            else:
-                # Single-subcode fallback — auto-match if there's only one option
-                tariff = tariff_data.get(code, {}) or {}
-                subs = tariff.get("subcodes", []) or []
-                if len(subs) == 1:
-                    sc = subs[0]
-                    row["_matched_code"] = sc.get("code", "")
-                    row["_matched_desc"] = sc.get("description", "") or tariff.get("description", "")
-                    row["_matched_duty"] = sc.get("duty", "") or tariff.get("duty", "")
+        # Step 4c — Enrich each row with its matched sub-code.
+        if use_list:
+            # Client-list output (Spoor C/D): write the COMPLETE code + the LIST
+            # description into the export columns; flag products not in the list.
+            # Product memory is ignored here — the client list is the source.
+            for row in final_rows:
+                code = row.get("Comm./imp. cod", "").strip()
+                desc = row.get("Description of Goods", "").strip()
+                if not code or _is_fee_row(desc):
+                    continue
+                key = f"{code}::{desc}"
+                subs = (tariff_data.get(code, {}) or {}).get("subcodes", []) or []
+                chosen = None
+                if matched_codes.get(key):
+                    mc = matched_codes[key].get("matched_code", "")
+                    chosen = next((s for s in subs if s["code"] == mc), None)
+                if chosen is None and subs:
+                    chosen = subs[0]
+                if chosen:
+                    row["_matched_code"] = chosen["code"]
+                    row["_matched_desc"] = chosen["description"]
+                    row["_cds"] = chosen.get("product") or {}  # rich CDS fields for Items tab
+                    row["Comm./imp. cod"] = chosen["code"]
+                    if chosen["description"]:
+                        row["Description of Goods"] = chosen["description"]
+                else:
+                    # Not in this client's list — keep working, flag clearly.
+                    if not desc.startswith(review.NOT_IN_LIST_MARKER):
+                        row["Description of Goods"] = f"{review.NOT_IN_LIST_MARKER} {desc}".strip()
+                    row["_not_in_list"] = True
+        else:
+            # Priority:
+            #   1. Existing memory entry
+            #   2. Fresh match from this run's match_subcodes (>=2 options)
+            #   3. Single-subcode auto-match (the invoice code IS the only leaf)
+            for row in final_rows:
+                code = row.get("Comm./imp. cod", "").strip()
+                desc = row.get("Description of Goods", "").strip()
+                if not code or not desc:
+                    continue
+                key = f"{code}::{desc}"
+                existing = memory_by_key.get(key) or {}
+                if existing.get("matched_code"):
+                    row["_matched_code"] = existing["matched_code"]
+                    row["_matched_desc"] = existing.get("matched_desc", "")
+                    row["_matched_duty"] = existing.get("matched_duty", "")
+                elif matched_codes.get(key):
+                    m = matched_codes[key]
+                    row["_matched_code"] = m.get("matched_code", "")
+                    row["_matched_desc"] = m.get("matched_desc", "")
+                    row["_matched_duty"] = m.get("duty", "")
+                else:
+                    # Single-subcode fallback — auto-match if there's only one option
+                    tariff = tariff_data.get(code, {}) or {}
+                    subs = tariff.get("subcodes", []) or []
+                    if len(subs) == 1:
+                        sc = subs[0]
+                        row["_matched_code"] = sc.get("code", "")
+                        row["_matched_desc"] = sc.get("description", "") or tariff.get("description", "")
+                        row["_matched_duty"] = sc.get("duty", "") or tariff.get("duty", "")
 
         # Persist memory updates to database — BUT ONLY IF the invoice is verified.
         # Unverified / subcode_needed invoices don't touch product memory to avoid
         # learning wrong data. Memory is populated later when the user confirms
-        # the invoice via /resolve.
-        if verified:
+        # the invoice via /resolve. Skipped entirely in client-list mode — the
+        # list is the source of truth, not the learned memory cache.
+        if verified and not use_list:
             for row in final_rows:
                 code = row.get("Comm./imp. cod", "").strip()
                 desc = row.get("Description of Goods", "").strip()
@@ -2171,18 +2375,21 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
         full_path = full_storage
         raw_path  = raw_storage
 
-        # Detect supplier/invoice label from first row
-        raw_inv = final_rows[0].get("Invoice", "") if final_rows else ""
-        _inv_cleaned = re.sub(r"[^\d]", "", raw_inv)
-        _looks_like_amount = bool(
-            re.match(r"^[\d.,\s]+$", raw_inv.strip())
-            and ("," in raw_inv or "." in raw_inv)
-            and len(_inv_cleaned) > 4
-        )
-        if raw_inv and not _looks_like_amount:
-            supplier = raw_inv
-        else:
-            supplier = re.sub(r"[_\-]+", " ", Path(original_name).stem).strip()
+        # Supplier label: prefer the name the AI read off the invoice; fall
+        # back to the old invoice-number / filename heuristic.
+        supplier = (data_a.get("supplier_name") or "").strip()
+        if not supplier:
+            raw_inv = final_rows[0].get("Invoice", "") if final_rows else ""
+            _inv_cleaned = re.sub(r"[^\d]", "", raw_inv)
+            _looks_like_amount = bool(
+                re.match(r"^[\d.,\s]+$", raw_inv.strip())
+                and ("," in raw_inv or "." in raw_inv)
+                and len(_inv_cleaned) > 4
+            )
+            if raw_inv and not _looks_like_amount:
+                supplier = raw_inv
+            else:
+                supplier = re.sub(r"[_\-]+", " ", Path(original_name).stem).strip()
 
         total_value = 0.0
         currency = "€"
@@ -3094,6 +3301,17 @@ def invoice_debug(invoice_id: str, ctx: dict = Depends(authed)):
     }
 
 
+@app.get("/invoices/{invoice_id}/review")
+def invoice_review(invoice_id: str, ctx: dict = Depends(authed)):
+    """Clear, located problem list for the review screen. Reads the already
+    persisted check results (rows, totals_check, ab_reasons) and runs the pure
+    review.build_review_issues detector over them — no re-processing needed."""
+    inv = db.get_invoice(invoice_id, ctx["company_id"])
+    if not inv:
+        raise HTTPException(404, "Invoice not found")
+    return review.review_payload(inv)
+
+
 def _stream_storage_file(storage_path: str, suggested_name: str):
     """Download a file from Supabase Storage and stream it to the client."""
     from fastapi.responses import Response
@@ -3128,6 +3346,23 @@ def export_raw(invoice_id: str, ctx: dict = Depends(authed)):
     if not storage_path:
         raise HTTPException(404, "Excel file not found")
     return _stream_storage_file(storage_path, Path(storage_path).name)
+
+
+@app.get("/invoices/{invoice_id}/export/items")
+def export_items(invoice_id: str, ctx: dict = Depends(authed)):
+    """Generate the MultiFreight CDS 'Items' tab on the fly from the stored
+    rows (which already carry the matched full codes + CDS fields)."""
+    from fastapi.responses import Response
+    inv = db.get_invoice(invoice_id, ctx["company_id"])
+    if not inv:
+        raise HTTPException(404, "Invoice not found")
+    data = build_items_xlsx(inv.get("rows") or [], inv.get("totals"))
+    safe = re.sub(r"[^\w\-]+", "_", (inv.get("supplier") or "invoice")).strip("_")
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="MultiFreight_Items_{safe}.xlsx"'},
+    )
 
 
 @app.post("/jobs/{job_id}/retry")
