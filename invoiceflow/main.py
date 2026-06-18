@@ -1897,6 +1897,7 @@ _ITEMS_DEFAULTS = {
     "[1/10] Procedure": "4000",
     "[4/16] Valuation Method": "1",
     "[6/9] Packages - Type (01)": "PK",
+    "[6/11] Packages - Shipping Marks (01)": "N/M",
 }
 
 # EU member-state ISO country codes — drives the origin-based preference rule.
