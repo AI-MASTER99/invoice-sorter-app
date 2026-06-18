@@ -7,6 +7,7 @@ runs dual-verification, looks up UK Trade Tariff, exports to Excel.
 import asyncio
 import base64
 import io
+import itertools
 import json
 import logging
 import os
@@ -2638,8 +2639,13 @@ async def login_page():
 # Dict size is capped at _MAX_TRACKED_KEYS; when full we evict empty
 # entries first, then the oldest. Without this, a username/IP scanner
 # could grow the dict unbounded and OOM the pod.
-_LOGIN_ATTEMPTS_USER: dict[tuple[str, str], list[float]] = {}
-_LOGIN_ATTEMPTS_IP:   dict[str, list[float]] = {}
+# Each attempt is stored as (timestamp, seq). The monotonic seq makes every
+# entry unique, so clearing one user's attempts removes EXACTLY their entries
+# from the shared IP bucket — never another user's that happens to share the
+# same timestamp float (coarse clocks / simultaneous requests can collide).
+_LOGIN_ATTEMPTS_USER: dict[tuple[str, str], list[tuple[float, int]]] = {}
+_LOGIN_ATTEMPTS_IP:   dict[str, list[tuple[float, int]]] = {}
+_LOGIN_SEQ = itertools.count()
 _LOGIN_WINDOW_SECONDS = 15 * 60
 _LOGIN_MAX_PER_USER   = 5
 _LOGIN_MAX_PER_IP     = 50
@@ -2675,8 +2681,8 @@ def _client_ip(request: Request) -> str:
     return (request.client.host if request.client else "") or "unknown"
 
 
-def _prune_attempts(arr: list[float], now: float) -> list[float]:
-    return [t for t in arr if now - t < _LOGIN_WINDOW_SECONDS]
+def _prune_attempts(arr: list[tuple[float, int]], now: float) -> list[tuple[float, int]]:
+    return [e for e in arr if now - e[0] < _LOGIN_WINDOW_SECONDS]
 
 
 def _evict_if_full(d: dict) -> list[tuple]:
@@ -2697,7 +2703,7 @@ def _evict_if_full(d: dict) -> list[tuple]:
             return evicted
     # Still full — drop entries with the oldest most-recent attempt.
     if len(d) > _MAX_TRACKED_KEYS:
-        ordered = sorted(d.items(), key=lambda kv: kv[1][-1] if kv[1] else 0)
+        ordered = sorted(d.items(), key=lambda kv: kv[1][-1][0] if kv[1] else 0)
         for k, ts in ordered[: len(d) - _MAX_TRACKED_KEYS]:
             evicted.append((k, list(ts)))
             del d[k]
@@ -2713,7 +2719,7 @@ def _check_login_rate_limit(username: str, ip: str) -> None:
         ip_attempts = _prune_attempts(_LOGIN_ATTEMPTS_IP.get(ip, []), now)
         _LOGIN_ATTEMPTS_IP[ip] = ip_attempts
         if len(ip_attempts) >= _LOGIN_MAX_PER_IP:
-            retry_in = int(_LOGIN_WINDOW_SECONDS - (now - ip_attempts[0]))
+            retry_in = int(_LOGIN_WINDOW_SECONDS - (now - ip_attempts[0][0]))
             # Log without the username — we don't want a brute-force
             # attempt against a real account name to leak that account's
             # existence into the logs (which may be shipped off-host).
@@ -2730,7 +2736,7 @@ def _check_login_rate_limit(username: str, ip: str) -> None:
         user_attempts = _prune_attempts(_LOGIN_ATTEMPTS_USER.get(user_key, []), now)
         _LOGIN_ATTEMPTS_USER[user_key] = user_attempts
         if len(user_attempts) >= _LOGIN_MAX_PER_USER:
-            retry_in = int(_LOGIN_WINDOW_SECONDS - (now - user_attempts[0]))
+            retry_in = int(_LOGIN_WINDOW_SECONDS - (now - user_attempts[0][0]))
             logger.warning(
                 "login rate limit hit (per-user+IP) ip=%s attempts=%d window=%ds",
                 ip, len(user_attempts), _LOGIN_WINDOW_SECONDS,
@@ -2769,8 +2775,9 @@ def _record_login_failure(username: str, ip: str) -> None:
     """
     now = time.time()
     with _LOGIN_LOCK:
-        _LOGIN_ATTEMPTS_USER.setdefault((username, ip), []).append(now)
-        _LOGIN_ATTEMPTS_IP.setdefault(ip, []).append(now)
+        entry = (now, next(_LOGIN_SEQ))
+        _LOGIN_ATTEMPTS_USER.setdefault((username, ip), []).append(entry)
+        _LOGIN_ATTEMPTS_IP.setdefault(ip, []).append(entry)
         for (_uname, uip), ts_list in _evict_if_full(_LOGIN_ATTEMPTS_USER):
             if not ts_list or uip not in _LOGIN_ATTEMPTS_IP:
                 continue
