@@ -1987,15 +1987,23 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
         if out_row > MAX_ROW:
             break
         cds = g["cds"]
-        # Always-present documents (slots fill in order). Product-specific
-        # documents from the list (and the origin-based U116 later) follow.
-        # The template has 3 document slots (01/02/03).
+        is_eu_origin = g["origin"] in _EU_COUNTRY_CODES
+        # Always-present documents (slots fill in order). The origin-based U116
+        # proof-of-origin doc and any product-specific documents from the list
+        # follow. The template has 3 document slots (01/02/03).
         docs = [
             {"code": "N935", "id": f"VM1 {g.get('invoice', '')}".strip(),
              "status": "JE", "reason": ""},
             {"code": "Y929", "id": "Excluded from regulation 834/2007",
              "status": "", "reason": "Excluded from regulation 834/2007"},
         ]
+        # EU origin → TCA preference 300 is claimed (see rule below), which needs
+        # the proof-of-origin document U116 in DE 2/3. Per gov.uk the document ID
+        # is the INVOICE NUMBER (never the REX number — that belongs in the
+        # statement-on-origin text on the invoice) and the status is JE.
+        if is_eu_origin:
+            docs.append({"code": "U116", "id": g.get("invoice", ""),
+                         "status": "JE", "reason": ""})
         docs += cds.get("documents") or []
 
         # ── Commodity code split: 8 digits here, last 2 in the TARIC column ──
@@ -2015,12 +2023,12 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
             put(out_row, _h, _v, as_text=True)
         # ── Origin-based preference rule (the TRUE country of origin) ──
         # EU origin  → preferential: [4/17] Preference 300 + [5/16] Country of
-        #              Preferential Origin = the origin country (U116 document
-        #              is a separate, still-open step).
+        #              Preferential Origin + the U116 proof-of-origin document
+        #              (added to `docs` above).
         # non-EU      → [4/17] Preference 100, no Country of Preferential Origin.
         # Unknown origin → left blank (can't determine — surfaces as a gap).
         origin = g["origin"]
-        if origin in _EU_COUNTRY_CODES:
+        if is_eu_origin:
             put(out_row, "[4/17] Preference", "300", as_text=True)
             put(out_row, "[5/16] Country of Preferential Origin", origin)
         elif origin:
