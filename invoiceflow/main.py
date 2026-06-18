@@ -1889,6 +1889,23 @@ def build_excel(
 _ITEMS_TEMPLATE = Path(__file__).resolve().parent / "assets" / "MULTIFREIGHT_template.xlsx"
 _CURRENCY_CODE = {"€": "EUR", "£": "GBP", "$": "USD", "CHF": "CHF"}
 
+# Central hardcoded defaults — the SAME on every MultiFreight Items line.
+# (Conditional fields like Preference / Country of Preferential Origin / U116
+# are origin-based rules added in a later step.)
+_ITEMS_DEFAULTS = {
+    "[1/10] Procedure": "4000",
+    "[4/16] Valuation Method": "1",
+    "[6/9] Packages - Type (01)": "PK",
+}
+
+# EU member-state ISO country codes — drives the origin-based preference rule.
+# Greece is "GR" in ISO 3166 but "EL" in EU customs nomenclature, so accept both.
+_EU_COUNTRY_CODES = {
+    "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE",
+    "GR", "EL", "HU", "IE", "IT", "LV", "LT", "LU", "MT", "NL", "PL",
+    "PT", "RO", "SK", "SI", "ES", "SE",
+}
+
 
 def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> bytes:
     """Fill the MultiFreight CDS 'Items' tab from the processed rows.
@@ -1918,6 +1935,7 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
         if ci is None or value in (None, ""):
             return
         cell = ws.cell(row=row_idx, column=ci, value=value)
+        cell.alignment = Alignment(vertical="center", wrap_text=False)
         if as_text:
             cell.number_format = "@"
 
@@ -1947,7 +1965,7 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
         entry = {
             "c8": c8, "taric": taric, "origin": origin, "desc": desc,
             "country": row.get("Country", ""), "currency": currency_of(row),
-            "cds": row.get("_cds") or {},
+            "cds": row.get("_cds") or {}, "invoice": (row.get("Invoice", "") or "").strip(),
             "gross": _num(row, "Gross Weight (KG)"), "net": _num(row, "Net Weight (KG)"),
             "value": _num(row, "Value"), "packages": _num(row, "Number of Packages"),
         }
@@ -1967,7 +1985,16 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
         if out_row > MAX_ROW:
             break
         cds = g["cds"]
-        docs = cds.get("documents") or []
+        # Always-present documents (slots fill in order). Product-specific
+        # documents from the list (and the origin-based U116 later) follow.
+        # The template has 3 document slots (01/02/03).
+        docs = [
+            {"code": "N935", "id": f"VM1 {g.get('invoice', '')}".strip(),
+             "status": "JE", "reason": ""},
+            {"code": "Y929", "id": "Excluded from regulation 834/2007",
+             "status": "", "reason": "Excluded from regulation 834/2007"},
+        ]
+        docs += cds.get("documents") or []
 
         # ── Commodity code split: 8 digits here, last 2 in the TARIC column ──
         put(out_row, "[6/14] Commodity Code", g["c8"], as_text=True)
@@ -1981,11 +2008,22 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
         put(out_row, "[5/15] Country of Origin", g["origin"])
         put(out_row, "[6/10] Packages - Number of Packages (01)", int(round(g["packages"])) or None)
         # ── CDS rule fields from the client list (blank when absent) ──
-        put(out_row, "[1/10] Procedure", cds.get("procedure"), as_text=True)
-        put(out_row, "[4/17] Preference", cds.get("pref"), as_text=True)
+        # Central hardcoded defaults — always the same on every line.
+        for _h, _v in _ITEMS_DEFAULTS.items():
+            put(out_row, _h, _v, as_text=True)
+        # ── Origin-based preference rule (the TRUE country of origin) ──
+        # EU origin  → preferential: [4/17] Preference 300 + [5/16] Country of
+        #              Preferential Origin = the origin country (U116 document
+        #              is a separate, still-open step).
+        # non-EU      → [4/17] Preference 100, no Country of Preferential Origin.
+        # Unknown origin → left blank (can't determine — surfaces as a gap).
+        origin = g["origin"]
+        if origin in _EU_COUNTRY_CODES:
+            put(out_row, "[4/17] Preference", "300", as_text=True)
+            put(out_row, "[5/16] Country of Preferential Origin", origin)
+        elif origin:
+            put(out_row, "[4/17] Preference", "100", as_text=True)
         put(out_row, "[4/8] Method of Payment", cds.get("mop"), as_text=True)
-        put(out_row, "[4/16] Valuation Method", cds.get("val_method"), as_text=True)
-        put(out_row, "[5/16] Country of Preferential Origin", cds.get("cop"))
         put(out_row, "[6/17] National Additional Codes - Code (01)", cds.get("nat_add_code"), as_text=True)
         for di, doc in enumerate(docs[:3], start=1):
             put(out_row, f"[2/3] Documents - Code (0{di})", doc.get("code"), as_text=True)
@@ -1993,6 +2031,29 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
             put(out_row, f"[2/3] Documents - Status (0{di})", doc.get("status"), as_text=True)
             put(out_row, f"[2/3] Documents - Reason (0{di})", doc.get("reason"))
         out_row += 1
+
+    # ── Cosmetic normalisation of the data block ─────────────────────────
+    # The template ships with leftover per-row heights on a couple of rows
+    # and wrap_text on every cell, so identical lines render at different
+    # heights and long values (e.g. "Excluded from regulation 834/2007")
+    # wrap or get clipped. Give every written line one uniform single-line
+    # height and widen each populated column to fit its longest value so
+    # nothing is cut off. (Cosmetic only — the importer reads cell values.)
+    last_row = out_row - 1
+    if last_row >= 4:
+        for r in range(4, last_row + 1):
+            ws.row_dimensions[r].height = 15
+        for ci in set(col.values()):
+            longest = max(
+                (len(str(ws.cell(row=r, column=ci).value))
+                 for r in range(4, last_row + 1)
+                 if ws.cell(row=r, column=ci).value not in (None, "")),
+                default=0,
+            )
+            if longest:
+                letter = get_column_letter(ci)
+                current = ws.column_dimensions[letter].width or 0
+                ws.column_dimensions[letter].width = min(80, max(current, longest + 2))
 
     buf = io.BytesIO()
     wb.save(buf)
