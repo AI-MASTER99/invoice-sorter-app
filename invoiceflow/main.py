@@ -1919,6 +1919,7 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
     (procedure, preference, documents…) come from the matched client-list row
     (row['_cds']) when present.
     """
+    items_rex = (totals or {}).get("supplier_rex", "")
     wb = openpyxl.load_workbook(_ITEMS_TEMPLATE)
     for name in list(wb.sheetnames):
         if name != "Items":
@@ -1952,7 +1953,8 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
     # ── Collect goods lines, splitting the code (8-digit + 2-digit TARIC) and
     #    merging lines that share the SAME commodity code + TARIC + origin
     #    (the client pays per line, so identical codes must be one summed line).
-    #    NOT-IN-LIST lines are never merged — a human still has to resolve each.
+    #    NOT-IN-LIST lines are merged too (client pays per line); a merged
+    #    NOT-IN-LIST line keeps all its distinct product names behind the marker.
     groups: list[dict] = []
     index: dict[tuple, dict] = {}
     for row in final_rows:
@@ -1964,21 +1966,28 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
         taric = digits[8:10] if len(digits) >= 10 else ""
         origin = (row.get("Origin", "") or "").strip().upper()
         not_in_list = bool(row.get("_not_in_list")) or desc.startswith(review.NOT_IN_LIST_MARKER)
+        product = desc.replace(review.NOT_IN_LIST_MARKER, "").strip() if not_in_list else desc
         entry = {
             "c8": c8, "taric": taric, "origin": origin, "desc": desc,
+            "not_in_list": not_in_list, "products": [product] if product else [],
             "country": row.get("Country", ""), "currency": currency_of(row),
             "cds": row.get("_cds") or {}, "invoice": (row.get("Invoice", "") or "").strip(),
             "gross": _num(row, "Gross Weight (KG)"), "net": _num(row, "Net Weight (KG)"),
             "value": _num(row, "Value"), "packages": _num(row, "Number of Packages"),
         }
+        # Merge any line sharing the same code+TARIC+origin — INCLUDING
+        # NOT-IN-LIST lines (the client pays per line). Distinct product names on
+        # merged NOT-IN-LIST lines are collected so the human can still resolve them.
         key = (c8, taric, origin)
-        if not not_in_list and key in index:
+        if key in index:
             g = index[key]
             g["gross"] += entry["gross"]; g["net"] += entry["net"]
             g["value"] += entry["value"]; g["packages"] += entry["packages"]
+            for p in entry["products"]:
+                if p and p not in g["products"]:
+                    g["products"].append(p)
         else:
-            if not not_in_list:
-                index[key] = entry
+            index[key] = entry
             groups.append(entry)
 
     out_row = 4
@@ -1997,19 +2006,25 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
             {"code": "Y929", "id": "Excluded from regulation 834/2007",
              "status": "", "reason": "Excluded from regulation 834/2007"},
         ]
-        # EU origin → TCA preference 300 is claimed (see rule below), which needs
-        # the proof-of-origin document U116 in DE 2/3. Per gov.uk the document ID
-        # is the INVOICE NUMBER (never the REX number — that belongs in the
-        # statement-on-origin text on the invoice) and the status is JE.
+        # EU origin → TCA preference 300 is claimed, which needs the proof-of-origin
+        # document U116 in DE 2/3. Reference field: the supplier's REX number when
+        # it's printed on the invoice, otherwise the invoice number. NOTE: gov.uk
+        # guidance says U116 should reference the INVOICE NUMBER, with the REX in the
+        # statement-on-origin text (and the REX as a data element uses code C100, not
+        # U116) — this REX-first behaviour was chosen by the user's customs colleague
+        # and every line is human-reviewed before submission. Status JE.
         if is_eu_origin:
-            docs.append({"code": "U116", "id": g.get("invoice", ""),
+            docs.append({"code": "U116", "id": items_rex or g.get("invoice", ""),
                          "status": "JE", "reason": ""})
         docs += cds.get("documents") or []
 
         # ── Commodity code split: 8 digits here, last 2 in the TARIC column ──
         put(out_row, "[6/14] Commodity Code", g["c8"], as_text=True)
         put(out_row, "[6/14] TARIC Code", g["taric"] or cds.get("taric_code"), as_text=True)
-        put(out_row, "[6/8] Description of Goods", g["desc"])
+        # Merged NOT-IN-LIST lines: show the marker once + all distinct products.
+        desc_out = (f"{review.NOT_IN_LIST_MARKER} " + " / ".join(g["products"])
+                    if g["not_in_list"] else g["desc"])
+        put(out_row, "[6/8] Description of Goods", desc_out)
         # ── Summed invoice figures ──
         put(out_row, "[6/5] Gross Mass (kg)", round(g["gross"], 3) or None)
         put(out_row, "[6/1] Net Mass (kg)", round(g["net"], 3) or None)
@@ -2276,10 +2291,11 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
         # of the gov.uk website.
         update(80, "Looking up commodity codes…")
         client_row = None
+        supplier_rex = (data_a.get("supplier_rex") or "").strip()
         if USE_CLIENT_LIST:
             client_row = db.find_client_by_identity(
                 company_id,
-                rex=(data_a.get("supplier_rex") or "").strip(),
+                rex=supplier_rex,
                 eori=(data_a.get("supplier_eori") or "").strip(),
                 name=(data_a.get("supplier_name") or "").strip(),
             )
@@ -2502,6 +2518,8 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
             elif "$" in v:
                 currency = "$"
 
+        # Carry the invoice's REX number through to the Items export (U116).
+        totals["supplier_rex"] = supplier_rex
         invoice = db.create_invoice(company_id, {
             "supplier":       supplier,
             "filename":       original_name,
