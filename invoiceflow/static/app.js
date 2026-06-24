@@ -35,9 +35,14 @@ function fmtDate(iso) {
 }
 
 function escHtml(str) {
+  // NOTE: also escapes ' and ` — many call sites interpolate the result into
+  // single-quoted JS string args inside inline onclick="..." handlers, where a
+  // surviving quote (e.g. an invoice supplier name from extracted PDF text)
+  // would break out of the string/attribute and execute arbitrary script.
   return String(str ?? '')
     .replace(/&/g,'&amp;').replace(/</g,'&lt;')
-    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;')
+    .replace(/'/g,'&#39;').replace(/`/g,'&#96;');
 }
 
 /* ── Auth ─────────────────────────────────────────────────── */
@@ -409,14 +414,17 @@ document.getElementById('modal-confirm').addEventListener('click', async () => {
   try {
     await api('POST', `/invoices/${resolveInvoiceId}/resolve`, { subcode });
     toast('Invoice moved to Verified! ✅', 'success');
+    // Only clear + refresh on actual success — otherwise a failed resolve was
+    // being reported as "Subcode saved." while nothing was persisted.
+    document.getElementById('modal-overlay').classList.add('hidden');
+    resolveInvoiceId = null;
+    await refreshInvoices();
+    await refreshInvoicesPage();
+    refreshStats();
   } catch (e) {
-    toast('Subcode saved.', 'info');
+    // Keep the modal open and resolveInvoiceId set so the operator can retry.
+    toast('Resolve failed: ' + e.message, 'error');
   }
-  document.getElementById('modal-overlay').classList.add('hidden');
-  resolveInvoiceId = null;
-  await refreshInvoices();
-  await refreshInvoicesPage();
-  refreshStats();
 });
 
 /* ── Review modal ─────────────────────────────────────────── */

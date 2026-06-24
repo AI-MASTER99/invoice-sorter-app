@@ -1053,19 +1053,10 @@ def parse_structured_rows(data: dict) -> list[dict]:
     return out
 
 
-_FEE_KEYWORDS = (
-    "contributo", "spese", "transport", "trasporto", "insurance",
-    "assicurazione", "certificate", "certificato", "stamp", "bollo",
-    "handling", "imballo", "imballaggio", "packaging", "delivery",
-    "consegna", "fee", "charge", "frais", "gebühr", "verzend",
-)
-
-
-def _is_fee_row(description: str) -> bool:
-    if not description:
-        return False
-    desc = description.lower()
-    return any(kw in desc for kw in _FEE_KEYWORDS)
+# Fee/charge-row detection lives canonically in review.py (word-boundary
+# regex). Delegate here so the two can never drift out of sync — a substring
+# match here previously dropped "COFFEE" goods lines from the export.
+_is_fee_row = review._is_fee_row
 
 
 def normalise_row(row: dict) -> dict:
@@ -1497,6 +1488,21 @@ def chunk_pages(pages: list[str], max_words_per_chunk: int = 1800) -> list[str]:
     return chunks
 
 
+def _first_text(message) -> str:
+    """First text block's content, or '' on a refusal / no text block.
+
+    Text-mode calls force no tool, so a stop_reason=='refusal' yields an empty
+    content array (IndexError on content[0]) and a leading non-text block yields
+    AttributeError on .text. Degrade to '' instead of crashing the job.
+    """
+    if getattr(message, "stop_reason", None) == "refusal":
+        return ""
+    return next(
+        (b.text for b in message.content if getattr(b, "type", None) == "text"),
+        "",
+    )
+
+
 async def run_extraction_text(client: anthropic.AsyncAnthropic, pdf_text: str, prompt: str, model: str | None = None) -> str:
     """Run extraction on pre-extracted PDF text with prompt caching.
     Run A writes cache, Run B reads cache at ~10% cost. Retries on rate limit."""
@@ -1520,7 +1526,7 @@ async def run_extraction_text(client: anthropic.AsyncAnthropic, pdf_text: str, p
                     ],
                 }],
             )
-            return message.content[0].text
+            return _first_text(message)
         except anthropic.RateLimitError:
             if attempt == 4:
                 raise
@@ -1578,7 +1584,7 @@ async def run_extraction(client: anthropic.AsyncAnthropic, file_bytes: bytes, mi
         max_tokens=32000,
         messages=[{"role": "user", "content": content_blocks}],
     )
-    return message.content[0].text
+    return _first_text(message)
 
 
 async def run_extraction_structured_text(
@@ -1991,7 +1997,8 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
             continue          # fee/charge rows are not commodity item lines
         digits = re.sub(r"\D", "", row.get("Comm./imp. cod", "") or "")
         c8 = digits[:8]
-        taric = digits[8:10] if len(digits) >= 10 else ""
+        taric = digits[8:]  # all digits past the 8-digit code — a 9th digit
+                            # was silently dropped by the old digits[8:10] gate
         origin = (row.get("Origin", "") or "").strip().upper()
         not_in_list = bool(row.get("_not_in_list")) or desc.startswith(review.NOT_IN_LIST_MARKER)
         product = desc.replace(review.NOT_IN_LIST_MARKER, "").strip() if not_in_list else desc
@@ -2005,9 +2012,11 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
         }
         # Merge key. NOT-IN-LIST lines stay in their own group (never folded into a
         # resolved line) and merge on 8-digit code + origin only; resolved lines
-        # merge on the full code (8-digit + TARIC) + origin. Distinct product names
-        # on a merged NOT-IN-LIST line are collected so a human can still resolve it.
-        key = (not_in_list, c8, "" if not_in_list else taric, origin)
+        # merge on the full code (8-digit + TARIC) + origin. Currency is part of the
+        # key so lines priced in different currencies are never summed under one
+        # currency. Distinct product names on a merged NOT-IN-LIST line are
+        # collected so a human can still resolve it.
+        key = (not_in_list, c8, "" if not_in_list else taric, origin, entry["currency"])
         if key in index:
             g = index[key]
             g["gross"] += entry["gross"]; g["net"] += entry["net"]
@@ -2021,9 +2030,16 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
 
     out_row = 4
     MAX_ROW = 102  # template processes Items rows 4..102
+    max_lines = MAX_ROW - out_row + 1  # = 99 writable Items rows
+    if len(groups) > max_lines:
+        # Fail loudly rather than silently truncating the customs declaration —
+        # a MultiFreight file missing goods lines under-reports the import.
+        raise ValueError(
+            f"This invoice produces {len(groups)} distinct commodity/origin/currency "
+            f"lines, but the MultiFreight Items template only holds {max_lines}. "
+            f"Split the invoice into multiple declarations."
+        )
     for g in groups:
-        if out_row > MAX_ROW:
-            break
         cds = g["cds"]
         is_eu_origin = g["origin"] in _EU_COUNTRY_CODES
         # Always-present documents (slots fill in order). The origin-based U116
@@ -2168,14 +2184,18 @@ Example:
 04061030\tMOZZARELLA X3 KG.BUF.DOP\t0406103090
 07020010\tCHERRY IL MARCHIO X3\t0702001007
 """
+    # Scale the token budget to the batch size — a fixed 2000 silently
+    # truncated the TSV reply on large invoices, dropping the trailing
+    # products (which then fell back to the first sub-code with no signal).
+    sc_max_tokens = min(16000, max(2000, 256 + 80 * len(lines)))
     try:
         msg = await client.messages.create(
             model=AI_MODEL_PRIMARY,
-            max_tokens=2000,
+            max_tokens=sc_max_tokens,
             messages=[{"role": "user", "content": prompt}],
         )
         result: dict[str, dict] = {}
-        for line in msg.content[0].text.strip().splitlines():
+        for line in _first_text(msg).strip().splitlines():
             parts = line.split("\t")
             if len(parts) >= 3:
                 inv_code = parts[0].strip()
@@ -2193,14 +2213,20 @@ Example:
                         }
                         break
                 else:
-                    # Claude returned a code not in our list — store anyway
-                    result[key] = {
-                        "matched_code": matched,
-                        "matched_desc": "",
-                        "duty": "N/A",
-                    }
+                    # Claude returned a code that is NOT among the offered
+                    # sub-codes (hallucination). Do NOT store it — a fabricated
+                    # TARIC code would be exported and cached into product
+                    # memory. Drop it so the row falls back to the single-subcode
+                    # path or stays unmatched (→ human review) instead.
+                    logger.warning(
+                        "match_subcodes: dropping out-of-list code %r for %r",
+                        matched, inv_code,
+                    )
         return result
     except Exception:
+        # Log so a genuine API error is distinguishable from "model returned no
+        # matches" — otherwise every product silently falls back to subs[0].
+        logger.warning("match_subcodes failed; returning no matches", exc_info=True)
         return {}
 
 
@@ -2218,7 +2244,10 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
     # already verified the key is set and non-default, so reading from
     # os.environ a second time would just hide misconfigurations behind
     # an empty string and surface as a confusing 401 from Anthropic.
-    client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+    # max_retries gives the raw-file extraction calls (run_extraction /
+    # run_extraction_structured, which have no hand-rolled retry loop) the same
+    # resilience as the text path, and also covers transient 5xx/connection errors.
+    client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY, max_retries=5)
 
     try:
         file_bytes = file_path.read_bytes()
@@ -2305,19 +2334,25 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
         totals_ok = all(c["match"] is not False for c in totals_check.values())
         totals_confirmed = sum(1 for c in totals_check.values() if c["match"] is True)
         if not final_rows:
-            # Empty extraction — cannot possibly verify. Flag as failed so the
-            # user notices and can retry / investigate the PDF, rather than
-            # treating two empty runs as a "match".
+            # Empty extraction — nothing could be read. Mark the JOB failed and
+            # stop here. Previously the code continued, uploaded two empty .xlsx
+            # files and created a status="failed" invoice while the job was still
+            # marked done/Complete — a contradictory state. Returning now lets the
+            # job-level Retry surface in the UI. (The `finally` still cleans up.)
+            db.update_job(job_id, {
+                "status":   "failed",
+                "progress": 100,
+                "step":     "No line items could be read from the document",
+                "error":    "Extraction returned zero rows",
+            })
+            return
+        if not totals_ok:
             verified = False
-            status = "failed"
+        elif totals_confirmed >= 2:
+            verified = True
         else:
-            if not totals_ok:
-                verified = False
-            elif totals_confirmed >= 2:
-                verified = True
-            else:
-                verified = ab_match
-            status = "verified" if verified else "subcode_needed"
+            verified = ab_match
+        status = "verified" if verified else "subcode_needed"
 
         # Step 4 — Commodity-code lookup.
         # Resolve which client this invoice belongs to (Spoor C). When the flag
@@ -2679,6 +2714,10 @@ MIME_MAP = {
     ".png": "image/png",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 }
+
+# Hard upload size cap (defends the single worker's RAM/disk against an
+# oversized upload). Sized for real invoice PDFs/scans with headroom.
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB
 
 
 # ---------------------------------------------------------------------------
@@ -3048,6 +3087,11 @@ async def api_delete_user(username: str, ctx: dict = Depends(admin_authed)):
     target = db.get_user(username, ctx["company_id"])
     if not target:
         raise HTTPException(404, "User not found")
+    # Mirror the password-reset path: migration 002's RLS USING role-clamp makes
+    # an admin's DELETE of a super_admin a 0-row no-op that still returns 200 OK.
+    # Surface it as a clear 403 instead of a misleading "deleted" success.
+    if target["role"] == "super_admin" and ctx["role"] != "super_admin":
+        raise HTTPException(403, "Cannot delete super_admin")
     db.delete_user(target["id"])
     return {"ok": True}
 
@@ -3373,13 +3417,23 @@ async def refresh_stale_tariff(ctx: dict = Depends(authed)):
 
 @app.post("/upload")
 async def upload_invoice(file: UploadFile = File(...), ctx: dict = Depends(authed)):
+    if not file.filename:
+        raise HTTPException(400, "No filename provided")
     ext = Path(file.filename).suffix.lower()
     mime = MIME_MAP.get(ext)
     if not mime:
         raise HTTPException(400, f"Unsupported file type: {ext}")
 
     safe_name = re.sub(r"[^\w\-.]", "_", file.filename)
-    content = await file.read()
+    # Read with a hard size cap instead of an unbounded file.read() — an
+    # oversized upload would otherwise be pulled fully into RAM (plus disk +
+    # later base64 expansion), able to OOM the single worker for all tenants.
+    buf = bytearray()
+    while chunk := await file.read(1024 * 1024):
+        buf.extend(chunk)
+        if len(buf) > MAX_UPLOAD_BYTES:
+            raise HTTPException(413, f"File too large (max {MAX_UPLOAD_BYTES // (1024 * 1024)} MB)")
+    content = bytes(buf)
 
     # Create the job first so we can use its id as the storage prefix.
     # This way we can always find the original upload by job id — no extra
@@ -3521,7 +3575,11 @@ def export_items(invoice_id: str, ctx: dict = Depends(authed)):
     inv = db.get_invoice(invoice_id, ctx["company_id"])
     if not inv:
         raise HTTPException(404, "Invoice not found")
-    data = build_items_xlsx(inv.get("rows") or [], inv.get("totals"))
+    try:
+        data = build_items_xlsx(inv.get("rows") or [], inv.get("totals"))
+    except ValueError as e:
+        # e.g. more goods lines than the template's 99 Items rows
+        raise HTTPException(422, str(e))
     safe = re.sub(r"[^\w\-]+", "_", (inv.get("supplier") or "invoice")).strip("_")
     return Response(
         content=data,

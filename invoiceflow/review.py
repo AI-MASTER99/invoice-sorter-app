@@ -24,12 +24,28 @@ import re
 
 # Fee/charge rows (transport, packaging, CONAI, insurance…) legitimately have
 # no commodity code, origin or weight — so the field/weight checks must SKIP
-# them. Mirrors _is_fee_row / _FEE_KEYWORDS in main.py.
-_FEE_KEYWORDS = (
+# them. main.py's _is_fee_row delegates to this one (no duplication).
+#
+# Two classes of keyword, matched differently so we neither under- nor
+# over-match:
+#  • _FEE_WORDS — short English terms that must match as WHOLE words (with an
+#    optional plural "s"). A naive substring match flagged "COFFEE" via "fee"
+#    and dropped a real goods line; whole-word matching also spares "charger"
+#    / "discharge" from "charge".
+#  • _FEE_STEMS — longer, language-specific stems matched as a word PREFIX so
+#    variants are caught ("verzend" → "verzendkosten", "imballo" →
+#    "imballaggio"). These are specific enough not to hit goods descriptions.
+_FEE_WORDS = ("fee", "charge", "stamp")
+_FEE_STEMS = (
     "contributo", "spese", "transport", "trasporto", "insurance",
-    "assicurazione", "certificate", "certificato", "stamp", "bollo",
+    "assicurazione", "certificate", "certificato", "bollo",
     "handling", "imballo", "imballaggio", "packaging", "delivery",
-    "consegna", "fee", "charge", "frais", "gebühr", "verzend",
+    "consegna", "frais", "gebühr", "verzend",
+)
+_FEE_RE = re.compile(
+    r"\b(?:" + "|".join(map(re.escape, _FEE_WORDS)) + r")s?\b"
+    r"|\b(?:" + "|".join(map(re.escape, _FEE_STEMS)) + r")",
+    re.IGNORECASE | re.UNICODE,
 )
 
 # ISO 3166-1 alpha-2 country codes (+ XI for Northern Ireland, used in CDS).
@@ -48,8 +64,7 @@ _ISO2 = frozenset((
 
 
 def _is_fee_row(description: str) -> bool:
-    d = (description or "").lower()
-    return any(kw in d for kw in _FEE_KEYWORDS)
+    return bool(description) and _FEE_RE.search(description) is not None
 
 
 # Friendly labels + units for the four totals keys produced by compare_totals().

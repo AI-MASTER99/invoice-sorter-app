@@ -52,9 +52,11 @@ BEGIN
     RAISE EXCEPTION 'Invalid hash format';
   END IF;
 
+  -- NOTE: the users table has no updated_at column (see schema.sql) — writing
+  -- to it raised "column updated_at does not exist", making every self-service
+  -- password change fail with a 500. Only password_hash is updated.
   UPDATE public.users
-     SET password_hash = new_hash,
-         updated_at    = now()
+     SET password_hash = new_hash
    WHERE id = caller_id;
 END;
 $$;
