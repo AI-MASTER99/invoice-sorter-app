@@ -41,4 +41,11 @@ services:
         value: claude-opus-4-8
       - key: AI_MODEL_LIGHT
         value: claude-sonnet-4-6
+      # Turn ON the per-client commodity-code list (the "V-lookup"): export
+      # columns come from the matched client's product list (list description,
+      # full 10-digit code + TARIC, CDS docs); products not in the list are
+      # flagged NOT-IN-LIST. Without it the app silently falls back to raw
+      # invoice data (8-digit codes, no TARIC).
+      - key: USE_CLIENT_LIST
+        value: "1"
     autoDeploy: true
