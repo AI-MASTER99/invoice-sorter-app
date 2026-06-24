@@ -748,8 +748,13 @@ EXTRACTION_TOOL = {
             "supplier_rex": {
                 "type": "string",
                 "description": (
-                    "The supplier's REX number if printed (e.g. "
-                    "'ITREXIT06167560157'). Empty string if absent."
+                    "The supplier's/exporter's REX number if printed ANYWHERE on "
+                    "the invoice — including inside the statement-on-origin text, "
+                    "not just in a labelled field. Look for a label like 'REX N.', "
+                    "'numero REX', 'N. REX', or 'REGISTRAZIONE DOGANALE N.', and "
+                    "for a token shaped like a 2-letter country code + 'REX' + "
+                    "digits (e.g. 'ITREXIT06167560157'). Copy it verbatim. Empty "
+                    "string only if truly absent."
                 ),
             },
             "supplier_eori": {
@@ -1445,6 +1450,23 @@ def extract_pdf_text(file_bytes: bytes) -> str:
         return ""
 
 
+# REX numbers have an unmistakable shape — a 2-letter country code, the literal
+# "REX", then an identifier (e.g. ITREXIT06167560157). They're printed in the
+# statement-on-origin / "REGISTRAZIONE DOGANALE" block, not in a labelled field,
+# which is why the model sometimes misses them. When the invoice has a text
+# layer, reading the REX straight from it is deterministic and more reliable
+# than the model — it's literally-printed text, not a guess.
+_REX_RE = re.compile(r"\b[A-Z]{2}REX[A-Z0-9]{4,}\b")
+
+
+def rex_from_text(text: str) -> str:
+    """Return the REX number printed in `text` (e.g. 'ITREXIT06167560157'), or ''."""
+    if not text:
+        return ""
+    m = _REX_RE.search(text.upper())
+    return m.group(0) if m else ""
+
+
 def extract_pdf_pages(file_bytes: bytes) -> list[str]:
     """Return extracted text per page as a list."""
     try:
@@ -1951,10 +1973,16 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
         return extract_value_number(row.get(field, "")) or 0.0
 
     # ── Collect goods lines, splitting the code (8-digit + 2-digit TARIC) and
-    #    merging lines that share the SAME commodity code + TARIC + origin
-    #    (the client pays per line, so identical codes must be one summed line).
-    #    NOT-IN-LIST lines are merged too (client pays per line); a merged
-    #    NOT-IN-LIST line keeps all its distinct product names behind the marker.
+    #    merging lines that belong on one customs line (the client pays per line,
+    #    so identical goods must be a single summed line):
+    #      • resolved (in-list) lines merge on the full code (8-digit + TARIC) + origin.
+    #      • NOT-IN-LIST lines merge on the 8-digit code + origin alone — the
+    #        colleague confirms these always carry the same last-2 subcode, and an
+    #        unmatched invoice line's TARIC can be missing/inconsistent, so neither a
+    #        slightly different description nor a stray TARIC may split them. They
+    #        stay in a SEPARATE group from resolved lines (so an unmatched product is
+    #        never silently folded into a resolved one) and keep every distinct
+    #        product name behind the marker so a human can still resolve each one.
     groups: list[dict] = []
     index: dict[tuple, dict] = {}
     for row in final_rows:
@@ -1975,10 +2003,11 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
             "gross": _num(row, "Gross Weight (KG)"), "net": _num(row, "Net Weight (KG)"),
             "value": _num(row, "Value"), "packages": _num(row, "Number of Packages"),
         }
-        # Merge any line sharing the same code+TARIC+origin — INCLUDING
-        # NOT-IN-LIST lines (the client pays per line). Distinct product names on
-        # merged NOT-IN-LIST lines are collected so the human can still resolve them.
-        key = (c8, taric, origin)
+        # Merge key. NOT-IN-LIST lines stay in their own group (never folded into a
+        # resolved line) and merge on 8-digit code + origin only; resolved lines
+        # merge on the full code (8-digit + TARIC) + origin. Distinct product names
+        # on a merged NOT-IN-LIST line are collected so a human can still resolve it.
+        key = (not_in_list, c8, "" if not_in_list else taric, origin)
         if key in index:
             g = index[key]
             g["gross"] += entry["gross"]; g["net"] += entry["net"]
@@ -2007,14 +2036,19 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
              "status": "", "reason": "Excluded from regulation 834/2007"},
         ]
         # EU origin → TCA preference 300 is claimed, which needs the proof-of-origin
-        # document U116 in DE 2/3. Reference field: the supplier's REX number when
-        # it's printed on the invoice, otherwise the invoice number. NOTE: gov.uk
-        # guidance says U116 should reference the INVOICE NUMBER, with the REX in the
-        # statement-on-origin text (and the REX as a data element uses code C100, not
-        # U116) — this REX-first behaviour was chosen by the user's customs colleague
-        # and every line is human-reviewed before submission. Status JE.
+        # document U116 in DE 2/3. Reference field: the supplier's REX (ITREXIT…)
+        # number — read off the invoice when present, else the matched client's
+        # stored REX from the list (see totals['supplier_rex']). NEVER the invoice
+        # number: when no REX is known the id is left blank so the gap surfaces for
+        # the human reviewer. NOTE: gov.uk guidance instead says U116 references the
+        # invoice number (with the REX in the statement-on-origin text, and the REX
+        # as a data element under code C100) — this REX-only behaviour was chosen by
+        # the user's customs colleague and every line is human-reviewed. Status JE.
         if is_eu_origin:
-            docs.append({"code": "U116", "id": items_rex or g.get("invoice", ""),
+            # U116 reference: only the number AFTER the country/"REX" prefix
+            # (ITREXIT06167560157 -> 06167560157), kept as text (as_text below)
+            # so a leading zero is preserved.
+            docs.append({"code": "U116", "id": re.sub(r"^[A-Za-z]+", "", items_rex),
                          "status": "JE", "reason": ""})
         docs += cds.get("documents") or []
 
@@ -2292,6 +2326,12 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
         update(80, "Looking up commodity codes…")
         client_row = None
         supplier_rex = (data_a.get("supplier_rex") or "").strip()
+        # Deterministic catch when the invoice has a text layer: the model can
+        # miss the REX (it sits in the statement-on-origin block, not a labelled
+        # field). Reading it straight from the printed text is more reliable, so
+        # it wins; the model's value is the fallback for image-only scans.
+        if has_usable_text:
+            supplier_rex = rex_from_text(pdf_text) or supplier_rex
         if USE_CLIENT_LIST:
             client_row = db.find_client_by_identity(
                 company_id,
@@ -2518,8 +2558,10 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
             elif "$" in v:
                 currency = "$"
 
-        # Carry the invoice's REX number through to the Items export (U116).
-        totals["supplier_rex"] = supplier_rex
+        # Carry the REX number through to the Items export (U116). Prefer the REX
+        # read off the invoice; fall back to the matched client's stored REX from
+        # the list (clients.rex, e.g. ITREXIT…). Never the invoice number.
+        totals["supplier_rex"] = supplier_rex or ((client_row or {}).get("rex") or "").strip()
         invoice = db.create_invoice(company_id, {
             "supplier":       supplier,
             "filename":       original_name,
