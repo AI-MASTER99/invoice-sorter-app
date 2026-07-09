@@ -263,7 +263,7 @@
           </div>
           <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
             <input class="memory-search" id="memory-search" type="text" placeholder="Search products…" />
-            <button class="btn-refresh-tariff" onclick="refreshStaleTariffs()" title="Refetch only entries older than 30 days (recommended monthly)">🔄 Refresh stale</button>
+            <button class="btn-refresh-tariff" onclick="refreshStaleTariffs(this)" title="Refetch only entries older than 30 days (recommended monthly)">🔄 Refresh stale</button>
             <button class="btn-refresh-tariff" id="btn-refresh-tariff" title="Force refetch tariff data for ALL entries (slow, higher cost)">↻ Refresh all</button>
             <button class="btn-refresh-tariff" onclick="cleanupInvalidMemory()" title="Remove entries whose code is not a real HS/commodity code">🧹 Clean invalid</button>
           </div>
@@ -407,7 +407,8 @@
   <div class="modal">
     <div class="modal-title">🔑 Change password</div>
     <div class="modal-sub">Set a new password for <strong id="modal-chpw-user"></strong></div>
-    <input class="modal-input" id="modal-chpw-input" type="password" placeholder="New password" />
+    <input class="modal-input hidden" id="modal-chpw-current" type="password" placeholder="Current password" autocomplete="current-password" aria-label="Current password" />
+    <input class="modal-input" id="modal-chpw-input" type="password" placeholder="New password" autocomplete="new-password" aria-label="New password" />
     <div class="modal-actions">
       <button class="btn-modal-cancel" id="modal-chpw-cancel">Cancel</button>
       <button class="btn-modal-confirm" id="modal-chpw-confirm">Update password</button>

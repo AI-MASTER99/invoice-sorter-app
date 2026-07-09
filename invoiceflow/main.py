@@ -7,6 +7,7 @@ runs dual-verification, looks up UK Trade Tariff, exports to Excel.
 import asyncio
 import base64
 import io
+import ipaddress
 import itertools
 import json
 import logging
@@ -256,11 +257,26 @@ async def authed(request: Request):
     if not user_id or not company_id or not role:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
+    # Revalidate against the DB on every request — the cookie lives up to
+    # 12h and there is no server-side session store to revoke. Without
+    # this, a deleted/demoted/moved user keeps their OLD role and company
+    # (at the app layer AND baked into the RLS JWT below) until the cookie
+    # expires. The lookup runs on the service client (the contextvar is
+    # not bound yet), one indexed PK read per request.
+    try:
+        row = db.get_user_by_id(user_id)
+    except Exception:
+        # Transient DB outage must not silently log everyone out.
+        raise HTTPException(status_code=503, detail="Service temporarily unavailable")
+    if not row:
+        sess.clear()
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
     ctx = {
         "user_id":    user_id,
-        "username":   sess.get("username", ""),
-        "company_id": company_id,
-        "role":       role,
+        "username":   row.get("username", sess.get("username", "")),
+        "company_id": row["company_id"],   # fresh — not the cookie's copy
+        "role":       row["role"],         # fresh — demotion applies instantly
     }
 
     jwt = mint_user_jwt(ctx)
@@ -2377,6 +2393,28 @@ Example:
 # ---------------------------------------------------------------------------
 # Background processing pipeline
 # ---------------------------------------------------------------------------
+def _user_facing_job_error(exc: Exception) -> str:
+    """Map an internal exception to a safe, still-actionable user message.
+
+    Raw exception text reaches the browser via GET /jobs, so it must not
+    carry internals (paths, DB error bodies, upstream payloads). Known
+    operator-actionable cases keep a specific hint; everything else is
+    generic — the full traceback is in the server log.
+    """
+    if isinstance(exc, anthropic.AuthenticationError):
+        return "AI service rejected the API key — check the ANTHROPIC_API_KEY setting."
+    if isinstance(exc, anthropic.RateLimitError):
+        return "AI service is rate-limiting — wait a minute and retry."
+    if isinstance(exc, anthropic.APIStatusError):
+        low = str(exc).lower()
+        if "credit" in low or "billing" in low:
+            return "AI service credit exhausted — top up the Anthropic account, then retry."
+        return f"AI service error (HTTP {exc.status_code}) — please retry."
+    if isinstance(exc, anthropic.APIConnectionError):
+        return "Could not reach the AI service — please retry."
+    return "Processing failed — please retry. Details are in the server logs."
+
+
 async def _process_invoice(job_id: str, company_id: str, file_path: Path, original_name: str, mime: str, upload_storage_path: str = ""):
     def update(progress: int, step: str):
         try:
@@ -2766,12 +2804,17 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
         })
 
     except Exception as exc:
+        # Full detail goes to the server log only — raw exception text can
+        # leak internals (file paths, DB error bodies, upstream responses)
+        # to the client via GET /jobs.
+        logger.exception("job %s failed", job_id)
+        user_msg = _user_facing_job_error(exc)
         try:
             db.update_job(job_id, {
                 "status":   "failed",
-                "step":     f"Error: {exc}",
+                "step":     user_msg,
                 "progress": 0,
-                "error":    str(exc),
+                "error":    user_msg,
             })
         except Exception:
             pass
@@ -2837,6 +2880,29 @@ app.add_middleware(
     allow_headers=["*"],
     allow_credentials=True,
 )
+
+
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    """Defense-in-depth headers. The CSP allows 'unsafe-inline' scripts
+    because login.html carries an inline <script> (form handler + canvas
+    background) and index.html uses a handful of static inline onclick
+    attributes; primary XSS protection is output escaping + delegated
+    event handling in app.js. The CSP still blocks external script/style
+    loading, framing, and off-origin form posts."""
+    resp = await call_next(request)
+    h = resp.headers
+    h.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+        "connect-src 'self'; base-uri 'self'; form-action 'self'; "
+        "frame-ancestors 'none'",
+    )
+    h.setdefault("X-Content-Type-Options", "nosniff")
+    h.setdefault("X-Frame-Options", "DENY")
+    h.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    return resp
 
 
 # The login page is public (Google can index it so returning users can find
@@ -2912,24 +2978,25 @@ _DUMMY_BCRYPT_HASH = _pwd_ctx.hash("dummy-password-for-timing-equalization")
 
 
 def _client_ip(request: Request) -> str:
-    """Best-effort real-client IP. On Render (and any reverse proxy),
-    request.client.host is the proxy's IP — useless for rate limiting.
-    Prefer the leftmost public IP from X-Forwarded-For, falling back to
-    the proxy IP only if no header is present.
+    """Best-effort real-client IP for rate limiting.
 
-    Note: this header is trivially spoofable when the app is reached
-    directly. On Render the platform overwrites X-Forwarded-For with
-    the real client IP, so trusting the leftmost entry is safe.
+    SECURITY: never trust the LEFTMOST X-Forwarded-For entry. Clients can
+    send their own X-Forwarded-For header; proxies (Render's edge included)
+    APPEND the true peer IP rather than replacing the header. So the
+    leftmost entry is attacker-controlled — an attacker who rotates it gets
+    a fresh rate-limit bucket per request, which turns the login limiter
+    into a no-op. The RIGHTMOST entry is the one our own edge appended and
+    is the only one we can trust. Validate it parses as an IP; otherwise
+    fall back to the socket peer address.
     """
     fwd = request.headers.get("x-forwarded-for", "")
     if fwd:
-        # First entry is the original client; subsequent entries are proxies.
-        first = fwd.split(",")[0].strip()
-        if first:
-            return first
-    real = request.headers.get("x-real-ip", "").strip()
-    if real:
-        return real
+        candidate = fwd.split(",")[-1].strip()
+        try:
+            ipaddress.ip_address(candidate)
+            return candidate
+        except ValueError:
+            pass  # malformed → fall through to socket address
     return (request.client.host if request.client else "") or "unknown"
 
 
@@ -3301,6 +3368,13 @@ async def api_change_password(
 
     # --- self-change path -------------------------------------------------
     if username == ctx["username"]:
+        # Require the CURRENT password. Without this, anyone with brief
+        # access to a logged-in browser (the 12h cookie) can silently take
+        # over the account by setting a new password with no re-auth.
+        current_pw = body.get("current_password") or ""
+        me = db.get_user_by_id(ctx["user_id"])
+        if not me or not verify_password(current_pw, me.get("password_hash", "")):
+            raise HTTPException(403, "Current password is incorrect")
         # RPC validates the bcrypt hash format server-side and writes
         # under SECURITY DEFINER, bypassing RLS for this single column.
         db._client().rpc("change_own_password", {"new_hash": new_hash}).execute()
@@ -3451,10 +3525,12 @@ async def tariff_search(q: str = "", ctx: dict = Depends(authed)):
     if digits_only.isdigit() and 2 <= len(digits_only) <= 10:
         return await _tariff_code_lookup(digits_only)
 
-    url = f"https://www.trade-tariff.service.gov.uk/api/v2/search?q={query}"
+    # params= URL-encodes the value — string interpolation would let input
+    # like "tea&other=x" smuggle extra query parameters upstream.
+    url = "https://www.trade-tariff.service.gov.uk/api/v2/search"
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.get(url, headers={"Accept": "application/json"})
+            r = await client.get(url, params={"q": query}, headers={"Accept": "application/json"})
             if r.status_code != 200:
                 return []
             data = r.json()

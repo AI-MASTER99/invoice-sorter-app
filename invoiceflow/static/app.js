@@ -35,15 +35,45 @@ function fmtDate(iso) {
 }
 
 function escHtml(str) {
-  // NOTE: also escapes ' and ` — many call sites interpolate the result into
-  // single-quoted JS string args inside inline onclick="..." handlers, where a
-  // surviving quote (e.g. an invoice supplier name from extracted PDF text)
-  // would break out of the string/attribute and execute arbitrary script.
+  // HTML-context escaping (element text + attribute values). NOT sufficient
+  // for inline onclick="..." handlers: the HTML parser decodes entities in
+  // the attribute BEFORE the JS is compiled, so &#39; becomes a live quote in
+  // the handler source. Therefore: NEVER interpolate data into inline event
+  // handlers — use data-* attributes + the delegated listener below instead.
   return String(str ?? '')
     .replace(/&/g,'&amp;').replace(/</g,'&lt;')
     .replace(/>/g,'&gt;').replace(/"/g,'&quot;')
     .replace(/'/g,'&#39;').replace(/`/g,'&#96;');
 }
+
+/* ── Delegated actions ────────────────────────────────────────
+   All dynamic (data-carrying) buttons are rendered with data-action +
+   data-* payload and handled here. dataset values are read as plain text
+   (never re-parsed as JS), so HTML-escaping at render time is safe. */
+const ACTIONS = {
+  'review':         d => openReview(d.id, d.supplier || ''),
+  'resolve':        d => openResolve(d.id, d.supplier || ''),
+  'retry':          d => retryInvoice(d.id),
+  'invoice-del':    d => deleteInvoice(d.id, d.supplier || ''),
+  'export-items':   d => exportItems(d.id),
+  'export-raw':     d => exportRaw(d.id),
+  'memory-del':     d => deleteMemoryEntry(d.id, d.desc || ''),
+  'memory-confirm': d => confirmMemoryEntry(d.id),
+  'copy-code':      d => copyCode(d.code),
+  'user-chpw':      d => openChpwModal(d.username),
+  'user-del':       d => deleteUser(d.username),
+  'company-del':    d => deleteCompany(d.id, d.name || ''),
+  'job-retry':      d => retryFailedJob(d.id),
+  'job-dismiss':    d => dismissFailedJob(d.id),
+  'job-cancel':     d => cancelJob(d.id),
+};
+
+document.addEventListener('click', (e) => {
+  const el = e.target.closest('[data-action]');
+  if (!el) return;
+  const fn = ACTIONS[el.dataset.action];
+  if (fn) { e.preventDefault(); fn(el.dataset); }
+});
 
 /* ── Auth ─────────────────────────────────────────────────── */
 async function checkAuth() {
@@ -205,9 +235,9 @@ async function refreshJobs() {
         ? (job.step || job.error || 'Processing failed')
         : (job.step || 'Processing…');
       const actionBtn = isFailed
-        ? `<button class="btn-retry-job" onclick="retryFailedJob('${job.id}')">↻ Retry</button>
-           <button class="btn-cancel" onclick="dismissFailedJob('${job.id}')">Dismiss</button>`
-        : `<button class="btn-cancel" onclick="cancelJob('${job.id}')">Cancel</button>`;
+        ? `<button class="btn-retry-job" data-action="job-retry" data-id="${escHtml(job.id)}">↻ Retry</button>
+           <button class="btn-cancel" data-action="job-dismiss" data-id="${escHtml(job.id)}">Dismiss</button>`
+        : `<button class="btn-cancel" data-action="job-cancel" data-id="${escHtml(job.id)}">Cancel</button>`;
       card.innerHTML = `
         ${iconHtml}
         <div class="job-info">
@@ -353,28 +383,29 @@ function badgeHtml(status) {
 }
 
 function actionsHtml(inv) {
-  const sup = escHtml(inv.supplier || '');
-  const del = `<button class="btn-export btn-delete" title="Delete permanently" onclick="deleteInvoice('${inv.id}', '${sup}')">🗑</button>`;
+  // data-* payload, handled by the delegated listener (see ACTIONS above).
+  const ctx = `data-id="${escHtml(inv.id)}" data-supplier="${escHtml(inv.supplier || '')}"`;
+  const del = `<button class="btn-export btn-delete" title="Delete permanently" data-action="invoice-del" ${ctx}>🗑</button>`;
   if (inv.status === 'verified') {
     return `
-      <button class="btn-export btn-review" onclick="openReview('${inv.id}', '${sup}')">🔍 Review</button>
-      <button class="btn-export btn-full"   onclick="exportItems('${inv.id}')">Full Excel</button>
-      <button class="btn-export btn-raw"    onclick="exportRaw('${inv.id}')">Raw only</button>
+      <button class="btn-export btn-review" data-action="review" ${ctx}>🔍 Review</button>
+      <button class="btn-export btn-full"   data-action="export-items" ${ctx}>Full Excel</button>
+      <button class="btn-export btn-raw"    data-action="export-raw" ${ctx}>Raw only</button>
       ${del}`;
   }
   if (inv.status === 'subcode_needed') {
     return `
-      <button class="btn-export btn-review"  onclick="openReview('${inv.id}', '${sup}')">🔍 Review</button>
-      <button class="btn-export btn-resolve" onclick="openResolve('${inv.id}', '${sup}')">Resolve</button>
-      <button class="btn-export btn-retry"   onclick="retryInvoice('${inv.id}')">↻ Retry</button>
-      <button class="btn-export btn-full"    onclick="exportItems('${inv.id}')">Full Excel</button>
-      <button class="btn-export btn-raw"     onclick="exportRaw('${inv.id}')">Raw only</button>
+      <button class="btn-export btn-review"  data-action="review" ${ctx}>🔍 Review</button>
+      <button class="btn-export btn-resolve" data-action="resolve" ${ctx}>Resolve</button>
+      <button class="btn-export btn-retry"   data-action="retry" ${ctx}>↻ Retry</button>
+      <button class="btn-export btn-full"    data-action="export-items" ${ctx}>Full Excel</button>
+      <button class="btn-export btn-raw"     data-action="export-raw" ${ctx}>Raw only</button>
       ${del}`;
   }
   if (inv.status === 'failed') {
     return `
-      <button class="btn-export btn-review" onclick="openReview('${inv.id}', '${sup}')">🔍 Review</button>
-      <button class="btn-export btn-retry"  onclick="retryInvoice('${inv.id}')">Retry</button>
+      <button class="btn-export btn-review" data-action="review" ${ctx}>🔍 Review</button>
+      <button class="btn-export btn-retry"  data-action="retry" ${ctx}>Retry</button>
       ${del}`;
   }
   return del;
@@ -535,7 +566,8 @@ function renderMemoryTable(items) {
       : '<span style="color:var(--muted)">—</span>';
     const statusBadge = m.confirmed
       ? '<span class="status-badge badge-verified">✓ Confirmed</span>'
-      : '<span class="status-badge badge-subcode">⚠ Pending</span>';
+      : `<span class="status-badge badge-subcode">⚠ Pending</span>
+         <button class="btn-export btn-review" title="Approve this learned product" data-action="memory-confirm" data-id="${escHtml(m.id)}">✓ Confirm</button>`;
     // Tariff age: calculate from fetched_at (or fall back to — if missing)
     const ageHtml = tariffAgeBadge(m.tariff?.fetched_at);
     rows += `
@@ -548,7 +580,7 @@ function renderMemoryTable(items) {
         <td class="subcodes-cell">${subsHtml}</td>
         <td>${ageHtml}</td>
         <td>${statusBadge}</td>
-        <td><button class="btn-delete" title="Delete from memory" onclick="deleteMemoryEntry('${m.id}', '${escHtml(m.description)}')">🗑</button></td>
+        <td><button class="btn-delete" title="Delete from memory" data-action="memory-del" data-id="${escHtml(m.id)}" data-desc="${escHtml(m.description)}">🗑</button></td>
       </tr>`;
   }
 
@@ -580,8 +612,18 @@ function tariffAgeBadge(fetchedAtIso) {
   } catch { return '<span class="age-badge age-unknown">—</span>'; }
 }
 
-async function refreshStaleTariffs() {
-  const btn = event?.currentTarget;
+async function confirmMemoryEntry(entryId) {
+  try {
+    await api('POST', `/memory/${entryId}/confirm`);
+    toast('Product confirmed', 'success');
+    refreshMemoryPage();
+    refreshStats();
+  } catch (e) {
+    toast('Confirm failed: ' + e.message, 'error');
+  }
+}
+
+async function refreshStaleTariffs(btn) {
   if (btn) { btn.disabled = true; btn.textContent = '↻ Checking…'; }
   try {
     const r = await api('POST', '/memory/refresh-stale');
@@ -677,7 +719,7 @@ async function doTariffSearch() {
               <td>${escHtml(item.description)}</td>
               <td class="tariff-cell">${escHtml(item.duty || '—')}</td>
               <td class="tariff-cell">${escHtml(item.vat || '—')}</td>
-              <td><button class="btn-copy-code" onclick="copyCode('${escHtml(item.code)}')" title="Copy code">📋</button></td>
+              <td><button class="btn-copy-code" data-action="copy-code" data-code="${escHtml(item.code)}" title="Copy code">📋</button></td>
             </tr>`).join('')}
         </tbody>
       </table>`;
@@ -713,9 +755,9 @@ async function loadUsersList() {
               <td><span class="role-badge role-${escHtml(u.role)}">${escHtml(u.role)}</span></td>
               <td style="text-align:right">
                 <div style="display:flex;gap:6px;justify-content:flex-end">
-                  <button class="btn-export btn-raw" onclick="openChpwModal('${escHtml(u.username)}')">Password</button>
+                  <button class="btn-export btn-raw" data-action="user-chpw" data-username="${escHtml(u.username)}">Password</button>
                   ${u.username !== currentUser
-                    ? `<button class="btn-export btn-retry" onclick="deleteUser('${escHtml(u.username)}')">Delete</button>`
+                    ? `<button class="btn-export btn-retry" data-action="user-del" data-username="${escHtml(u.username)}">Delete</button>`
                     : ''}
                 </div>
               </td>
@@ -792,6 +834,11 @@ function openChpwModal(username) {
   chpwTargetUser = username;
   document.getElementById('modal-chpw-user').textContent = username;
   document.getElementById('modal-chpw-input').value = '';
+  // Changing your OWN password requires re-entering the current one
+  // (server enforces this); admin resets of other users don't.
+  const cur = document.getElementById('modal-chpw-current');
+  cur.value = '';
+  cur.classList.toggle('hidden', username !== currentUser);
   document.getElementById('modal-chpw-overlay').classList.remove('hidden');
 }
 
@@ -804,10 +851,16 @@ document.getElementById('modal-chpw-confirm')?.addEventListener('click', async (
   if (!chpwTargetUser) return;
   const pw = document.getElementById('modal-chpw-input').value;
   if (!pw) { toast('Enter a password', 'error'); return; }
+  const body = { password: pw };
+  if (chpwTargetUser === currentUser) {
+    const cur = document.getElementById('modal-chpw-current').value;
+    if (!cur) { toast('Enter your current password', 'error'); return; }
+    body.current_password = cur;
+  }
   try {
-    await api('PUT', `/api/users/${encodeURIComponent(chpwTargetUser)}/password`, { password: pw });
+    await api('PUT', `/api/users/${encodeURIComponent(chpwTargetUser)}/password`, body);
     toast(`Password updated for "${chpwTargetUser}"`, 'success');
-  } catch (e) { toast('Error: ' + e.message, 'error'); }
+  } catch (e) { toast('Error: ' + e.message, 'error'); return; }
   document.getElementById('modal-chpw-overlay').classList.add('hidden');
   chpwTargetUser = null;
 });
@@ -884,7 +937,7 @@ async function refreshAdminPage() {
       const isSelf    = c.users.some(u => u.role === 'super_admin' && u.username === currentUser);
       const delBtn    = isSelf
         ? '<span style="color:var(--muted);font-size:11px">(your company)</span>'
-        : `<button class="btn-export btn-retry" onclick="deleteCompany('${c.id}', '${escHtml(c.name)}')">Delete</button>`;
+        : `<button class="btn-export btn-retry" data-action="company-del" data-id="${escHtml(c.id)}" data-name="${escHtml(c.name)}">Delete</button>`;
       html += `<tr>
         <td><strong>${escHtml(c.name)}</strong></td>
         <td style="color:var(--muted);font-size:12px">${usersList || '—'}</td>
