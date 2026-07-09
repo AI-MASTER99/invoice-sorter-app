@@ -129,6 +129,18 @@ if os.environ.get("AI_MODEL"):
 # behaviour; flip to 1 in .env to use the client lists (Spoor C).
 USE_CLIENT_LIST = os.environ.get("USE_CLIENT_LIST") == "1"
 
+# Storage retention: the per-invoice files (original upload + the two Excel
+# exports) are only needed briefly — long enough for the user to download
+# their result. Kept forever they filled the free-tier Storage quota (20 GB
+# seen → project restricted → app down). A daily background purge deletes
+# storage objects older than this many days. The per-client "V-lookup" lists
+# (clients / client_products tables) are NOT touched — only the two buckets.
+# 0 disables the purge. Default 30.
+try:
+    STORAGE_RETENTION_DAYS = int(os.environ.get("STORAGE_RETENTION_DAYS", "30"))
+except ValueError:
+    STORAGE_RETENTION_DAYS = 30
+
 for d in (UPLOADS_DIR, OUTPUT_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
@@ -298,6 +310,72 @@ def _queue_worker():
 # Start the single worker thread at module load
 _worker_thread = threading.Thread(target=_queue_worker, daemon=True)
 _worker_thread.start()
+
+
+# ---------------------------------------------------------------------------
+# Storage retention purge — keeps the Supabase buckets from growing unbounded
+# ---------------------------------------------------------------------------
+def purge_old_storage(days: int) -> dict:
+    """Delete upload/export objects older than `days`. Returns a per-bucket
+    summary. Never raises — logs and returns what it managed to do.
+
+    The two buckets hold only transient per-invoice files; the durable data
+    (per-client V-lookup lists, users, invoice metadata rows) lives in
+    Postgres tables and is untouched here.
+    """
+    from datetime import timezone, timedelta
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    summary: dict = {}
+    for bucket in (db.BUCKET_UPLOADS, db.BUCKET_EXPORTS):
+        try:
+            files = db.storage_list_all(bucket)
+        except Exception as e:  # noqa: BLE001
+            summary[bucket] = {"error": f"{type(e).__name__}: {e}"}
+            continue
+        victims = []
+        for f in files:
+            raw = f.get("created_at")
+            created = None
+            if raw:
+                try:
+                    created = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                except ValueError:
+                    created = None
+            # No timestamp → treat as old (safe: these are transient files).
+            if created is None or created <= cutoff:
+                victims.append(f["path"])
+        freed = sum(f["size"] for f in files if f["path"] in set(victims))
+        try:
+            removed = db.storage_delete_many(bucket, victims) if victims else 0
+            summary[bucket] = {"deleted": removed, "freed_bytes": freed}
+        except Exception as e:  # noqa: BLE001
+            summary[bucket] = {"error": f"{type(e).__name__}: {e}", "attempted": len(victims)}
+    return summary
+
+
+def _retention_worker():
+    """Daemon: run the storage purge shortly after boot, then once a day.
+
+    Guarded so a Storage outage (or an over-quota project) never crashes the
+    app — it just logs and retries on the next cycle.
+    """
+    # Small initial delay so it never competes with startup / first requests.
+    first = True
+    while True:
+        time.sleep(120 if first else 24 * 60 * 60)
+        first = False
+        if STORAGE_RETENTION_DAYS <= 0:
+            continue
+        try:
+            summary = purge_old_storage(STORAGE_RETENTION_DAYS)
+            print(f"[retention] purge (>{STORAGE_RETENTION_DAYS}d): {summary}", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[retention] purge failed: {type(e).__name__}: {e}", flush=True)
+
+
+if STORAGE_RETENTION_DAYS > 0:
+    _retention_thread = threading.Thread(target=_retention_worker, daemon=True)
+    _retention_thread.start()
 
 
 def _enqueue_job(job_id: str, company_id: str, file_path: Path, original_name: str, mime: str, upload_storage_path: str = ""):
@@ -3062,6 +3140,40 @@ async def api_list_all_companies(_: dict = Depends(super_admin_authed)):
         users = db.list_users(c["id"])
         result.append({**c, "users": users, "user_count": len(users)})
     return result
+
+
+@app.get("/api/admin/storage/usage")
+async def api_storage_usage(_: dict = Depends(super_admin_authed)):
+    """Super-admin: how much each storage bucket is using, and the file count.
+
+    Answers "what's actually filling Supabase?" — the durable data (the
+    per-client V-lookup lists, users, invoice rows) lives in Postgres and is
+    tiny; the volume is the transient upload/export files reported here.
+    """
+    out = {"retention_days": STORAGE_RETENTION_DAYS, "buckets": {}, "total_bytes": 0}
+    for bucket in (db.BUCKET_UPLOADS, db.BUCKET_EXPORTS):
+        try:
+            files = db.storage_list_all(bucket)
+            size = sum(f["size"] for f in files)
+            out["buckets"][bucket] = {"files": len(files), "bytes": size}
+            out["total_bytes"] += size
+        except Exception as e:  # noqa: BLE001
+            out["buckets"][bucket] = {"error": f"{type(e).__name__}: {e}"}
+    return out
+
+
+@app.post("/api/admin/storage/purge")
+async def api_storage_purge(body: dict = {}, _: dict = Depends(super_admin_authed)):
+    """Super-admin: delete upload/export files older than `days` (default =
+    the configured retention). Does NOT touch the per-client V-lookup lists
+    or any database table — only the two transient file buckets."""
+    days = body.get("days", STORAGE_RETENTION_DAYS)
+    try:
+        days = max(0, int(days))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "days must be an integer >= 0")
+    summary = purge_old_storage(days)
+    return {"purged_older_than_days": days, "result": summary}
 
 
 @app.delete("/api/admin/companies/{company_id}")

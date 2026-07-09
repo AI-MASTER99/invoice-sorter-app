@@ -48,4 +48,11 @@ services:
       # invoice data (8-digit codes, no TARIC).
       - key: USE_CLIENT_LIST
         value: "1"
+      # Storage retention: a daily purge deletes upload/export files older
+      # than this many days so the buckets never blow the free-tier quota
+      # again (they filled to 20 GB → project restricted → app down). The
+      # per-client V-lookup lists live in Postgres and are never touched.
+      # 0 disables the purge.
+      - key: STORAGE_RETENTION_DAYS
+        value: "30"
     autoDeploy: true

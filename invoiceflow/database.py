@@ -127,6 +127,63 @@ def storage_delete(bucket: str, path: str) -> None:
     _sb_service.storage.from_(bucket).remove([path])
 
 
+_STORAGE_LIST_PAGE = 1000
+
+
+def _storage_list_folder(bucket: str, prefix: str) -> list[dict]:
+    """One folder's entries (files + subfolders), following pagination."""
+    store = _sb_service.storage.from_(bucket)
+    out: list[dict] = []
+    offset = 0
+    while True:
+        page = store.list(prefix, {"limit": _STORAGE_LIST_PAGE, "offset": offset})
+        if not page:
+            break
+        out.extend(page)
+        if len(page) < _STORAGE_LIST_PAGE:
+            break
+        offset += _STORAGE_LIST_PAGE
+    return out
+
+
+def storage_list_all(bucket: str, prefix: str = "") -> list[dict]:
+    """Recursively list every file object in a bucket.
+
+    Objects are stored as ``{company_id}/<file>`` so we descend one level
+    per company folder. Returns dicts with ``path``, ``size`` (bytes), and
+    ``created_at`` (ISO string or None). Used by the retention purge.
+    """
+    files: list[dict] = []
+    for entry in _storage_list_folder(bucket, prefix):
+        name = entry.get("name")
+        if not name:
+            continue
+        full = f"{prefix}/{name}" if prefix else name
+        meta = entry.get("metadata")
+        if isinstance(meta, dict) and meta.get("size") is not None:
+            files.append({
+                "path": full,
+                "size": int(meta.get("size") or 0),
+                "created_at": entry.get("created_at") or entry.get("updated_at"),
+            })
+        else:
+            # Folder placeholder → recurse.
+            files.extend(storage_list_all(bucket, full))
+    return files
+
+
+def storage_delete_many(bucket: str, paths: list[str]) -> int:
+    """Delete many objects in batches. Returns the count removed."""
+    store = _sb_service.storage.from_(bucket)
+    removed = 0
+    BATCH = 100
+    for i in range(0, len(paths), BATCH):
+        chunk = paths[i:i + BATCH]
+        store.remove(chunk)
+        removed += len(chunk)
+    return removed
+
+
 # ═══════════════════════════════════════════════════════════════
 # COMPANIES
 # ═══════════════════════════════════════════════════════════════
