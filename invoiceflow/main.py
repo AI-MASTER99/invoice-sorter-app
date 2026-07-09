@@ -159,11 +159,27 @@ def verify_password(plain: str, hashed: str) -> bool:
 
 def ensure_default_admin():
     """Make sure the default admin user exists with a correct password hash.
-    Runs once at startup — idempotent."""
+    Runs once at startup — idempotent.
+
+    Break-glass recovery: set FORCE_ADMIN_RESET=1 in the environment to reset
+    the default admin's password to the current APP_PASSWORD on boot — for
+    when the admin password is lost and nobody can log in. Remove the flag
+    again after logging in (while set, every deploy re-resets the password).
+    """
+    force_reset = os.environ.get("FORCE_ADMIN_RESET", "").strip().lower() not in (
+        "", "0", "false", "no",
+    )
     existing = db.get_user("admin", db.DEFAULT_COMPANY_ID)
     if not existing:
         db.create_user(
             db.DEFAULT_COMPANY_ID, "admin", _pwd_ctx.hash(APP_PASSWORD), "admin"
+        )
+    elif force_reset:
+        db.update_user_password(existing["id"], _pwd_ctx.hash(APP_PASSWORD))
+        print(
+            "[startup] FORCE_ADMIN_RESET set — default admin password reset to "
+            "APP_PASSWORD. Remove FORCE_ADMIN_RESET once you can log in.",
+            flush=True,
         )
     elif existing.get("password_hash", "").startswith("$2b$12$placeholder"):
         # Schema's seed placeholder — replace with real hash
