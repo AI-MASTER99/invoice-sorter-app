@@ -222,6 +222,34 @@ def _try_ensure_default_admin() -> None:
 _try_ensure_default_admin()
 
 
+_stale_jobs_swept = False
+
+
+def _try_recover_stale_jobs() -> None:
+    """One-time boot sweep: jobs still 'running'/'queued' in the DB belong
+    to the previous process (the queue is in-memory and dies with it).
+    Without this they spin in the UI forever with no way to act on them.
+    Marking them failed surfaces the Retry button (retry re-reads the
+    original upload from storage — nothing is lost). Guarded like the
+    admin bootstrap — a DB outage defers to the next login, never
+    crashes boot."""
+    global _stale_jobs_swept
+    if _stale_jobs_swept:
+        return
+    try:
+        n = db.fail_stale_active_jobs(
+            "Interrupted by a server restart — click Retry to reprocess."
+        )
+        _stale_jobs_swept = True
+        if n:
+            print(f"[startup] marked {n} stale running/queued job(s) as failed (retryable)", flush=True)
+    except Exception as e:  # noqa: BLE001 — never crash boot
+        print(f"[startup] stale-job sweep deferred ({type(e).__name__}: {e})", flush=True)
+
+
+_try_recover_stale_jobs()
+
+
 async def authed(request: Request):
     """Authenticated dep — binds a per-request user-scoped Supabase client.
 
@@ -3190,9 +3218,11 @@ async def api_login(request: Request, body: dict = {}):
     ip = _client_ip(request)
 
     # Self-heal: if the DB was unreachable at boot (e.g. Supabase free tier
-    # paused), the admin bootstrap was deferred. Retry it here so the first
-    # login after the DB comes back provisions the admin without a redeploy.
+    # paused), the admin bootstrap and stale-job sweep were deferred. Retry
+    # them here so the first login after the DB comes back completes both
+    # without a redeploy.
     _try_ensure_default_admin()
+    _try_recover_stale_jobs()
 
     # Reject empty username before touching the rate limiter — otherwise
     # a flood of empty-username probes pollutes the ("",IP) bucket.

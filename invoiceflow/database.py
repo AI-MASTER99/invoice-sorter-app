@@ -495,6 +495,22 @@ def list_jobs(company_id: str, limit: int = 100) -> list[dict]:
     return r.data
 
 
+def fail_stale_active_jobs(message: str) -> int:
+    """Mark every 'running'/'queued' job as failed. Service-role, cross-tenant.
+
+    Called once at boot: the job queue is in-memory and does not survive a
+    restart/redeploy, so any row still active at startup belongs to a dead
+    process and would otherwise stay 'running' in the UI forever. The rows
+    become failed → the UI shows its Retry button (retry re-reads the
+    original upload from storage, so nothing is lost)."""
+    r = (_sb_service.table("jobs")
+         .update({"status": "failed", "progress": 0,
+                  "step": message, "error": message})
+         .in_("status", ["running", "queued"])
+         .execute())
+    return len(r.data or [])
+
+
 def get_job(job_id: str) -> Optional[dict]:
     r = _client().table("jobs").select("*").eq("id", job_id).limit(1).execute()
     return r.data[0] if r.data else None
