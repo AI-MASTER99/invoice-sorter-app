@@ -158,7 +158,39 @@ def ensure_default_admin():
         db.update_user_password(existing["id"], _pwd_ctx.hash(APP_PASSWORD))
 
 
-ensure_default_admin()
+_admin_ensured = False
+
+
+def _try_ensure_default_admin() -> None:
+    """Best-effort admin bootstrap that NEVER crashes process startup.
+
+    On Supabase's free tier the project auto-pauses after ~1 week idle. If
+    we run ensure_default_admin() unguarded at import and the DB is
+    unreachable, the exception propagates out of module import → uvicorn
+    exits 1 → Render restarts → exits 1 → an endless crash-loop where the
+    app is fully down and shows nothing but Render's "starting" screen.
+
+    A transient DB outage must not take the whole web process down. So:
+    log it, let the app boot anyway (health checks and the login page can
+    still serve), and retry lazily on the next login once the DB is back —
+    no redeploy required.
+    """
+    global _admin_ensured
+    if _admin_ensured:
+        return
+    try:
+        ensure_default_admin()
+        _admin_ensured = True
+    except Exception as e:  # noqa: BLE001 — deliberately broad: never crash boot
+        print(
+            f"[startup] ensure_default_admin deferred — database unreachable? "
+            f"({type(e).__name__}: {e}). App will boot and retry on next login. "
+            f"If this persists, check that the Supabase project is not paused.",
+            flush=True,
+        )
+
+
+_try_ensure_default_admin()
 
 
 async def authed(request: Request):
@@ -2946,6 +2978,11 @@ async def api_login(request: Request, body: dict = {}):
     password = body.get("password") or ""
     company_name = (body.get("company") or "").strip()
     ip = _client_ip(request)
+
+    # Self-heal: if the DB was unreachable at boot (e.g. Supabase free tier
+    # paused), the admin bootstrap was deferred. Retry it here so the first
+    # login after the DB comes back provisions the admin without a redeploy.
+    _try_ensure_default_admin()
 
     # Reject empty username before touching the rate limiter — otherwise
     # a flood of empty-username probes pollutes the ("",IP) bucket.
