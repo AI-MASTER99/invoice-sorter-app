@@ -97,6 +97,9 @@ const ACTIONS = {
   'job-retry':      d => retryFailedJob(d.id),
   'job-dismiss':    d => dismissFailedJob(d.id),
   'job-cancel':     d => cancelJob(d.id),
+  'client-open':    d => openClientProducts(d.id, d.name || ''),
+  'client-del':     d => deleteClient(d.id, d.name || ''),
+  'product-del':    d => deleteClientProduct(d.id, d.desc || ''),
 };
 
 document.addEventListener('click', (e) => {
@@ -148,6 +151,7 @@ function navigateTo(page) {
     invoices:  'Invoices',
     memory:    'Product Memory',
     tariff:    'UK Tariff Lookup',
+    clients:   'Client Lists',
     settings:  'Settings',
     admin:     'Admin panel',
   };
@@ -155,6 +159,7 @@ function navigateTo(page) {
 
   if (page === 'invoices') refreshInvoicesPage();
   if (page === 'memory')   refreshMemoryPage();
+  if (page === 'clients')  refreshClientsPage();
   if (page === 'settings') refreshSettingsPage();
   if (page === 'admin')    refreshAdminPage();
 }
@@ -782,6 +787,160 @@ async function doTariffSearch() {
 function copyCode(code) {
   navigator.clipboard.writeText(code).then(() => toast(`Copied ${code}`, 'success'));
 }
+
+/* ── Client lists (V-lookup editor) ───────────────────────── */
+let _selectedClient = null;   // {id, name} of the open product list
+let _clientProducts = [];     // cache for the search filter
+
+async function refreshClientsPage() {
+  const box = document.getElementById('clients-list');
+  try {
+    const clients = await api('GET', '/api/clients');
+    document.getElementById('clients-count').textContent =
+      clients.length ? `(${clients.length})` : '';
+    if (!clients.length) {
+      box.innerHTML = '<div class="empty-state" style="padding:24px 0"><div class="empty-icon">📋</div>No clients yet. Add your first supplier above.</div>';
+      return;
+    }
+    box.innerHTML = `
+      <table class="memory-table">
+        <thead><tr><th>Client</th><th>REX</th><th>EORI</th><th>Products</th><th></th></tr></thead>
+        <tbody>
+          ${clients.map(c => `
+            <tr${_selectedClient && _selectedClient.id === c.id ? ' style="background:var(--bg-hover, rgba(0,0,0,0.04))"' : ''}>
+              <td><strong>${escHtml(c.name)}</strong></td>
+              <td><span class="code-mono">${escHtml(c.rex || '—')}</span></td>
+              <td><span class="code-mono">${escHtml(c.eori || '—')}</span></td>
+              <td>${c.product_count}</td>
+              <td style="text-align:right">
+                <div style="display:flex;gap:6px;justify-content:flex-end">
+                  <button class="btn-export btn-review" data-action="client-open" data-id="${escHtml(c.id)}" data-name="${escHtml(c.name)}">📂 Open list</button>
+                  <button class="btn-export btn-retry" data-action="client-del" data-id="${escHtml(c.id)}" data-name="${escHtml(c.name)}">Delete</button>
+                </div>
+              </td>
+            </tr>`).join('')}
+        </tbody>
+      </table>`;
+  } catch (e) {
+    box.innerHTML = `<div style="color:var(--red);font-size:13px">Could not load clients: ${escHtml(e.message)}</div>`;
+  }
+}
+
+async function openClientProducts(clientId, clientName) {
+  _selectedClient = { id: clientId, name: clientName };
+  document.getElementById('client-products-title').textContent = clientName;
+  document.getElementById('client-products-card').classList.remove('hidden');
+  document.getElementById('product-search').value = '';
+  await loadClientProducts();
+  refreshClientsPage();   // repaint selection highlight
+}
+
+async function loadClientProducts() {
+  if (!_selectedClient) return;
+  const box = document.getElementById('client-products-list');
+  try {
+    _clientProducts = await api('GET', `/api/clients/${_selectedClient.id}/products`);
+    renderClientProducts();
+  } catch (e) {
+    box.innerHTML = `<div style="color:var(--red);font-size:13px">Could not load products: ${escHtml(e.message)}</div>`;
+  }
+}
+
+function renderClientProducts() {
+  const box = document.getElementById('client-products-list');
+  const q = (document.getElementById('product-search').value || '').toLowerCase();
+  const items = _clientProducts.filter(p =>
+    !q || (p.description || '').toLowerCase().includes(q)
+       || (p.full_code || '').includes(q));
+  document.getElementById('client-products-count').textContent =
+    `(${items.length}${q ? ` of ${_clientProducts.length}` : ''})`;
+  if (!items.length) {
+    box.innerHTML = `<div class="empty-state" style="padding:24px 0">${q ? 'No matches.' : 'This list is empty — add the first product above.'}</div>`;
+    return;
+  }
+  box.innerHTML = `
+    <table class="memory-table">
+      <thead><tr><th>Code (8-digit)</th><th>TARIC</th><th>Full code</th><th>Description</th><th></th></tr></thead>
+      <tbody>
+        ${items.map(p => `
+          <tr>
+            <td><span class="code-mono">${escHtml(p.general_code)}</span></td>
+            <td><span class="code-mono">${escHtml(p.taric_code || '—')}</span></td>
+            <td><span class="code-mono">${escHtml(p.full_code)}</span></td>
+            <td>${escHtml(p.description || '')}</td>
+            <td style="text-align:right">
+              <button class="btn-delete" title="Remove from list" data-action="product-del" data-id="${escHtml(p.id)}" data-desc="${escHtml(p.description || p.full_code)}">🗑</button>
+            </td>
+          </tr>`).join('')}
+      </tbody>
+    </table>`;
+}
+
+function _clientsMsg(elId, text, ok) {
+  const msg = document.getElementById(elId);
+  msg.textContent = text;
+  msg.className = `settings-msg ${ok ? 'success' : 'error'} show`;
+  setTimeout(() => msg.classList.remove('show'), 5000);
+}
+
+document.getElementById('btn-client-add')?.addEventListener('click', async () => {
+  const name = document.getElementById('client-new-name').value.trim();
+  const rex  = document.getElementById('client-new-rex').value.trim();
+  const eori = document.getElementById('client-new-eori').value.trim();
+  if (!name) { _clientsMsg('clients-msg', 'Client name is required.', false); return; }
+  try {
+    await api('POST', '/api/clients', { name, rex, eori });
+    _clientsMsg('clients-msg', `✓ Client "${name}" added.`, true);
+    document.getElementById('client-new-name').value = '';
+    document.getElementById('client-new-rex').value = '';
+    document.getElementById('client-new-eori').value = '';
+    refreshClientsPage();
+  } catch (e) { _clientsMsg('clients-msg', 'Error: ' + e.message, false); }
+});
+
+async function deleteClient(clientId, name) {
+  if (!confirm(`Delete client "${name}" and their ENTIRE product list?\n\nInvoices from this supplier will no longer match a list (rows get flagged NOT IN LIST).`)) return;
+  try {
+    await api('DELETE', `/api/clients/${clientId}`);
+    toast(`Deleted ${name}`, 'success');
+    if (_selectedClient && _selectedClient.id === clientId) {
+      _selectedClient = null;
+      document.getElementById('client-products-card').classList.add('hidden');
+    }
+    refreshClientsPage();
+  } catch (e) { toast('Delete failed: ' + e.message, 'error'); }
+}
+
+document.getElementById('btn-product-add')?.addEventListener('click', async () => {
+  if (!_selectedClient) return;
+  const full_code = document.getElementById('product-new-code').value.trim();
+  const description = document.getElementById('product-new-desc').value.trim();
+  if (!full_code || !description) {
+    _clientsMsg('products-msg', 'Both the full code and the description are required.', false);
+    return;
+  }
+  try {
+    await api('POST', `/api/clients/${_selectedClient.id}/products`, { full_code, description });
+    _clientsMsg('products-msg', '✓ Saved.', true);
+    document.getElementById('product-new-code').value = '';
+    document.getElementById('product-new-desc').value = '';
+    await loadClientProducts();
+    refreshClientsPage();   // product count changed
+  } catch (e) { _clientsMsg('products-msg', 'Error: ' + e.message, false); }
+});
+
+async function deleteClientProduct(productId, desc) {
+  if (!_selectedClient) return;
+  if (!confirm(`Remove "${desc}" from ${_selectedClient.name}'s list?`)) return;
+  try {
+    await api('DELETE', `/api/clients/${_selectedClient.id}/products/${productId}`);
+    toast('Removed from list', 'success');
+    await loadClientProducts();
+    refreshClientsPage();
+  } catch (e) { toast('Delete failed: ' + e.message, 'error'); }
+}
+
+document.getElementById('product-search')?.addEventListener('input', renderClientProducts);
 
 /* ── Settings page ────────────────────────────────────────── */
 async function refreshSettingsPage() {

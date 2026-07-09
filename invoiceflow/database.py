@@ -473,6 +473,13 @@ def delete_client_products(company_id: str, client_id: str) -> None:
      .eq("company_id", company_id).eq("client_id", client_id).execute())
 
 
+def delete_client_product(company_id: str, client_id: str, product_id: str) -> None:
+    """Delete ONE list row (the in-app editor's per-row delete)."""
+    (_client().table("client_products").delete()
+     .eq("company_id", company_id).eq("client_id", client_id)
+     .eq("id", product_id).execute())
+
+
 # ═══════════════════════════════════════════════════════════════
 # JOBS
 # ═══════════════════════════════════════════════════════════════

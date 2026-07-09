@@ -62,6 +62,10 @@
         <span class="icon">🔍</span>
         <span>UK Tariff lookup</span>
       </div>
+      <div class="nav-item" data-page="clients">
+        <span class="icon">📋</span>
+        <span>Client lists</span>
+      </div>
       <div class="nav-item" data-page="settings">
         <span class="icon">⚙</span>
         <span>Settings</span>
@@ -286,6 +290,55 @@
         <div id="tariff-results"></div>
       </div>
     </main>
+
+    <!-- ══════════════════════════════
+         PAGE: CLIENT LISTS (V-lookup)
+    ══════════════════════════════ -->
+    <main class="content page-content hidden" id="page-clients">
+
+      <!-- Client list -->
+      <div class="card" style="margin-bottom:16px">
+        <div class="memory-header" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+          <div>
+            <div class="section-title">Clients <span id="clients-count" style="color:var(--muted);font-size:13px;margin-left:6px"></span></div>
+            <div style="color:var(--muted);font-size:12px;margin-top:4px">
+              Suppliers and their commodity-code lists (the V-lookup). Invoices from a
+              matched client fill the export from that client's list.
+            </div>
+          </div>
+        </div>
+        <div class="add-user-fields" id="client-add-form" style="margin-top:12px">
+          <input class="settings-input" id="client-new-name" type="text" placeholder="Client / supplier name" aria-label="Client name" />
+          <input class="settings-input" id="client-new-rex" type="text" placeholder="REX (optional, e.g. ITREXIT0616…)" aria-label="REX number" />
+          <input class="settings-input" id="client-new-eori" type="text" placeholder="EORI (optional)" aria-label="EORI number" />
+          <button class="btn-save-user" id="btn-client-add">＋ Add client</button>
+        </div>
+        <div class="settings-msg hidden" id="clients-msg"></div>
+        <div id="clients-list" style="margin-top:12px"></div>
+      </div>
+
+      <!-- Selected client's products -->
+      <div class="card hidden" id="client-products-card">
+        <div class="section-title" style="margin-bottom:4px">
+          Product list — <span id="client-products-title"></span>
+          <span id="client-products-count" style="color:var(--muted);font-size:13px;margin-left:6px"></span>
+        </div>
+        <div style="color:var(--muted);font-size:12px;margin-bottom:12px">
+          One row per product: the full 10-digit commodity code + the list description.
+          The 8-digit part is the lookup key; the last 2 digits fill the TARIC column.
+          Saving an existing code updates its description.
+        </div>
+        <div class="add-user-fields">
+          <input class="settings-input" id="product-new-code" type="text" placeholder="Full code (8-10 digits, e.g. 0704901000)" maxlength="12" aria-label="Full commodity code" />
+          <input class="settings-input" id="product-new-desc" type="text" placeholder="Description (as it must appear on the export)" aria-label="Product description" />
+          <button class="btn-save-user" id="btn-product-add">＋ Add / update</button>
+        </div>
+        <div class="settings-msg hidden" id="products-msg"></div>
+        <input class="memory-search" id="product-search" type="text" placeholder="Search this list…" aria-label="Search products" style="margin-top:12px" />
+        <div id="client-products-list" style="margin-top:8px"></div>
+      </div>
+
+    </main><!-- /page-clients -->
 
     <!-- ══════════════════════════════
          PAGE: SETTINGS

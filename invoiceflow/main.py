@@ -3471,6 +3471,106 @@ async def api_change_password(
 
 
 # ---------------------------------------------------------------------------
+# Clients + product lists (the "V-lookup") — in-app editor endpoints
+# ---------------------------------------------------------------------------
+# The per-supplier commodity-code lists that drive the Items export.
+# Reading is open to every user (operators need to see what will match);
+# mutations are admin-only. All rows are tenant-scoped via RLS + the
+# explicit company_id filters in the DAL.
+
+def _clean_str(v, max_len: int = 200) -> str:
+    return str(v or "").strip()[:max_len]
+
+
+@app.get("/api/clients")
+async def api_list_clients(ctx: dict = Depends(authed)):
+    clients = db.list_clients(ctx["company_id"])
+    return [{
+        **c,
+        "product_count": db.count_client_products(ctx["company_id"], c["id"]),
+    } for c in clients]
+
+
+@app.post("/api/clients")
+async def api_create_client(body: dict = {}, ctx: dict = Depends(admin_authed)):
+    name = _clean_str(body.get("name"))
+    if not name:
+        raise HTTPException(400, "Client name is required")
+    entry = {"name": name}
+    rex = _clean_str(body.get("rex"), 64)
+    eori = _clean_str(body.get("eori"), 64)
+    if rex:
+        entry["rex"] = rex
+    if eori:
+        entry["eori"] = eori
+    return db.create_client_record(ctx["company_id"], entry)
+
+
+@app.put("/api/clients/{client_id}")
+async def api_update_client(client_id: str, body: dict = {}, ctx: dict = Depends(admin_authed)):
+    if not db.get_client(ctx["company_id"], client_id):
+        raise HTTPException(404, "Client not found")
+    updates = {}
+    if "name" in body:
+        name = _clean_str(body.get("name"))
+        if not name:
+            raise HTTPException(400, "Client name cannot be empty")
+        updates["name"] = name
+    if "rex" in body:
+        updates["rex"] = _clean_str(body.get("rex"), 64) or None
+    if "eori" in body:
+        updates["eori"] = _clean_str(body.get("eori"), 64) or None
+    if updates:
+        db.update_client(ctx["company_id"], client_id, updates)
+    return {"ok": True}
+
+
+@app.delete("/api/clients/{client_id}")
+async def api_delete_client(client_id: str, ctx: dict = Depends(admin_authed)):
+    if not db.get_client(ctx["company_id"], client_id):
+        raise HTTPException(404, "Client not found")
+    db.delete_client(ctx["company_id"], client_id)   # products cascade
+    return {"ok": True}
+
+
+@app.get("/api/clients/{client_id}/products")
+async def api_list_client_products(client_id: str, ctx: dict = Depends(authed)):
+    if not db.get_client(ctx["company_id"], client_id):
+        raise HTTPException(404, "Client not found")
+    return db.list_client_products(ctx["company_id"], client_id)
+
+
+@app.post("/api/clients/{client_id}/products")
+async def api_upsert_client_product(client_id: str, body: dict = {}, ctx: dict = Depends(admin_authed)):
+    """Add/update one V-lookup row. Keyed on full_code (upsert): saving an
+    existing code updates its description. general_code (the 8-digit
+    VLOOKUP key) is derived from the full code."""
+    if not db.get_client(ctx["company_id"], client_id):
+        raise HTTPException(404, "Client not found")
+    full_code = re.sub(r"\D", "", str(body.get("full_code") or ""))
+    if not 8 <= len(full_code) <= 10:
+        raise HTTPException(400, "Full code must be 8-10 digits (e.g. 0704901000)")
+    description = _clean_str(body.get("description"), 300)
+    if not description:
+        raise HTTPException(400, "Description is required")
+    entry = {
+        "general_code": full_code[:8],
+        "full_code":    full_code,
+        "taric_code":   full_code[8:10],
+        "description":  description,
+    }
+    return db.upsert_client_product(ctx["company_id"], client_id, entry)
+
+
+@app.delete("/api/clients/{client_id}/products/{product_id}")
+async def api_delete_client_product(client_id: str, product_id: str, ctx: dict = Depends(admin_authed)):
+    if not db.get_client(ctx["company_id"], client_id):
+        raise HTTPException(404, "Client not found")
+    db.delete_client_product(ctx["company_id"], client_id, product_id)
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
 # Tariff search endpoint
 # ---------------------------------------------------------------------------
 async def _tariff_code_lookup(code: str) -> list[dict]:
