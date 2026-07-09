@@ -3672,7 +3672,8 @@ async def retry_invoice(invoice_id: str, ctx: dict = Depends(authed)):
 
     ext = Path(original_file).suffix.lower()
     mime = MIME_MAP.get(ext, "application/pdf")
-    tmp_local = UPLOADS_DIR / f"retry_{uuid.uuid4()}_{re.sub(r'[^\\w\\-.]', '_', original_file)}"
+    safe_name = re.sub(r'[^\w\-.]', '_', original_file)
+    tmp_local = UPLOADS_DIR / f"retry_{uuid.uuid4()}_{safe_name}"
     tmp_local.write_bytes(data)
 
     # Create new job + delete old invoice record
