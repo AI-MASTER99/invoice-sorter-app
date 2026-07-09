@@ -54,5 +54,5 @@ services:
       # per-client V-lookup lists live in Postgres and are never touched.
       # 0 disables the purge.
       - key: STORAGE_RETENTION_DAYS
-        value: "30"
+        value: "7"
     autoDeploy: true

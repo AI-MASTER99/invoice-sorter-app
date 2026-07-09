@@ -135,11 +135,11 @@ USE_CLIENT_LIST = os.environ.get("USE_CLIENT_LIST") == "1"
 # seen → project restricted → app down). A daily background purge deletes
 # storage objects older than this many days. The per-client "V-lookup" lists
 # (clients / client_products tables) are NOT touched — only the two buckets.
-# 0 disables the purge. Default 30.
+# 0 disables the purge. Default 7.
 try:
-    STORAGE_RETENTION_DAYS = int(os.environ.get("STORAGE_RETENTION_DAYS", "30"))
+    STORAGE_RETENTION_DAYS = int(os.environ.get("STORAGE_RETENTION_DAYS", "7"))
 except ValueError:
-    STORAGE_RETENTION_DAYS = 30
+    STORAGE_RETENTION_DAYS = 7
 
 for d in (UPLOADS_DIR, OUTPUT_DIR):
     d.mkdir(parents=True, exist_ok=True)
