@@ -226,16 +226,16 @@
 
     <form id="login-form">
       <div class="field">
-        <label>Company</label>
-        <input type="text" id="login-company" autocomplete="organization" placeholder="Your company" />
+        <label for="login-company">Company</label>
+        <input type="text" id="login-company" autocomplete="organization" placeholder="Your company" autofocus />
       </div>
       <div class="field">
-        <label>Username</label>
-        <input type="text" id="login-username" autocomplete="username" placeholder="admin" />
+        <label for="login-username">Username</label>
+        <input type="text" id="login-username" autocomplete="username" placeholder="admin" required />
       </div>
       <div class="field">
-        <label>Password</label>
-        <input type="password" id="login-password" autocomplete="current-password" placeholder="••••••••" />
+        <label for="login-password">Password</label>
+        <input type="password" id="login-password" autocomplete="current-password" placeholder="••••••••" required />
       </div>
       <button type="submit" class="btn-login" id="btn-login">Sign in →</button>
       <div class="error-msg" id="login-error">Invalid credentials.</div>
@@ -357,7 +357,9 @@
           window.location.href = '/';
         } else {
           const data = await r.json().catch(() => ({}));
-          err.textContent = data.detail || 'Invalid credentials.';
+          // 422 validation errors return detail as an array of objects —
+          // rendering that verbatim shows "[object Object]".
+          err.textContent = typeof data.detail === 'string' ? data.detail : 'Invalid credentials.';
           err.classList.add('show');
           btn.disabled = false;
           btn.textContent = 'Sign in →';

@@ -482,11 +482,15 @@ def create_job(company_id: str, data: dict) -> dict:
     return r.data[0]
 
 
-def list_jobs(company_id: str) -> list[dict]:
+def list_jobs(company_id: str, limit: int = 100) -> list[dict]:
+    """Most recent jobs first. Bounded: the UI polls this every 2 s and
+    only renders active + recently-failed jobs — returning the company's
+    entire unbounded job history grew the payload (and DB load) forever."""
     r = (_client().table("jobs")
          .select("*")
          .eq("company_id", company_id)
          .order("created_at", desc=True)
+         .limit(limit)
          .execute())
     return r.data
 

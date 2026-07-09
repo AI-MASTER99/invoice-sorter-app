@@ -9,6 +9,26 @@ let currentUser = null;
 let currentRole = null;
 
 /* ── Utility ─────────────────────────────────────────────── */
+
+// Connection-loss banner: the pollers swallow individual errors (right —
+// a blip shouldn't toast every 2 s), but a persistently unreachable
+// backend used to show stale data with NO signal at all.
+let _netFailures = 0;
+function _setOffline(off) {
+  let b = document.getElementById('offline-banner');
+  if (off && !b) {
+    b = document.createElement('div');
+    b.id = 'offline-banner';
+    b.setAttribute('role', 'alert');
+    b.textContent = '⚠ Can’t reach the server — retrying…';
+    b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:9999;'
+      + 'background:#b91c1c;color:#fff;text-align:center;padding:6px 12px;font-size:13px';
+    document.body.appendChild(b);
+  } else if (!off && b) {
+    b.remove();
+  }
+}
+
 async function api(method, path, body) {
   const opts = { method, credentials: 'include' };
   if (body instanceof FormData) {
@@ -17,14 +37,25 @@ async function api(method, path, body) {
     opts.headers = { 'Content-Type': 'application/json' };
     opts.body = JSON.stringify(body);
   }
-  const r = await fetch(API + path, opts);
+  let r;
+  try {
+    r = await fetch(API + path, opts);
+  } catch (e) {
+    // Network-level failure (server down / connection lost)
+    if (++_netFailures >= 3) _setOffline(true);
+    throw e;
+  }
+  _netFailures = 0;
+  _setOffline(false);
   if (r.status === 401) {
     window.location.href = '/login';
     throw new Error('Not authenticated');
   }
   if (!r.ok) {
     const err = await r.json().catch(() => ({}));
-    throw new Error(err.detail || `${r.status} ${r.statusText}`);
+    // 422 returns detail as an array of objects — never render that raw.
+    const detail = typeof err.detail === 'string' ? err.detail : '';
+    throw new Error(detail || `${r.status} ${r.statusText}`);
   }
   return r.json();
 }
@@ -202,6 +233,11 @@ async function refreshJobs() {
       }
       knownJobs[j.id] = { ...j };
     });
+    // Prune terminal jobs we no longer render — without this the map
+    // accumulates every job id for the lifetime of the tab.
+    for (const id of Object.keys(knownJobs)) {
+      if (knownJobs[id].status === 'done') delete knownJobs[id];
+    }
 
     const section   = document.getElementById('jobs-section');
     const container = document.getElementById('jobs-container');
@@ -302,9 +338,19 @@ async function cancelJob(id) {
 }
 
 /* ── Dashboard invoice preview ────────────────────────────── */
+// Stale-render guards: several timers + event handlers fire overlapping
+// GET /invoices calls; a slow OLD response resolving after a newer one
+// repainted the table with stale rows (a just-deleted invoice popped back
+// for a few seconds). Each renderer ignores responses older than the
+// latest request it issued.
+let _invSeq = 0;
+let _invPageSeq = 0;
+
 async function refreshInvoices() {
+  const seq = ++_invSeq;
   try {
     const list = await api('GET', '/invoices');
+    if (seq !== _invSeq) return;   // a newer refresh superseded this one
     const tbody = document.getElementById('invoices-tbody');
 
     const subcode = list.filter(i => i.status === 'subcode_needed').length;
@@ -334,8 +380,10 @@ async function refreshInvoices() {
 
 /* ── Full invoices page (3 tabs) ──────────────────────────── */
 async function refreshInvoicesPage() {
+  const seq = ++_invPageSeq;
   try {
     const list = await api('GET', '/invoices');
+    if (seq !== _invPageSeq) return;   // superseded by a newer refresh
     const groups = { verified: [], subcode_needed: [], failed: [] };
     list.forEach(inv => { (groups[inv.status] || groups.failed).push(inv); });
 
@@ -411,7 +459,10 @@ function actionsHtml(inv) {
   return del;
 }
 
-function exportFull(id)  { window.open(`/invoices/${id}/export/full`,  '_blank'); }
+// NOTE: the "Full Excel" button deliberately downloads the MultiFreight
+// Items export (/export/items) — the customs-ready deliverable. The
+// /export/full endpoint (invoice-data workbook + tariff sheet) still
+// exists server-side for direct/API use but has no UI button.
 function exportRaw(id)   { window.open(`/invoices/${id}/export/raw`,   '_blank'); }
 function exportItems(id) { window.open(`/invoices/${id}/export/items`, '_blank'); }
 
@@ -950,7 +1001,56 @@ async function refreshAdminPage() {
   } catch (e) {
     console.error(e);
   }
+  refreshStorageUsage();
 }
+
+function fmtBytes(n) {
+  if (n == null) return '—';
+  const units = ['B','KB','MB','GB','TB'];
+  let f = Number(n), i = 0;
+  while (f >= 1024 && i < units.length - 1) { f /= 1024; i++; }
+  return `${f.toFixed(1)} ${units[i]}`;
+}
+
+async function refreshStorageUsage() {
+  const box = document.getElementById('admin-storage-usage');
+  if (!box) return;
+  try {
+    const u = await api('GET', '/api/admin/storage/usage');
+    const rows = Object.entries(u.buckets || {}).map(([name, b]) =>
+      b.error
+        ? `<div>📦 <strong>${escHtml(name)}</strong>: <span style="color:var(--red)">${escHtml(b.error)}</span></div>`
+        : `<div>📦 <strong>${escHtml(name)}</strong>: ${b.files} files · ${fmtBytes(b.bytes)}</div>`
+    ).join('');
+    box.innerHTML = `${rows}
+      <div style="margin-top:6px"><strong>Total: ${fmtBytes(u.total_bytes)}</strong>
+      <span style="color:var(--muted)"> · auto-purge after ${u.retention_days} days</span></div>`;
+  } catch (e) {
+    box.textContent = 'Could not load storage usage: ' + e.message;
+  }
+}
+
+document.getElementById('btn-storage-purge')?.addEventListener('click', async () => {
+  const days = parseInt(document.getElementById('admin-purge-days').value, 10);
+  const msg = document.getElementById('admin-storage-msg');
+  if (Number.isNaN(days) || days < 0) {
+    msg.textContent = 'Enter a valid number of days (0 = everything).';
+    msg.className = 'settings-msg error show'; return;
+  }
+  const what = days === 0 ? 'ALL stored invoice files' : `files older than ${days} days`;
+  if (!confirm(`Delete ${what} from storage?\n\nClient V-lookup lists and invoice records are NOT affected — only the stored PDF/Excel files.`)) return;
+  try {
+    const r = await api('POST', '/api/admin/storage/purge', { days });
+    const freed = Object.values(r.result || {}).reduce((a, b) => a + (b.freed_bytes || 0), 0);
+    msg.textContent = `✓ Purge done — freed ${fmtBytes(freed)}.`;
+    msg.className = 'settings-msg success show';
+    refreshStorageUsage();
+  } catch (e) {
+    msg.textContent = 'Purge failed: ' + e.message;
+    msg.className = 'settings-msg error show';
+  }
+  setTimeout(() => msg.classList.remove('show'), 6000);
+});
 
 async function deleteCompany(companyId, companyName) {
   if (!confirm(`Permanently delete "${companyName}" and ALL their data (invoices, memory, users)?\n\nThis cannot be undone.`)) return;
