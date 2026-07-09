@@ -27,7 +27,7 @@ logger = logging.getLogger("invoiceflow")
 
 load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=True)
 
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any
 
 import anthropic
@@ -1248,15 +1248,14 @@ def normalise_row(row: dict) -> dict:
     return out
 
 
-def _norm_num(s: str) -> str:
-    """Normalize a numeric string for comparison.
-    Handles EU (1.234,56) and US (1,234.56) formats, strips currency symbols.
-    Returns the integer representation (cents-like) for robust comparison."""
+def _parse_num(s: str) -> float | None:
+    """Parse a numeric string to float WITHOUT rounding.
+    Handles EU (1.234,56) and US (1,234.56) formats, strips currency symbols."""
     if not s:
-        return ""
+        return None
     cleaned = re.sub(r"[^\d,\.\-]", "", str(s))
     if not cleaned:
-        return ""
+        return None
     # If both . and , present: last one is decimal separator
     if "," in cleaned and "." in cleaned:
         if cleaned.rfind(",") > cleaned.rfind("."):
@@ -1272,9 +1271,16 @@ def _norm_num(s: str) -> str:
         else:
             cleaned = cleaned.replace(",", "")
     try:
-        return f"{float(cleaned):.2f}"
+        return float(cleaned)
     except ValueError:
-        return ""
+        return None
+
+
+def _norm_num(s: str) -> str:
+    """Normalize a numeric string for comparison (2-decimal string).
+    Parsing itself is unrounded — see _parse_num."""
+    f = _parse_num(s)
+    return "" if f is None else f"{f:.2f}"
 
 
 def _row_key(r: dict) -> tuple:
@@ -1479,17 +1485,20 @@ def parse_totals(raw: str) -> dict:
 
 
 def sum_rows_numeric(rows: list[dict], field: str) -> str:
-    """Sum a numeric column across rows, return normalized string (2 decimals)."""
+    """Sum a numeric column across rows, return normalized string (2 decimals).
+
+    Sums the UN-rounded per-row values and rounds only the final total —
+    matching the Excel `=SUM(...)` over raw 3-decimal weights. Rounding
+    each row first (the old behaviour) drifted from the true total: five
+    rows of 0.004 kg summed to 0.00 while the invoice footer said 0.02,
+    firing a false high-severity mismatch."""
     total = 0.0
     any_val = False
     for r in rows:
-        n = _norm_num(r.get(field, ""))
-        if n:
-            try:
-                total += float(n)
-                any_val = True
-            except ValueError:
-                pass
+        f = _parse_num(r.get(field, ""))
+        if f is not None:
+            total += f
+            any_val = True
     return f"{total:.2f}" if any_val else ""
 
 
@@ -1891,10 +1900,23 @@ def build_excel(
     sheet_title: str,
     totals: dict | None = None,
     flagged_cells: list[set[str]] | None = None,
+    currency: str = "€",
 ) -> bytes:
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = sheet_title
+
+    # Currency-aware number format for the Value column — previously
+    # hard-coded to €, which rendered a £/$/CHF invoice's amounts as
+    # Euros in the export. Symbols map to a prefix; unknown → bare.
+    _value_fmts = {
+        "€": '€#,##0.00', "£": '£#,##0.00', "$": '$#,##0.00',
+        "CHF": '"CHF "#,##0.00',
+    }
+    value_fmt = _value_fmts.get(currency, '#,##0.00')
+
+    def _fmt_for(col_name: str, fmt: str) -> str:
+        return value_fmt if col_name == "Value" else fmt
 
     # ── Row 1: merged title ───────────────────────────────────
     ws.merge_cells("A1:I1")
@@ -1939,7 +1961,7 @@ def build_excel(
                 c.fill = alt_fill
             c.font      = _FONT_CELL
             c.alignment = Alignment(horizontal=align, vertical="center")
-            c.number_format = fmt
+            c.number_format = _fmt_for(col_name, fmt)
 
             if col_name in ("Value", "Gross Weight (KG)", "Net Weight (KG)", "Number of Packages"):
                 num = extract_value_number(str(raw))
@@ -1988,7 +2010,7 @@ def build_excel(
         c.fill      = _FILL_TOTALS
         c.font      = _FONT_TOTALS
         c.alignment = Alignment(horizontal="right", vertical="center")
-        c.number_format = fmt
+        c.number_format = _fmt_for(col_name, fmt)
 
         # If per-line data exists → use SUM formula (dynamic).
         # If per-line empty but Run C footer has a total → use Run C value.
@@ -2225,12 +2247,21 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
                          "status": "JE", "reason": ""})
         docs += cds.get("documents") or []
 
+        # The template has only 3 document slots. NEVER silently drop a
+        # document (a missing certificate is a compliance failure at the
+        # border) — surface the overflow in the description so the human
+        # reviewer, who reads every line, resolves it explicitly.
+        dropped_docs = [d.get("code") or "?" for d in docs[3:]]
+
         # ── Commodity code split: 8 digits here, last 2 in the TARIC column ──
         put(out_row, "[6/14] Commodity Code", g["c8"], as_text=True)
         put(out_row, "[6/14] TARIC Code", g["taric"] or cds.get("taric_code"), as_text=True)
         # Merged NOT-IN-LIST lines: show the marker once + all distinct products.
         desc_out = (f"{review.NOT_IN_LIST_MARKER} " + " / ".join(g["products"])
                     if g["not_in_list"] else g["desc"])
+        if dropped_docs:
+            desc_out = (f"*** >3 DOCS — NOT DECLARED: {', '.join(dropped_docs)} — "
+                        f"RESOLVE MANUALLY *** {desc_out}")
         put(out_row, "[6/8] Description of Goods", desc_out)
         # ── Summed invoice figures ──
         put(out_row, "[6/5] Gross Mass (kg)", round(g["gross"], 3) or None)
@@ -2502,13 +2533,20 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
             raw_c2 = ""
         totals_1 = parse_totals(raw_c1)
         totals_2 = parse_totals(raw_c2)
-        # Only keep a total if both runs agree (normalised numeric compare).
+        # Only keep a total if both runs agree (normalised numeric compare —
+        # "€5,425.48" and "€5425.48" are the SAME total; raw string equality
+        # blanked total_value_raw on formatting drift, which silently
+        # disabled review.check_currency's line-vs-total comparison).
         # If one is blank, accept the other (can't disagree with nothing).
         totals: dict = {}
         for key in ("total_packages", "total_gross_kg", "total_net_kg", "total_value", "total_value_raw"):
             v1, v2 = totals_1.get(key, ""), totals_2.get(key, "")
             if v1 and v2:
-                totals[key] = v1 if v1 == v2 else ""
+                n1, n2 = _norm_num(v1), _norm_num(v2)
+                if n1 and n1 == n2:
+                    totals[key] = v1          # same number → keep run 1's raw form
+                else:
+                    totals[key] = v1 if v1 == v2 else ""
             else:
                 totals[key] = v1 or v2
         totals_check = compare_totals(final_rows, totals)
@@ -2731,11 +2769,27 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
         # Step 5 — Generate Excel files + upload to Supabase Storage
         update(95, "Generating Excel files…")
         stem = Path(original_name).stem
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         safe_stem = re.sub(r"[^\w\-]", "_", stem)
 
-        full_bytes = build_excel(final_rows, tariff_data, "Invoice Data", totals=totals, flagged_cells=flagged_cells)
-        raw_bytes  = build_excel(final_rows, None, "Raw Extraction", totals=totals, flagged_cells=flagged_cells)
+        # Detect the invoice currency BEFORE building the Excels, so the
+        # Value column renders in the invoice's own currency (not €).
+        total_value = 0.0
+        currency = "€"
+        for row in final_rows:
+            v = row.get("Value", "") or ""
+            num = extract_value_number(v)
+            if num:
+                total_value += num
+            if "£" in v:
+                currency = "£"
+            elif "CHF" in v.upper():
+                currency = "CHF"
+            elif "$" in v:
+                currency = "$"
+
+        full_bytes = build_excel(final_rows, tariff_data, "Invoice Data", totals=totals, flagged_cells=flagged_cells, currency=currency)
+        raw_bytes  = build_excel(final_rows, None, "Raw Extraction", totals=totals, flagged_cells=flagged_cells, currency=currency)
 
         xlsx_mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         full_storage = f"{company_id}/{safe_stem}_{ts}_full.xlsx"
@@ -2763,17 +2817,7 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
             else:
                 supplier = re.sub(r"[_\-]+", " ", Path(original_name).stem).strip()
 
-        total_value = 0.0
-        currency = "€"
-        for row in final_rows:
-            v = row.get("Value", "") or ""
-            num = extract_value_number(v)
-            if num:
-                total_value += num
-            if "£" in v:
-                currency = "£"
-            elif "$" in v:
-                currency = "$"
+        # (total_value and currency were computed above, before the Excel build)
 
         # Carry the REX number through to the Items export (U116). Prefer the REX
         # read off the invoice; fall back to the matched client's stored REX from
@@ -2782,13 +2826,18 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
         invoice = db.create_invoice(company_id, {
             "supplier":       supplier,
             "filename":       original_name,
-            "date":           datetime.now().isoformat(),
+            "date":           datetime.now(timezone.utc).isoformat(),
             "value":          f"{currency}{total_value:,.2f}",
             "status":         status,
             "rows":           final_rows,
             "tariff_data":    tariff_data,
             "totals":         totals,
             "totals_check":   totals_check,
+            # Persist the A/B disagreement flags — the Excel highlights
+            # these cells yellow, and without this key review_payload sees
+            # None and silently drops every "two readings disagree" issue,
+            # reporting the invoice as verified. JSON-serializable lists.
+            "flagged_cells":  [sorted(s) for s in (flagged_cells or [])],
             "ab_match":       ab_match,
             "ab_reasons":     ab_reasons,
             "full_xlsx_path": str(full_path),
