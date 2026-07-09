@@ -45,6 +45,7 @@ from starlette.middleware.sessions import SessionMiddleware
 # Database layer (Supabase)
 import database as db
 import review
+import tariff_rules
 
 # JWT minting for per-request user-scoped Supabase client (Phase B)
 from auth_jwt import mint_user_jwt
@@ -2249,31 +2250,20 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
     for g in groups:
         cds = g["cds"]
         is_eu_origin = g["origin"] in _EU_COUNTRY_CODES
-        # Always-present documents (slots fill in order). The origin-based U116
-        # proof-of-origin doc and any product-specific documents from the list
-        # follow. The template has 3 document slots (01/02/03).
-        docs = [
-            {"code": "N935", "id": f"VM1 {g.get('invoice', '')}".strip(),
-             "status": "JE", "reason": ""},
-            {"code": "Y929", "id": "Excluded from regulation 834/2007",
-             "status": "", "reason": "Excluded from regulation 834/2007"},
-        ]
-        # EU origin → TCA preference 300 is claimed, which needs the proof-of-origin
-        # document U116 in DE 2/3. Reference field: the supplier's REX (ITREXIT…)
-        # number — read off the invoice when present, else the matched client's
-        # stored REX from the list (see totals['supplier_rex']). NEVER the invoice
-        # number: when no REX is known the id is left blank so the gap surfaces for
-        # the human reviewer. NOTE: gov.uk guidance instead says U116 references the
-        # invoice number (with the REX in the statement-on-origin text, and the REX
-        # as a data element under code C100) — this REX-only behaviour was chosen by
-        # the user's customs colleague and every line is human-reviewed. Status JE.
-        if is_eu_origin:
-            # U116 reference: only the number AFTER the country/"REX" prefix
-            # (ITREXIT06167560157 -> 06167560157), kept as text (as_text below)
-            # so a leading zero is preserved.
-            docs.append({"code": "U116", "id": re.sub(r"^[A-Za-z]+", "", items_rex),
-                         "status": "JE", "reason": ""})
-        docs += cds.get("documents") or []
+        # DE 2/3 documents + review flags come from the rule engine
+        # (tariff_rules.resolve_line_docs): N935 always, Y929 only on food
+        # chapters 01-24, U116 on EU-origin lines (REX reference — the
+        # colleague-confirmed divergence from gov.uk guidance is documented
+        # in that module), then the client-list docs. Flags (e.g. a likely-
+        # required N853 the list doesn't carry) are stamped on the line
+        # description below — never guessed in, never silently dropped.
+        docs, line_flags = tariff_rules.resolve_line_docs(
+            code8=g["c8"],
+            is_eu_origin=is_eu_origin,
+            invoice_number=g.get("invoice", ""),
+            rex_ref=items_rex,
+            list_docs=cds.get("documents") or [],
+        )
 
         # The template has only 3 document slots. NEVER silently drop a
         # document (a missing certificate is a compliance failure at the
@@ -2290,6 +2280,8 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
         if dropped_docs:
             desc_out = (f"*** >3 DOCS — NOT DECLARED: {', '.join(dropped_docs)} — "
                         f"RESOLVE MANUALLY *** {desc_out}")
+        for _flag in line_flags:
+            desc_out = f"*** {_flag} *** {desc_out}"
         put(out_row, "[6/8] Description of Goods", desc_out)
         # ── Summed invoice figures ──
         put(out_row, "[6/5] Gross Mass (kg)", round(g["gross"], 3) or None)
