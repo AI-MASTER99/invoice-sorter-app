@@ -117,7 +117,7 @@ OUTPUT_DIR  = _DATA_ROOT / "output"
 # AI models — the primary one does the heavy lifting (extraction, verification,
 # sub-code matching — anything where quality directly affects customs outcomes).
 # The light one handles the simple totals extraction where Sonnet is plenty.
-AI_MODEL_PRIMARY = os.environ.get("AI_MODEL_PRIMARY", "claude-opus-4-7")
+AI_MODEL_PRIMARY = os.environ.get("AI_MODEL_PRIMARY", "claude-opus-4-8")
 AI_MODEL_LIGHT   = os.environ.get("AI_MODEL_LIGHT",   "claude-sonnet-4-6")
 
 # Legacy single-model env var — if set, override both (for easy rollback)
