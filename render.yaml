@@ -55,10 +55,4 @@ services:
       # 0 disables the purge.
       - key: STORAGE_RETENTION_DAYS
         value: "7"
-      # ⚠ BREAK-GLASS — TEMPORARY, REMOVE AFTER LOGGING IN. Resets the
-      # default admin's password to the current APP_PASSWORD on every
-      # boot (the operator is locked out). While present, every deploy
-      # re-resets the password. Delete this entry once login works.
-      - key: FORCE_ADMIN_RESET
-        value: "1"
     autoDeploy: true
