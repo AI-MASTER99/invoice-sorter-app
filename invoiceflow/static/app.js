@@ -582,7 +582,7 @@ async function refreshMemoryPage() {
           _memoryItems = updated || [];
           renderMemoryTable(_memoryItems);
           document.getElementById('memory-count').textContent = `(${_memoryItems.length})`;
-        }), 500);
+        }).catch(() => {}), 500);   // inner promise needs its own catch
       }).catch(() => {});
     }
   } catch (e) { /* silent */ }
@@ -791,6 +791,7 @@ function copyCode(code) {
 /* ── Client lists (V-lookup editor) ───────────────────────── */
 let _selectedClient = null;   // {id, name} of the open product list
 let _clientProducts = [];     // cache for the search filter
+let _prodSeq = 0;             // stale-render guard for the products fetch
 
 async function refreshClientsPage() {
   const box = document.getElementById('clients-list');
@@ -837,9 +838,12 @@ async function openClientProducts(clientId, clientName) {
 
 async function loadClientProducts() {
   if (!_selectedClient) return;
+  const seq = ++_prodSeq;
   const box = document.getElementById('client-products-list');
   try {
-    _clientProducts = await api('GET', `/api/clients/${_selectedClient.id}/products`);
+    const rows = await api('GET', `/api/clients/${_selectedClient.id}/products`);
+    if (seq !== _prodSeq) return;   // a newer client was opened — drop stale rows
+    _clientProducts = rows;
     renderClientProducts();
   } catch (e) {
     box.innerHTML = `<div style="color:var(--red);font-size:13px">Could not load products: ${escHtml(e.message)}</div>`;
@@ -1020,15 +1024,19 @@ async function deleteUser(username) {
 }
 
 document.getElementById('btn-chpw')?.addEventListener('click', async () => {
+  const curp = document.getElementById('chpw-current').value;
   const np = document.getElementById('chpw-new').value;
   const cp = document.getElementById('chpw-confirm').value;
   const msg = document.getElementById('chpw-msg');
+  if (!curp) { msg.textContent = 'Enter your current password.'; msg.className = 'settings-msg error show'; return; }
   if (!np) { msg.textContent = 'Enter a new password.'; msg.className = 'settings-msg error show'; return; }
   if (np !== cp) { msg.textContent = 'Passwords do not match.'; msg.className = 'settings-msg error show'; return; }
   try {
-    await api('PUT', `/api/users/${encodeURIComponent(currentUser)}/password`, { password: np });
+    // Self-change: the server requires the current password (anti-hijack).
+    await api('PUT', `/api/users/${encodeURIComponent(currentUser)}/password`, { current_password: curp, password: np });
     msg.textContent = 'Password updated successfully.';
     msg.className = 'settings-msg success show';
+    document.getElementById('chpw-current').value = '';
     document.getElementById('chpw-new').value = '';
     document.getElementById('chpw-confirm').value = '';
   } catch (e) {

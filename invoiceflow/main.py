@@ -412,8 +412,11 @@ def purge_old_storage(days: int) -> dict:
                     created = datetime.fromisoformat(raw.replace("Z", "+00:00"))
                 except ValueError:
                     created = None
-            # No timestamp → treat as old (safe: these are transient files).
-            if created is None or created <= cutoff:
+            # Fail SAFE on a missing/unparseable timestamp: KEEP the file.
+            # Deleting it could purge a just-uploaded file whose job hasn't
+            # read it yet (breaking retry). Age-based deletion only acts on
+            # files we can actually prove are old.
+            if created is not None and created <= cutoff:
                 victims.append(f["path"])
         freed = sum(f["size"] for f in files if f["path"] in set(victims))
         try:

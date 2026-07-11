@@ -373,8 +373,9 @@
         <div class="section-title" style="margin-bottom:4px">Change your password</div>
         <div style="color:var(--muted);font-size:12px;margin-bottom:16px">Update the password for your own account</div>
         <div class="add-user-fields">
+          <input class="settings-input" id="chpw-current" aria-label="Current password" type="password" placeholder="Current password" autocomplete="current-password" />
           <input class="settings-input" id="chpw-new" aria-label="New password" type="password" placeholder="New password" autocomplete="new-password" />
-          <input class="settings-input" id="chpw-confirm" type="password" placeholder="Confirm password" autocomplete="new-password" />
+          <input class="settings-input" id="chpw-confirm" aria-label="Confirm password" type="password" placeholder="Confirm password" autocomplete="new-password" />
           <button class="btn-save-user" id="btn-chpw">Update</button>
         </div>
         <div class="settings-msg hidden" id="chpw-msg"></div>
