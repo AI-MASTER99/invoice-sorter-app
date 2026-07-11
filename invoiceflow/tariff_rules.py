@@ -32,9 +32,11 @@ Rules implemented:
          engine does not ADD the document — it FLAGS lines that look like
          they need N853 but don't carry it in their list docs.
 
-Slot budget: the template has 3 document slots. This module returns the
-full ordered list; the caller (build_items_xlsx) writes the first three
-and stamps a NOT-DECLARED marker for any overflow — never a silent drop.
+Slot budget: the export sheet carries 6 document slots (the stock
+template's 3 are widened by main._ensure_document_slots). This module
+returns the full ordered list; the caller (build_items_xlsx) writes the
+first six and stamps a NOT-DECLARED marker for any overflow — never a
+silent drop.
 """
 from __future__ import annotations
 

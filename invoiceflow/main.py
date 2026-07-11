@@ -2158,6 +2158,64 @@ _EU_COUNTRY_CODES = {
 }
 
 
+# One document slot in the MultiFreight Items sheet = this 9-column block.
+# {n} is the zero-padded slot number ("01"…"06").
+_DOC_SLOT_FIELDS = (
+    "[2/3] Documents - Code ({n})",
+    "[2/3] Documents - ID ({n})",
+    "[2/3] Documents - Part ({n})",
+    "[2/3] Documents - Status ({n})",
+    "[2/3] Documents - Reason ({n})",
+    "[8/7] Documents - Date of Validity ({n})",
+    "[8/7] Documents - Issuing Authority ({n})",
+    "[8/7] Documents - Write-off Quantity ({n})",
+    "[8/7] Documents - Write-off Unit ({n})",
+)
+
+
+def _ensure_document_slots(ws, want: int = 6) -> None:
+    """Widen the Items sheet to `want` document slots.
+
+    The stock MultiFreight template ships with only 3 slots — which
+    N935 + Y929 + U116 already consume on an EU food line, so any product
+    certificate (e.g. N853) used to overflow into a description note.
+    Operators normally add the extra columns by hand; do it here instead:
+    APPEND the 9-column slot blocks for slots 04..06 after the last used
+    column, copying header style + width from the slot-03 block. Appending
+    (rather than inserting mid-sheet) keeps every existing column at its
+    original position — safe for position-sensitive importers — and avoids
+    openpyxl's pathologically slow insert_cols on this template (it carries
+    a stray styled cell at row ~1M). Idempotent — if the template already
+    has the extra slots, nothing changes.
+    """
+    from copy import copy as _copy
+
+    headers = {str(ws.cell(row=3, column=c).value).strip(): c
+               for c in range(1, ws.max_column + 1)
+               if ws.cell(row=3, column=c).value not in (None, "")}
+    if _DOC_SLOT_FIELDS[0].format(n=f"0{want}") in headers:
+        return  # template already has them
+    src_start = headers.get("[2/3] Documents - Code (03)")
+    if not src_start:
+        return  # unexpected template layout — leave untouched
+    block = len(_DOC_SLOT_FIELDS)                 # 9 columns per slot
+    append_at = max(headers.values()) + 1         # first free column
+    for s, slot in enumerate(range(4, want + 1)):
+        for f, field in enumerate(_DOC_SLOT_FIELDS):
+            src_c = ws.cell(row=3, column=src_start + f)
+            dst_col = append_at + s * block + f
+            dst = ws.cell(row=3, column=dst_col,
+                          value=field.format(n=f"0{slot}"))
+            dst.font = _copy(src_c.font)
+            dst.fill = _copy(src_c.fill)
+            dst.border = _copy(src_c.border)
+            dst.alignment = _copy(src_c.alignment)
+            src_letter = get_column_letter(src_start + f)
+            if src_letter in ws.column_dimensions:
+                ws.column_dimensions[get_column_letter(dst_col)].width = \
+                    ws.column_dimensions[src_letter].width
+
+
 def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> bytes:
     """Fill the MultiFreight CDS 'Items' tab from the processed rows.
 
@@ -2174,6 +2232,8 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
         if name != "Items":
             del wb[name]
     ws = wb["Items"]
+
+    _ensure_document_slots(ws, want=6)
 
     # Map exact row-3 header text -> column index.
     col: dict[str, int] = {}
@@ -2288,11 +2348,12 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
             list_docs=cds.get("documents") or [],
         )
 
-        # The template has only 3 document slots. NEVER silently drop a
-        # document (a missing certificate is a compliance failure at the
-        # border) — surface the overflow in the description so the human
+        # 6 document slots (the sheet is widened by _ensure_document_slots;
+        # the stock template only has 3). NEVER silently drop a document
+        # (a missing certificate is a compliance failure at the border) —
+        # anything past slot 06 is surfaced in the description so the human
         # reviewer, who reads every line, resolves it explicitly.
-        dropped_docs = [d.get("code") or "?" for d in docs[3:]]
+        dropped_docs = [d.get("code") or "?" for d in docs[6:]]
 
         # ── Commodity code split: 8 digits here, last 2 in the TARIC column ──
         put(out_row, "[6/14] Commodity Code", g["c8"], as_text=True)
@@ -2301,7 +2362,7 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
         desc_out = (f"{review.NOT_IN_LIST_MARKER} " + " / ".join(g["products"])
                     if g["not_in_list"] else g["desc"])
         if dropped_docs:
-            desc_out = (f"*** >3 DOCS — NOT DECLARED: {', '.join(dropped_docs)} — "
+            desc_out = (f"*** >6 DOCS — NOT DECLARED: {', '.join(dropped_docs)} — "
                         f"RESOLVE MANUALLY *** {desc_out}")
         for _flag in line_flags:
             desc_out = f"*** {_flag} *** {desc_out}"
@@ -2336,7 +2397,7 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
             put(out_row, "[4/17] Preference", "100", as_text=True)
         put(out_row, "[4/8] Method of Payment", cds.get("mop"), as_text=True)
         put(out_row, "[6/17] National Additional Codes - Code (01)", cds.get("nat_add_code"), as_text=True)
-        for di, doc in enumerate(docs[:3], start=1):
+        for di, doc in enumerate(docs[:6], start=1):
             put(out_row, f"[2/3] Documents - Code (0{di})", doc.get("code"), as_text=True)
             put(out_row, f"[2/3] Documents - ID (0{di})", doc.get("id"), as_text=True)
             put(out_row, f"[2/3] Documents - Status (0{di})", doc.get("status"), as_text=True)
