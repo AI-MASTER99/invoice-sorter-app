@@ -261,13 +261,38 @@ def create_invoice(company_id: str, data: dict) -> dict:
     return r.data[0]
 
 
-def list_invoices(company_id: str) -> list[dict]:
+# Summary columns for list views. NEVER select("*") on this table in a
+# polled path: the heavy JSONB columns (rows, tariff_data, totals, …) made
+# every 5-second dashboard poll pull the entire table (~750 KB) out of
+# Supabase just to render 6 small fields — the primary source of the
+# 23 GB/month egress that got the free-tier project restricted.
+_INVOICE_SUMMARY_COLS = "id, supplier, filename, date, created_at, value, status"
+
+
+def list_invoices(company_id: str, columns: str = _INVOICE_SUMMARY_COLS) -> list[dict]:
     r = (_client().table("invoices")
-         .select("*")
+         .select(columns)
          .eq("company_id", company_id)
          .order("date", desc=True)
          .execute())
     return r.data
+
+
+def count_invoices(company_id: str, status: Optional[str] = None) -> int:
+    q = (_client().table("invoices")
+         .select("id", count="exact")
+         .eq("company_id", company_id))
+    if status:
+        q = q.eq("status", status)
+    return q.execute().count or 0
+
+
+def count_memory(company_id: str) -> int:
+    r = (_client().table("product_memory")
+         .select("id", count="exact")
+         .eq("company_id", company_id)
+         .execute())
+    return r.count or 0
 
 
 def get_invoice(invoice_id: str, company_id: str) -> Optional[dict]:

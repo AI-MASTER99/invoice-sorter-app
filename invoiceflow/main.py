@@ -3904,18 +3904,18 @@ def list_jobs(ctx: dict = Depends(authed)):
 
 @app.get("/stats")
 def get_stats(ctx: dict = Depends(authed)):
+    """Polled every 10 s by every open tab — MUST stay cheap. Counts only;
+    fetching the full invoices/memory tables here (the old behaviour) was
+    a major egress leak (see _INVOICE_SUMMARY_COLS in database.py)."""
     cid = ctx["company_id"]
-    all_invoices = db.list_invoices(cid)
-    total = len(all_invoices)
-    verified = sum(1 for v in all_invoices if v["status"] == "verified")
+    total = db.count_invoices(cid)
+    verified = db.count_invoices(cid, status="verified")
     rate = round(verified / total * 100) if total else 0
-    memory = db.list_memory(cid)
-    pending = sum(1 for m in memory if not m.get("confirmed", False))
     return {
         "processed_today":   db.count_jobs_today(cid),
         "verification_rate": rate,
-        "memory_count":      len(memory),
-        "memory_pending":    pending,
+        "memory_count":      db.count_memory(cid),
+        "memory_pending":    db.count_memory_pending(cid),
     }
 
 
