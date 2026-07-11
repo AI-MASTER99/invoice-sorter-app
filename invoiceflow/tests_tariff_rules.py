@@ -40,6 +40,21 @@ def test_n853_not_required_elsewhere():
     assert not tr.n853_required("02")        # too short for a prefix
 
 
+# ── Dropped-leading-zero normalization (the HIGH finding) ────────────────
+def test_dropped_leading_zero_still_classifies_dairy():
+    # 04061030 with the leading zero dropped by Excel/AI → "4061030"
+    assert tr.n853_required("4061030")      # must still flag (was missed)
+    assert tr.y929_applies("4061030")       # must still be food ch.04
+    assert tr._chapter("4061030") == 4      # not 40 (rubber)
+
+
+def test_dropped_leading_zero_meat_and_fish():
+    assert tr.n853_required("2013000")      # 02013000 meat
+    assert tr.n853_required("3028990")      # 03028990 fish
+    # a genuine even-length non-animal code is untouched
+    assert not tr.n853_required("84282000")
+
+
 # ── resolve_line_docs: composition ──────────────────────────────────────
 def _codes(docs):
     return [d["code"] for d in docs]

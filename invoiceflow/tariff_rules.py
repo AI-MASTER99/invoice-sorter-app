@@ -56,9 +56,28 @@ _N853_PREFIXES = frozenset({
 _FOOD_CHAPTER_MAX = 24
 
 
+def _norm_digits(code: str) -> str:
+    """Digits only, with a dropped leading zero restored.
+
+    Commodity codes are even-length (6/8/10). Excel and the AI routinely
+    drop the leading zero on chapters 01-09, yielding an ODD length
+    (e.g. 04061030 -> 4061030). Left-pad odd lengths so the chapter/prefix
+    read off the front is correct — otherwise `4061030` parses as chapter
+    40 (rubber) instead of 04 (dairy), silently skipping Y929 and MISSING
+    the N853 vet-cert flag. Mirrors _norm_general_code's zfill in main.py.
+    """
+    digits = re.sub(r"\D", "", code or "")
+    # Real codes are even-length (6/8/10); a dropped leading zero makes them
+    # odd (5/7/9). Restore it only for those plausible lengths — never pad a
+    # 1- or 3-digit stray into a spurious chapter.
+    if len(digits) >= 5 and len(digits) % 2 == 1:
+        digits = "0" + digits
+    return digits
+
+
 def _chapter(code: str) -> int | None:
     """First two digits of a commodity code, or None if not derivable."""
-    digits = re.sub(r"\D", "", code or "")
+    digits = _norm_digits(code)
     if len(digits) < 2:
         return None
     try:
@@ -75,7 +94,7 @@ def y929_applies(code: str) -> bool:
 
 def n853_required(code: str) -> bool:
     """Operator's rule: animal-origin prefix → CHED-P (N853) is expected."""
-    digits = re.sub(r"\D", "", code or "")
+    digits = _norm_digits(code)
     return len(digits) >= 3 and digits[:3] in _N853_PREFIXES
 
 

@@ -189,6 +189,10 @@ def ensure_default_admin():
 
 
 _admin_ensured = False
+# Serializes the lazy bootstrap + stale-job sweep. When the DB returns from
+# auto-pause, concurrent first-logins could otherwise all pass the module
+# flags at once and fire duplicate writes at the just-unpaused (fragile) DB.
+_bootstrap_lock = threading.Lock()
 
 
 def _try_ensure_default_admin() -> None:
@@ -208,16 +212,19 @@ def _try_ensure_default_admin() -> None:
     global _admin_ensured
     if _admin_ensured:
         return
-    try:
-        ensure_default_admin()
-        _admin_ensured = True
-    except Exception as e:  # noqa: BLE001 — deliberately broad: never crash boot
-        print(
-            f"[startup] ensure_default_admin deferred — database unreachable? "
-            f"({type(e).__name__}: {e}). App will boot and retry on next login. "
-            f"If this persists, check that the Supabase project is not paused.",
-            flush=True,
-        )
+    with _bootstrap_lock:
+        if _admin_ensured:      # re-check inside the lock
+            return
+        try:
+            ensure_default_admin()
+            _admin_ensured = True
+        except Exception as e:  # noqa: BLE001 — deliberately broad: never crash boot
+            print(
+                f"[startup] ensure_default_admin deferred — database unreachable? "
+                f"({type(e).__name__}: {e}). App will boot and retry on next login. "
+                f"If this persists, check that the Supabase project is not paused.",
+                flush=True,
+            )
 
 
 _try_ensure_default_admin()
@@ -237,15 +244,18 @@ def _try_recover_stale_jobs() -> None:
     global _stale_jobs_swept
     if _stale_jobs_swept:
         return
-    try:
-        n = db.fail_stale_active_jobs(
-            "Interrupted by a server restart — click Retry to reprocess."
-        )
-        _stale_jobs_swept = True
-        if n:
-            print(f"[startup] marked {n} stale running/queued job(s) as failed (retryable)", flush=True)
-    except Exception as e:  # noqa: BLE001 — never crash boot
-        print(f"[startup] stale-job sweep deferred ({type(e).__name__}: {e})", flush=True)
+    with _bootstrap_lock:
+        if _stale_jobs_swept:   # re-check inside the lock
+            return
+        try:
+            n = db.fail_stale_active_jobs(
+                "Interrupted by a server restart — click Retry to reprocess."
+            )
+            _stale_jobs_swept = True
+            if n:
+                print(f"[startup] marked {n} stale running/queued job(s) as failed (retryable)", flush=True)
+        except Exception as e:  # noqa: BLE001 — never crash boot
+            print(f"[startup] stale-job sweep deferred ({type(e).__name__}: {e})", flush=True)
 
 
 _try_recover_stale_jobs()
@@ -2204,6 +2214,10 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
         if _is_fee_row(desc):
             continue          # fee/charge rows are not commodity item lines
         digits = re.sub(r"\D", "", row.get("Comm./imp. cod", "") or "")
+        # Restore a dropped leading zero (odd length ≥5) before splitting, so
+        # chapter-01-09 codes classify correctly downstream (Y929/N853).
+        if len(digits) >= 5 and len(digits) % 2 == 1:
+            digits = "0" + digits
         c8 = digits[:8]
         taric = digits[8:]  # all digits past the 8-digit code — a 9th digit
                             # was silently dropped by the old digits[8:10] gate
@@ -2889,6 +2903,14 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
             pass
         raise
     finally:
+        # Close the Anthropic client's httpx connection pool. Created per
+        # job on the worker's single long-lived event loop; never closing it
+        # leaked sockets/FDs and memory every job — the main OOM contributor
+        # on the 512 MB Render instance.
+        try:
+            await client.close()
+        except Exception:
+            pass
         # Clean up the temp local file (original is safe in Supabase Storage)
         try:
             if file_path.exists():

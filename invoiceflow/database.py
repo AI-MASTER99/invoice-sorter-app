@@ -269,11 +269,16 @@ def create_invoice(company_id: str, data: dict) -> dict:
 _INVOICE_SUMMARY_COLS = "id, supplier, filename, date, created_at, value, status"
 
 
-def list_invoices(company_id: str, columns: str = _INVOICE_SUMMARY_COLS) -> list[dict]:
+def list_invoices(company_id: str, columns: str = _INVOICE_SUMMARY_COLS,
+                  limit: int = 500) -> list[dict]:
+    # Bounded: /invoices is polled every 5s. Without a row cap the payload
+    # grows with history forever — the row-axis twin of the column-axis
+    # egress leak. The dashboard never renders more than a page anyway.
     r = (_client().table("invoices")
          .select(columns)
          .eq("company_id", company_id)
          .order("date", desc=True)
+         .limit(limit)
          .execute())
     return r.data
 
@@ -514,12 +519,15 @@ def create_job(company_id: str, data: dict) -> dict:
     return r.data[0]
 
 
-def list_jobs(company_id: str, limit: int = 100) -> list[dict]:
-    """Most recent jobs first. Bounded: the UI polls this every 2 s and
-    only renders active + recently-failed jobs — returning the company's
-    entire unbounded job history grew the payload (and DB load) forever."""
+_JOB_COLS = "id, filename, status, progress, step, error, invoice_id, created_at"
+
+
+def list_jobs(company_id: str, limit: int = 60) -> list[dict]:
+    """Most recent jobs first, summary columns only. Polled every 2 s; the
+    UI renders active + recently-terminal jobs, so cap rows and select just
+    the fields the client uses (no select(*)) to keep this cheap on egress."""
     r = (_client().table("jobs")
-         .select("*")
+         .select(_JOB_COLS)
          .eq("company_id", company_id)
          .order("created_at", desc=True)
          .limit(limit)
