@@ -2219,8 +2219,12 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
         digits = re.sub(r"\D", "", row.get("Comm./imp. cod", "") or "")
         # Restore a dropped leading zero (odd length ≥5) before splitting, so
         # chapter-01-09 codes classify correctly downstream (Y929/N853).
+        # NEVER silent: `zero_assumed` puts a VERIFY marker on the line —
+        # the repair is a best guess the human must confirm.
+        zero_assumed = False
         if len(digits) >= 5 and len(digits) % 2 == 1:
             digits = "0" + digits
+            zero_assumed = True
         c8 = digits[:8]
         taric = digits[8:]  # all digits past the 8-digit code — a 9th digit
                             # was silently dropped by the old digits[8:10] gate
@@ -2234,6 +2238,7 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
             "cds": row.get("_cds") or {}, "invoice": (row.get("Invoice", "") or "").strip(),
             "gross": _num(row, "Gross Weight (KG)"), "net": _num(row, "Net Weight (KG)"),
             "value": _num(row, "Value"), "packages": _num(row, "Number of Packages"),
+            "zero_assumed": zero_assumed,
         }
         # Merge key. NOT-IN-LIST lines stay in their own group (never folded into a
         # resolved line) and merge on 8-digit code + origin only; resolved lines
@@ -2246,6 +2251,7 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
             g = index[key]
             g["gross"] += entry["gross"]; g["net"] += entry["net"]
             g["value"] += entry["value"]; g["packages"] += entry["packages"]
+            g["zero_assumed"] = g["zero_assumed"] or entry["zero_assumed"]
             for p in entry["products"]:
                 if p and p not in g["products"]:
                     g["products"].append(p)
@@ -2299,6 +2305,11 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
                         f"RESOLVE MANUALLY *** {desc_out}")
         for _flag in line_flags:
             desc_out = f"*** {_flag} *** {desc_out}"
+        if g.get("zero_assumed"):
+            # The invoice code had an odd digit count; we assumed a dropped
+            # leading zero. Best guess, never silent — reviewer must confirm.
+            desc_out = (f"*** CODE HAD AN ODD DIGIT COUNT — LEADING ZERO "
+                        f"ASSUMED, READ AS {g['c8']}{g['taric']} — VERIFY *** {desc_out}")
         put(out_row, "[6/8] Description of Goods", desc_out)
         # ── Summed invoice figures ──
         put(out_row, "[6/5] Gross Mass (kg)", round(g["gross"], 3) or None)

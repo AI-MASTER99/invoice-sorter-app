@@ -342,6 +342,7 @@ def check_fields(rows) -> list[dict]:
     length, value present; plus genuinely empty rows. Fee rows are skipped."""
     miss_origin, bad_origin = [], []
     miss_code, bad_code = [], []
+    odd_code = []   # 7/9 digits — almost always a dropped leading zero
     miss_value, empty_rows = [], []
     for i, row in enumerate(rows or []):
         line = i + 1
@@ -359,6 +360,13 @@ def check_fields(rows) -> list[dict]:
             miss_origin.append(line)
         elif origin not in _ISO2:
             bad_origin.append(line)
+        # Odd-length codes (7/9 digits) are flagged for EVERY row, including
+        # NOT-IN-LIST ones: real codes are even-length, so this is almost
+        # always Excel/AI dropping the leading zero of a chapter 01-09 code
+        # (04061030 → 4061030). Downstream classification assumes the zero
+        # back, but the human must confirm — never a silent repair.
+        if code and len(code) >= 5 and len(code) % 2 == 1:
+            odd_code.append(line)
         if not not_in_list:
             if not code:
                 miss_code.append(line)
@@ -384,6 +392,13 @@ def check_fields(rows) -> list[dict]:
             f"Commodity code has an unexpected length on {_lines(bad_code)} "
             f"(should be 8–10 digits).",
             "Check the commodity code."))
+    if odd_code:
+        issues.append(_issue("high", _loc(odd_code), "commodity code",
+            f"Commodity code on {_lines(odd_code)} has an odd number of digits "
+            f"— a leading zero was probably lost (e.g. 4061030 should be "
+            f"04061030). The export assumes the zero back, but you must "
+            f"confirm the code is right.",
+            "Verify the commodity code and add the missing leading zero."))
     if miss_value:
         issues.append(_issue("high", _loc(miss_value), "value",
             f"Value is missing on {_lines(miss_value)}.",
