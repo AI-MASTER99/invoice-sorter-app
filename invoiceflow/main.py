@@ -2967,12 +2967,29 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
         # to the client via GET /jobs.
         logger.exception("job %s failed", job_id)
         user_msg = _user_facing_job_error(exc)
+        # Diagnostic (non-sensitive): exception type + the last frame INSIDE
+        # our own code (file:line). No data values, so safe to persist; lets
+        # us pinpoint a crash without Render log access. Stored in a separate
+        # column; the user-facing step/error stay generic.
+        diag = f"{type(exc).__name__}"
+        try:
+            tb = exc.__traceback__
+            last = None
+            while tb is not None:
+                fn = tb.tb_frame.f_code.co_filename
+                if fn.endswith(("main.py", "review.py", "tariff_rules.py", "database.py")):
+                    last = (os.path.basename(fn), tb.tb_lineno)
+                tb = tb.tb_next
+            if last:
+                diag = f"{type(exc).__name__} @ {last[0]}:{last[1]} :: {str(exc)[:200]}"
+        except Exception:
+            pass
         try:
             db.update_job(job_id, {
                 "status":   "failed",
-                "step":     user_msg,
+                "step":     user_msg,      # generic, shown to the user
                 "progress": 0,
-                "error":    user_msg,
+                "error":    diag,          # diagnostic, read from the DB
             })
         except Exception:
             pass
