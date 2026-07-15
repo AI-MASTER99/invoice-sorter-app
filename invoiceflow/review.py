@@ -456,12 +456,19 @@ def review_payload(invoice: dict | None) -> dict:
     uncertain-cell issues are shown.
     """
     invoice = invoice or {}
+    # flagged_cells are nested inside `totals` (the invoices table has no
+    # dedicated column); fall back to a top-level key for forward-compat if
+    # a real column is ever added.
+    _totals = invoice.get("totals") or {}
+    flagged = invoice.get("flagged_cells")
+    if flagged is None and isinstance(_totals, dict):
+        flagged = _totals.get("_flagged_cells")
     issues = build_review_issues(
         rows=invoice.get("rows") or [],
-        totals=invoice.get("totals"),
+        totals=_totals,
         totals_check=invoice.get("totals_check"),
         ab_reasons=invoice.get("ab_reasons") or [],
-        flagged_cells=invoice.get("flagged_cells"),
+        flagged_cells=flagged,
         tariff_data=invoice.get("tariff_data"),
     )
     return {"summary": summarize(issues), "issues": issues}

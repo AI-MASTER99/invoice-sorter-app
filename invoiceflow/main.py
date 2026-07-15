@@ -2932,6 +2932,13 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
         # read off the invoice; fall back to the matched client's stored REX from
         # the list (clients.rex, e.g. ITREXIT…). Never the invoice number.
         totals["supplier_rex"] = supplier_rex or ((client_row or {}).get("rex") or "").strip()
+        # Persist the A/B disagreement flags so review_payload can raise its
+        # "two readings disagree" issues later. The invoices table has NO
+        # flagged_cells column, so nest them inside the existing `totals`
+        # jsonb (which IS a column) rather than as a top-level key — a
+        # top-level key crashed create_invoice with PGRST204 on EVERY
+        # invoice. JSON-serializable lists.
+        totals["_flagged_cells"] = [sorted(s) for s in (flagged_cells or [])]
         invoice = db.create_invoice(company_id, {
             "supplier":       supplier,
             "filename":       original_name,
@@ -2942,11 +2949,6 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
             "tariff_data":    tariff_data,
             "totals":         totals,
             "totals_check":   totals_check,
-            # Persist the A/B disagreement flags — the Excel highlights
-            # these cells yellow, and without this key review_payload sees
-            # None and silently drops every "two readings disagree" issue,
-            # reporting the invoice as verified. JSON-serializable lists.
-            "flagged_cells":  [sorted(s) for s in (flagged_cells or [])],
             "ab_match":       ab_match,
             "ab_reasons":     ab_reasons,
             "full_xlsx_path": str(full_path),
