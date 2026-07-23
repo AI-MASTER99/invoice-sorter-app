@@ -2400,7 +2400,11 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
         elif origin:
             put(out_row, "[4/17] Preference", "100", as_text=True)
         put(out_row, "[4/8] Method of Payment", cds.get("mop"), as_text=True)
-        put(out_row, "[6/17] National Additional Codes - Code (01)", cds.get("nat_add_code"), as_text=True)
+        # VATZ (zero-rated VAT) on every item — operator instruction 2026-07
+        # ("'VATZ' needs to be installed on column AY for all Items"). A
+        # product-specific nat_add_code from the client list overrides it.
+        put(out_row, "[6/17] National Additional Codes - Code (01)",
+            cds.get("nat_add_code") or "VATZ", as_text=True)
         for di, doc in enumerate(docs[:6], start=1):
             put(out_row, f"[2/3] Documents - Code (0{di})", doc.get("code"), as_text=True)
             put(out_row, f"[2/3] Documents - ID (0{di})", doc.get("id"), as_text=True)
