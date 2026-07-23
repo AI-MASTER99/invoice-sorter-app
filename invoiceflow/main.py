@@ -2361,16 +2361,20 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
         # Merged NOT-IN-LIST lines: show the marker once + all distinct products.
         desc_out = (f"{review.NOT_IN_LIST_MARKER} " + " / ".join(g["products"])
                     if g["not_in_list"] else g["desc"])
+        # Warnings go AFTER the description (operator feedback: a warning
+        # prefix in the narrow MultiFreight column read as the description
+        # being "replaced"). The NOT-IN-LIST marker stays a prefix — that
+        # one must dominate the cell.
         if dropped_docs:
-            desc_out = (f"*** >6 DOCS — NOT DECLARED: {', '.join(dropped_docs)} — "
-                        f"RESOLVE MANUALLY *** {desc_out}")
+            desc_out = (f"{desc_out} *** >6 DOCS — NOT DECLARED: "
+                        f"{', '.join(dropped_docs)} — RESOLVE MANUALLY ***")
         for _flag in line_flags:
-            desc_out = f"*** {_flag} *** {desc_out}"
+            desc_out = f"{desc_out} *** {_flag} ***"
         if g.get("zero_assumed"):
             # The invoice code had an odd digit count; we assumed a dropped
             # leading zero. Best guess, never silent — reviewer must confirm.
-            desc_out = (f"*** CODE HAD AN ODD DIGIT COUNT — LEADING ZERO "
-                        f"ASSUMED, READ AS {g['c8']}{g['taric']} — VERIFY *** {desc_out}")
+            desc_out = (f"{desc_out} *** CODE HAD AN ODD DIGIT COUNT — LEADING "
+                        f"ZERO ASSUMED, READ AS {g['c8']}{g['taric']} — VERIFY ***")
         put(out_row, "[6/8] Description of Goods", desc_out)
         # ── Summed invoice figures ──
         put(out_row, "[6/5] Gross Mass (kg)", round(g["gross"], 3) or None)

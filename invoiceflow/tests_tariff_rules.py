@@ -66,8 +66,8 @@ def test_food_eu_line_gets_n935_y929_u116():
         invoice_number="INV-1", rex_ref="ITREXIT06167560157")
     assert _codes(docs) == ["N935", "Y929", "U116"]
     assert docs[0]["id"] == "VM1 INV-1"
-    # REX prefix stripped, digits kept (incl. leading zero)
-    assert docs[2]["id"] == "06167560157"
+    # FULL REX code incl. prefix (operator request, 2026-07)
+    assert docs[2]["id"] == "ITREXIT06167560157"
     assert flags == []  # 070 is not an animal prefix
 
 

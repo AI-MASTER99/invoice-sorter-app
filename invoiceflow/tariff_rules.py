@@ -19,10 +19,11 @@ Rules implemented:
          declared for food chapters 01-24. Declaring it on e.g. an
          escalator (8428…) was noise — previously it was unconditional.
   U116 — TCA proof-of-origin (statement on origin) for EU-origin lines
-         claiming preference 300. Reference = the supplier's REX number
-         (digits only, prefix stripped); left blank when no REX is known
-         so the gap surfaces to the reviewer (never the invoice number —
-         deliberate, colleague-confirmed divergence from gov.uk guidance).
+         claiming preference 300. Reference = the supplier's FULL REX code
+         including prefix (ITREXIT06167560157 — operator-requested, 2026-07);
+         left blank when no REX is known so the gap surfaces to the reviewer
+         (never the invoice number — deliberate, colleague-confirmed
+         divergence from gov.uk guidance).
   List documents — product-specific docs from the client's V-lookup list
          (client_products.documents) follow the always-present ones.
   N853 — CHED-P veterinary certificate. The operator's rule: required
@@ -126,10 +127,11 @@ def resolve_line_docs(
         docs.append({"code": "Y929", "id": "Excluded from regulation 834/2007",
                      "status": "", "reason": "Excluded from regulation 834/2007"})
     if is_eu_origin:
-        # U116 reference: only the number AFTER the country/"REX" prefix
-        # (ITREXIT06167560157 -> 06167560157); blank when unknown so the
-        # gap surfaces (as_text at the write site preserves leading zeros).
-        docs.append({"code": "U116", "id": re.sub(r"^[A-Za-z]+", "", rex_ref or ""),
+        # U116 reference: the FULL REX code including its prefix
+        # (ITREXIT06167560157) — per the customs operator's explicit request
+        # (2026-07: MultiFreight column BT must show the complete code, not
+        # just the digits). Blank when unknown so the gap surfaces.
+        docs.append({"code": "U116", "id": (rex_ref or "").strip(),
                      "status": "JE", "reason": ""})
     docs += list_docs
 
@@ -139,9 +141,8 @@ def resolve_line_docs(
         # Deliberately a FLAG, not an auto-added doc: the CHED reference is
         # shipment-specific (not derivable from the invoice), and the BTOM
         # low-risk exemption nuance is unconfirmed. Never guess.
-        flags.append(
-            f"N853 (CHED-P) is normally required for {code8[:3]}… animal-origin "
-            f"codes but is not in the client list for this product — confirm "
-            f"and add the CHED reference manually"
-        )
+        # Short on purpose: this text lands on the export line next to the
+        # product description, which must stay readable (operator feedback:
+        # a long prefix read as the description being "replaced").
+        flags.append("CHECK: N853/CHED-P may be required — not in client list")
     return docs, flags
