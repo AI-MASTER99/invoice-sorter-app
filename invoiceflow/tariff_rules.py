@@ -59,7 +59,7 @@ _N853_PREFIXES = frozenset({
 _FOOD_CHAPTER_MAX = 24
 
 
-def _norm_digits(code: str) -> str:
+def norm_digits(code: str) -> str:
     """Digits only, with a dropped leading zero restored.
 
     Commodity codes are even-length (6/8/10). Excel and the AI routinely
@@ -76,6 +76,33 @@ def _norm_digits(code: str) -> str:
     if len(digits) >= 5 and len(digits) % 2 == 1:
         digits = "0" + digits
     return digits
+
+
+_norm_digits = norm_digits          # internal alias (pre-existing callers)
+
+
+def split_commodity_code(code: str) -> tuple[str, str, bool]:
+    """Split a declared code into its two customs parts.
+
+    A commodity code is 8 digits of nomenclature (the HS/CN code) plus a
+    2-digit additional TARIC code — "0704901000" is 07049010 + 00. Customs
+    reads them as two boxes, so both the MultiFreight Items file and the
+    working sheet write them as two columns.
+
+    Returns (code8, taric, zero_assumed). `zero_assumed` reports a repaired
+    leading zero (see norm_digits); the repair is never silent — the caller
+    stamps a VERIFY marker on the line. Anything shorter than 8 digits after
+    the repair cannot be split (an internal SKU, a truncated entry): both
+    parts come back empty so the caller shows the value untouched.
+    """
+    raw = re.sub(r"\D", "", code or "")
+    digits = norm_digits(code)
+    zero_assumed = digits != raw
+    if len(digits) < 8:
+        return "", "", zero_assumed
+    # Every digit past the 8-digit code: a 10-digit code gives "00".."99",
+    # and a stray 11th digit stays visible rather than being trimmed away.
+    return digits[:8], digits[8:], zero_assumed
 
 
 def _chapter(code: str) -> int | None:

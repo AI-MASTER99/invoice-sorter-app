@@ -24,6 +24,36 @@ def test_y929_not_on_non_food():
     assert not tr.y929_applies("4")         # too short to derive a chapter
 
 
+# ── Splitting the declared code into its two customs parts ──────────────
+def test_split_commodity_code_separates_the_taric_suffix():
+    assert tr.split_commodity_code("2005998098") == ("20059980", "98", False)
+    assert tr.split_commodity_code("0704901000") == ("07049010", "00", False)
+
+
+def test_split_commodity_code_handles_an_8_digit_code():
+    # Nothing declared past the nomenclature code -> no TARIC part.
+    assert tr.split_commodity_code("07049010") == ("07049010", "", False)
+
+
+def test_split_commodity_code_reports_a_repaired_leading_zero():
+    # 7 digits: the chapter-01-09 zero drop. Split on the repair, and SAY so.
+    assert tr.split_commodity_code("4061030") == ("04061030", "", True)
+
+
+def test_split_commodity_code_refuses_what_is_not_a_code():
+    # An internal SKU must not be sliced into a plausible-looking code.
+    assert tr.split_commodity_code("22.289") == ("", "", True)
+    assert tr.split_commodity_code("852910") == ("", "", False)
+    assert tr.split_commodity_code("") == ("", "", False)
+
+
+def test_split_commodity_code_keeps_a_stray_extra_digit_visible():
+    # 11 digits is junk either way — but nothing is trimmed away silently.
+    code8, taric, assumed = tr.split_commodity_code("07049010000")
+    assert code8 + taric == tr.norm_digits("07049010000")
+    assert assumed is True
+
+
 # ── N853: animal-origin prefixes ────────────────────────────────────────
 def test_n853_required_for_animal_prefixes():
     assert tr.n853_required("02013000")     # 020 meat
