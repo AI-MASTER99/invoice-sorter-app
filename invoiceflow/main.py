@@ -1922,7 +1922,11 @@ _FONT_TOTALS = Font(name="Calibri", bold=True, color="FFFFFF",  size=10)
 # col: (width, number_format, h_align)
 _COL_CFG = [
     ("Invoice",             12,  "General", "left"),
-    ("Comm./imp. cod",      18,  "@",       "left"),
+    # The declared code, split into its two customs parts: 8 digits of
+    # nomenclature + the 2-digit additional TARIC code (operator request —
+    # the reviewer reads them as two boxes, as customs does).
+    ("Comm./imp. cod",      14,  "@",       "left"),
+    ("TARIC",                8,  "@",       "center"),
     ("Description of Goods",42,  "General", "left"),
     ("Origin",               8,  "General", "center"),
     ("Country",             12,  "General", "left"),
@@ -1960,8 +1964,16 @@ def build_excel(
     def _fmt_for(col_name: str, fmt: str) -> str:
         return value_fmt if col_name == "Value" else fmt
 
+    # Sheet geometry follows _COL_CFG — adding a column (e.g. TARIC) must
+    # not leave the title merge or the totals row pointing at stale letters.
+    _last_col = get_column_letter(len(_COL_CFG))
+    _numeric_cols = ("Number of Packages", "Gross Weight (KG)",
+                     "Net Weight (KG)", "Value")
+    _first_numeric = next(i for i, (n, *_ ) in enumerate(_COL_CFG, start=1)
+                          if n in _numeric_cols)
+
     # ── Row 1: merged title ───────────────────────────────────
-    ws.merge_cells("A1:I1")
+    ws.merge_cells(f"A1:{_last_col}1")
     # Build title from first data row
     inv_num  = rows[0].get("Invoice", "") if rows else ""
     date_str = datetime.now().strftime("%d/%m/%Y")
@@ -1991,13 +2003,30 @@ def build_excel(
         row_idx = data_start + data_i
         alt_fill = _FILL_ALT if (row_idx % 2 == 0) else None   # even = light blue, odd = white
         flags = flagged_cells[data_i] if data_i < len(flagged_cells) else set()
+        # The row carries ONE code ("0704901000"); the sheet shows its two
+        # customs parts. Too short to split (an SKU that slipped through) →
+        # the code column keeps the raw value and TARIC stays empty, so
+        # nothing is invented and nothing is hidden.
+        code8, taric, _zero_assumed = tariff_rules.split_commodity_code(
+            row.get("Comm./imp. cod", ""))
         for col_idx, (col_name, width, fmt, align) in enumerate(_COL_CFG, start=1):
             c   = ws.cell(row=row_idx, column=col_idx)
             raw = row.get(col_name, "") or ""
+            if col_name == "Comm./imp. cod":
+                raw = code8 or raw
+            elif col_name == "TARIC":
+                raw = taric
 
-            # Yellow = the two independent extractions disagreed on this
-            # cell — user should verify. Yellow wins over alt-row blue.
-            if col_name in flags:
+            # Yellow = verify this cell. Two things earn it: the two
+            # independent extractions disagreed, or the code needed a
+            # leading zero to be split at all (`zero_assumed` — the repair
+            # is a guess, so it is shown, never applied silently; review's
+            # odd-length-code issue explains it in the panel). A
+            # disagreement on the code flags BOTH of its parts.
+            _is_code_col = col_name in ("Comm./imp. cod", "TARIC")
+            if (col_name in flags
+                    or (col_name == "TARIC" and "Comm./imp. cod" in flags)
+                    or (_is_code_col and _zero_assumed)):
                 c.fill = _FILL_FLAG
             elif alt_fill:
                 c.fill = alt_fill
@@ -2015,7 +2044,8 @@ def build_excel(
 
     # ── Totals row ────────────────────────────────────────────
     total_row = data_end + 1
-    ws.merge_cells(f"A{total_row}:E{total_row}")
+    ws.merge_cells(f"A{total_row}:"
+                   f"{get_column_letter(_first_numeric - 1)}{total_row}")
     tc = ws.cell(row=total_row, column=1, value="TOTALS")
     tc.font      = _FONT_TOTALS
     tc.fill      = _FILL_TOTALS
@@ -2044,7 +2074,7 @@ def build_excel(
         return total
 
     for col_idx, (col_name, width, fmt, align) in enumerate(_COL_CFG, start=1):
-        if col_idx < 6:   # already merged
+        if col_idx < _first_numeric:   # already merged
             ws.cell(row=total_row, column=col_idx).fill = _FILL_TOTALS
             continue
         col_letter = get_column_letter(col_idx)
@@ -2276,18 +2306,18 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
         desc = (row.get("Description of Goods", "") or "").strip()
         if _is_fee_row(desc):
             continue          # fee/charge rows are not commodity item lines
-        digits = re.sub(r"\D", "", row.get("Comm./imp. cod", "") or "")
         # Restore a dropped leading zero (odd length ≥5) before splitting, so
         # chapter-01-09 codes classify correctly downstream (Y929/N853).
         # NEVER silent: `zero_assumed` puts a VERIFY marker on the line —
-        # the repair is a best guess the human must confirm.
-        zero_assumed = False
-        if len(digits) >= 5 and len(digits) % 2 == 1:
-            digits = "0" + digits
-            zero_assumed = True
-        c8 = digits[:8]
-        taric = digits[8:]  # all digits past the 8-digit code — a 9th digit
-                            # was silently dropped by the old digits[8:10] gate
+        # the repair is a best guess the human must confirm. `taric` is every
+        # digit past the 8-digit code — a 9th digit was silently dropped by
+        # the old digits[8:10] gate.
+        c8, taric, zero_assumed = tariff_rules.split_commodity_code(
+            row.get("Comm./imp. cod", ""))
+        if not c8:
+            # Too short to be a code (an SKU that slipped through): group on
+            # whatever digits there are, exactly as before.
+            c8 = tariff_rules.norm_digits(row.get("Comm./imp. cod", ""))
         origin = (row.get("Origin", "") or "").strip().upper()
         not_in_list = bool(row.get("_not_in_list")) or desc.startswith(review.NOT_IN_LIST_MARKER)
         product = desc.replace(review.NOT_IN_LIST_MARKER, "").strip() if not_in_list else desc
