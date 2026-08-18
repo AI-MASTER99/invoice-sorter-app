@@ -37,6 +37,27 @@ Open http://localhost:8000/login (user `admin` + your `APP_PASSWORD`).
 
 Tests: `python -m pytest tests_review.py tests_rate_limit.py -q`
 
+## Commodity-code lists (the "V-lookup")
+
+Each client's list lives in `client_products` and is loaded from a
+MultiFreight CDS "Items" export — the goods lines as they were accepted at
+the border. `invoiceflow/data/commodity_codes.csv` is that export folded to
+one row per (exporter REX, full code) by `invoiceflow/cds_list.py`.
+
+```bash
+# which REX numbers are in the list, and which already have a client
+python scripts/load_client_list.py --list
+
+# refresh the list of every client that exists in the DB (upsert, never deletes)
+python scripts/load_client_list.py
+
+# after a new export from MultiFreight
+python scripts/load_client_list.py --source "<CDS items export.csv>" --derive
+```
+
+`--help` covers loading a single client (`--rex`), giving one client every
+code in the file (`--client "<name>" --all-codes`), and `--dry-run`.
+
 ## Environment variables
 
 See `invoiceflow/.env.example` for the authoritative, commented list.
