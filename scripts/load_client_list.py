@@ -49,6 +49,11 @@ import database as db                 # noqa: E402
 # ── Config ───────────────────────────────────────────────────────────
 COMPANY_NAME = "Dornack"
 DERIVED_CSV = ROOT / "invoiceflow" / "data" / "commodity_codes.csv"
+# The hand-maintained per-client spreadsheets ("AI EURO CODE TARIC
+# DESCRIPTION.xlsx"), folded to the same shape. Their descriptions are the
+# operator's own wording, so they outrank the export's on a shared code;
+# codes only the export knows are still added.
+CURATED_CSV = ROOT / "invoiceflow" / "data" / "commodity_codes_curated.csv"
 
 # The first client, kept here so its identity (aliases/EORI) is restored on
 # every run — the REX is what the export and the invoice matcher agree on.
@@ -66,8 +71,10 @@ def parse_args():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--source", help="raw CDS Items export (CSV) to read instead "
                                     "of the committed list")
+    p.add_argument("--client-xlsx", help="a curated client list (.xlsx: code / "
+                                         "additional code / description); needs --rex")
     p.add_argument("--derive", action="store_true",
-                   help="rewrite invoiceflow/data/commodity_codes.csv from --source")
+                   help="rewrite the committed data/*.csv from --source / --client-xlsx")
     p.add_argument("--rex", help="load only this exporter REX")
     p.add_argument("--client", help="target client by name (with --all-codes, or "
                                     "to redirect a --rex group)")
@@ -84,21 +91,54 @@ def parse_args():
 
 
 def load_entries(args) -> list[dict]:
-    """The list rows: from a raw export when --source, else the committed CSV."""
+    """The list rows: the curated spreadsheets merged with the CDS export.
+
+    Both sources are committed as CSV, so a plain run needs no input files.
+    --source / --client-xlsx read a fresh export or spreadsheet instead, and
+    --derive rewrites the committed copy from it.
+    """
+    # ── The export (folded, or read fresh from --source) ──
     if args.source:
-        entries, stats = cds_list.parse_export(args.source)
+        export, stats = cds_list.parse_export(args.source)
         print(f"Read {stats['rows']} export lines "
               f"({stats['skipped_no_code']} without a usable code) -> "
               f"{stats['entries']} list entries, {stats['clients']} REX numbers.")
         if args.derive and not args.dry_run:
-            cds_list.write_derived(entries, DERIVED_CSV)
+            cds_list.write_derived(export, DERIVED_CSV)
             print(f"Wrote {DERIVED_CSV.relative_to(ROOT)}")
-        return entries
-    if not DERIVED_CSV.exists():
-        raise SystemExit(f"{DERIVED_CSV} not found — pass --source <export.csv>")
-    entries = cds_list.read_derived(DERIVED_CSV)
-    print(f"Read {len(entries)} list entries from "
-          f"{DERIVED_CSV.relative_to(ROOT)}")
+    elif DERIVED_CSV.exists():
+        export = cds_list.read_derived(DERIVED_CSV)
+        print(f"{len(export):5d} entries from {DERIVED_CSV.name} (CDS export)")
+    else:
+        export = []
+
+    # ── The curated spreadsheets ──
+    if args.client_xlsx:
+        if not args.rex:
+            raise SystemExit("--client-xlsx needs --rex <REX> (whose list is it?)")
+        curated = cds_list.read_client_xlsx(args.client_xlsx, rex=args.rex)
+        print(f"{len(curated):5d} entries from {Path(args.client_xlsx).name}")
+        if args.derive and not args.dry_run:
+            # Replace only this REX's rows; every other client's stay.
+            kept = [e for e in (cds_list.read_derived(CURATED_CSV)
+                                if CURATED_CSV.exists() else [])
+                    if e["rex"] != args.rex.strip().upper()]
+            cds_list.write_derived(
+                sorted(kept + curated, key=lambda e: (e["rex"], e["full_code"])),
+                CURATED_CSV)
+            print(f"Wrote {CURATED_CSV.relative_to(ROOT)}")
+    elif CURATED_CSV.exists():
+        curated = cds_list.read_derived(CURATED_CSV)
+        print(f"{len(curated):5d} entries from {CURATED_CSV.name} (curated lists)")
+    else:
+        curated = []
+
+    if not export and not curated:
+        raise SystemExit(f"No list found — pass --source <export.csv> or "
+                         f"--client-xlsx <list.xlsx> --rex <REX>")
+    entries = cds_list.merge_lists(curated, export)
+    print(f"{len(entries):5d} entries after merging "
+          f"(curated descriptions win on a shared code)")
     return entries
 
 

@@ -171,6 +171,79 @@ def test_derived_round_trip(tmp_path):
     assert back == [{**e, "lines": e["lines"]} for e in entries]
 
 
+# ── The curated spreadsheet, and merging it with the export ─────────────
+def _xlsx(tmp_path, rows, name="list.xlsx"):
+    import openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["Commodity Code", "Additional Code", "Description"])
+    for r in rows:
+        ws.append(list(r))
+    path = tmp_path / name
+    wb.save(path)
+    return path
+
+
+def test_read_client_xlsx_reads_code_additional_code_description(tmp_path):
+    path = _xlsx(tmp_path, [("04061030", 90, "MOZZARELLA CHEESE"),
+                            ("07031019", "00", "ONIONS")])
+    entries = cl.read_client_xlsx(path, rex="ITREX1")
+    assert [(e["general_code"], e["full_code"], e["taric_code"], e["description"])
+            for e in entries] == [
+        ("04061030", "0406103090", "90", "MOZZARELLA CHEESE"),
+        ("07031019", "0703101900", "00", "ONIONS"),
+    ]
+    assert all(e["rex"] == "ITREX1" for e in entries)
+
+
+def test_read_client_xlsx_defaults_a_missing_additional_code_to_00(tmp_path):
+    path = _xlsx(tmp_path, [("07032000", None, "GARLIC")])
+    assert cl.read_client_xlsx(path)[0]["full_code"] == "0703200000"
+
+
+def test_read_client_xlsx_skips_rows_that_cannot_be_a_list_row(tmp_path):
+    path = _xlsx(tmp_path, [
+        ("04061030", 90, "MOZZARELLA CHEESE"),
+        ("852910", "00", "ELEVATOR MATERIAL"),   # 6-digit stub
+        ("07032000", "00", ""),                  # no description
+        (None, None, None),                      # blank row
+        ("04061030", 90, "DUPLICATE"),           # same code twice
+    ])
+    entries = cl.read_client_xlsx(path)
+    assert [e["full_code"] for e in entries] == ["0406103090"]
+    assert entries[0]["description"] == "MOZZARELLA CHEESE"
+
+
+def test_merge_lists_keeps_the_curated_description():
+    curated = [{"rex": "ITREX1", "general_code": "04061030",
+                "full_code": "0406103090", "taric_code": "90",
+                "description": "MOZZARELLA CHEESE", "lines": 0, "last_used": ""}]
+    export = [{"rex": "ITREX1", "general_code": "04061030",
+               "full_code": "0406103090", "taric_code": "90",
+               "description": "CHEESE", "lines": 32, "last_used": "2026-08-09"},
+              {"rex": "ITREX1", "general_code": "07032000",
+               "full_code": "0703200000", "taric_code": "00",
+               "description": "GARLIC", "lines": 7, "last_used": "2026-06-21"}]
+    merged = cl.merge_lists(curated, export)
+    assert [e["full_code"] for e in merged] == ["0406103090", "0703200000"]
+    # curated wording survives, but it inherits the export's provenance
+    assert merged[0]["description"] == "MOZZARELLA CHEESE"
+    assert merged[0]["lines"] == 32 and merged[0]["last_used"] == "2026-08-09"
+    # a code only the export knows is added, never dropped
+    assert merged[1]["description"] == "GARLIC"
+
+
+def test_merge_lists_keeps_the_clients_apart():
+    curated = [{"rex": "ITREX1", "general_code": "04061030",
+                "full_code": "0406103090", "description": "MOZZARELLA CHEESE"}]
+    export = [{"rex": "BEREX2", "general_code": "04061030",
+               "full_code": "0406103090", "description": "CHEESE"}]
+    merged = cl.merge_lists(curated, export)
+    assert len(merged) == 2
+    assert {e["rex"]: e["description"] for e in merged} == {
+        "ITREX1": "MOZZARELLA CHEESE", "BEREX2": "CHEESE"}
+
+
 def test_product_payload_is_the_client_products_columns():
     entry = {"general_code": "07049010", "full_code": "0704901000",
              "taric_code": "00", "description": "CABBAGE", "lines": 3,

@@ -39,10 +39,17 @@ Tests: `python -m pytest tests_review.py tests_rate_limit.py -q`
 
 ## Commodity-code lists (the "V-lookup")
 
-Each client's list lives in `client_products` and is loaded from a
-MultiFreight CDS "Items" export — the goods lines as they were accepted at
-the border. `invoiceflow/data/commodity_codes.csv` is that export folded to
-one row per (exporter REX, full code) by `invoiceflow/cds_list.py`.
+Each client's list lives in `client_products` and is loaded from two
+sources, merged by `invoiceflow/cds_list.py`:
+
+| File | Source | Role |
+|------|--------|------|
+| `invoiceflow/data/commodity_codes.csv` | MultiFreight CDS "Items" export | every code actually declared, folded to one row per (exporter REX, full code) |
+| `invoiceflow/data/commodity_codes_curated.csv` | the hand-kept per-client spreadsheets (`AI EURO CODE TARIC DESCRIPTION.xlsx`) | the operator's own wording |
+
+On a code both know, the curated description wins ("MOZZARELLA CHEESE", not
+"CHEESE"); codes only the export knows are added. Loading only ever upserts
+— no list row is deleted.
 
 ```bash
 # which REX numbers are in the list, and which already have a client
@@ -53,6 +60,9 @@ python scripts/load_client_list.py
 
 # after a new export from MultiFreight
 python scripts/load_client_list.py --source "<CDS items export.csv>" --derive
+
+# after updating a client's spreadsheet
+python scripts/load_client_list.py --client-xlsx "<list.xlsx>" --rex <REX> --derive
 ```
 
 `--help` covers loading a single client (`--rex`), giving one client every

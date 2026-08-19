@@ -218,6 +218,70 @@ def parse_export(source) -> tuple[list[dict], dict]:
     return build_list(read_export(source))
 
 
+# ── The curated per-client spreadsheet (the second source) ──────────────
+# Layout of "AI EURO CODE TARIC DESCRIPTION.xlsx": A = 8-digit code,
+# B = the 2-digit additional (TARIC) code, C = the description. One sheet,
+# one header row. These lists are maintained by hand per client, so their
+# wording is the one the operator wants on the declaration — the loader
+# lets it win over a description folded out of the export.
+def read_client_xlsx(path, rex: str = "", sheet: str = "") -> list[dict]:
+    """Read a curated client list into the same entry shape as the export.
+
+    Rows without a full 8-digit code or without a description are skipped —
+    a list row that cannot be looked up, or that would write an empty
+    description onto a customs line, is not a list row.
+    """
+    import openpyxl                      # only needed for this path
+    wb = openpyxl.load_workbook(path, data_only=True)
+    ws = wb[sheet] if sheet else wb.worksheets[0]
+    entries, seen = [], set()
+    for i, row in enumerate(ws.iter_rows(values_only=True)):
+        if i == 0 or not row or row[0] in (None, ""):
+            continue                     # header / blank
+        general = re.sub(r"\D", "", str(row[0]))
+        if len(general) == 7:
+            general = "0" + general       # the chapter-01-09 zero drop
+        taric = re.sub(r"\D", "", str(row[1])) if len(row) > 1 and row[1] not in (None, "") else ""
+        desc = clean_description(row[2] if len(row) > 2 else "")
+        full = general + (taric.zfill(2) if taric else "00")
+        if len(general) != 8 or not desc or full in seen:
+            continue
+        seen.add(full)
+        entries.append({
+            "rex": rex.strip().upper(),
+            "general_code": general,
+            "full_code": full,
+            "taric_code": full[8:10],
+            "description": desc,
+            "origin": "", "preference": "", "procedure": "",
+            "lines": 0, "last_used": "",
+        })
+    entries.sort(key=lambda e: e["full_code"])
+    return entries
+
+
+def merge_lists(preferred: list[dict], extra: list[dict]) -> list[dict]:
+    """Merge two lists on (REX, full code); `preferred` keeps its description.
+
+    The curated spreadsheet is the operator's own wording ("MOZZARELLA
+    CHEESE"), so it outranks the wording folded out of the export
+    ("CHEESE"). Codes only the export knows are added, never dropped —
+    that is the point of running both sources.
+    """
+    out = {(e["rex"], e["full_code"]): dict(e) for e in preferred}
+    for e in extra:
+        key = (e["rex"], e["full_code"])
+        if key in out:
+            # Keep the curated description; take the export's provenance so
+            # the operator can still see how often the code was declared.
+            for field in ("origin", "preference", "procedure", "lines", "last_used"):
+                if not out[key].get(field):
+                    out[key][field] = e.get(field, "")
+        else:
+            out[key] = dict(e)
+    return sorted(out.values(), key=lambda e: (e["rex"], e["full_code"]))
+
+
 # ── The derived list, as committed to the repo ──────────────────────────
 DERIVED_COLUMNS = ["rex", "general_code", "full_code", "taric_code",
                    "description", "origin", "preference", "procedure",
