@@ -1,12 +1,13 @@
-"""Turn a MultiFreight CDS "Items" export into client commodity-code lists.
+"""Turn a MultiFreight CDS "Items" export into the commodity-code list.
 
-The V-lookup lists (`client_products`) used to be typed by hand or loaded
-from a per-client spreadsheet. A CDS Items export is the same information
-straight from the source: every goods line MultiFreight has declared,
-carrying the commodity code as it was actually accepted at the border.
+The V-lookup list (`commodity_codes`, formerly the per-client
+`client_products`) used to be typed by hand or loaded from a spreadsheet.
+A CDS Items export is the same information straight from the source: every
+goods line MultiFreight has declared, carrying the commodity code as it was
+actually accepted at the border.
 
 This module is pure parsing — no DB, no network — so it can be tested and
-re-run over any future export. `scripts/load_client_list.py` does the
+re-run over any future export. `scripts/load_commodity_list.py` does the
 upserting.
 
 Shape of the export (60 columns, one row per goods line, CP1252):
@@ -24,9 +25,10 @@ Two columns carry the list:
 The client a line belongs to is NOT in the export (every Exporter/Seller/
 Buyer column is empty). The one identifier present is the exporter's REX
 in the U116 proof-of-origin document — the same identifier the app already
-matches clients on (`db.find_client_by_identity`). Lines with no U116 (a
-non-EU origin claims no preference) are grouped under REX "" and are only
-loadable with an explicit client choice.
+matches clients on (`db.find_client_by_identity`). The list itself is now
+company-wide (shared by all clients), so the REX only feeds the clients
+registry; lines with no U116 (a non-EU origin claims no preference) are
+grouped under REX "" and load like any other.
 
 Run: python -m pytest tests_cds_list.py -q
 """
@@ -154,14 +156,14 @@ def build_list(rows: list[dict]) -> tuple[list[dict], dict]:
     """Fold export rows into list entries, one per (REX, full code).
 
     Returns (entries, stats). Each entry is ready for
-    `db.upsert_client_product` once a client_id is known:
+    `db.upsert_commodity_code` (after `merge_by_code` folds the REX groups):
 
         {rex, general_code, full_code, taric_code, description,
          origin, preference, procedure, lines, last_used}
 
     `lines` and `last_used` are provenance for the operator's review — how
     many declared goods lines back this code and when it was last used —
-    not columns of `client_products`.
+    not columns of `commodity_codes`.
     """
     descs: dict[tuple[str, str], Counter] = defaultdict(Counter)
     meta: dict[tuple[str, str], dict] = {}
@@ -253,9 +255,9 @@ def group_by_rex(entries: list[dict]) -> dict[str, list[dict]]:
 def merge_by_code(entries: list[dict]) -> list[dict]:
     """Collapse entries from several REX groups into one list per full code.
 
-    Used when a single client takes the whole file (--all-codes): the same
-    code can appear under many exporters, and a client's list holds one row
-    per code. The wording backed by the most declared lines wins.
+    The company-wide list holds one row per code, but the same code can
+    appear under many exporters in the export. The wording backed by the
+    most declared lines wins.
     """
     best: dict[str, dict] = {}
     for e in entries:
@@ -270,7 +272,7 @@ def merge_by_code(entries: list[dict]) -> list[dict]:
 
 
 def product_payload(entry: dict) -> dict:
-    """The `client_products` columns for one entry (provenance dropped)."""
+    """The `commodity_codes` columns for one entry (provenance dropped)."""
     return {
         "general_code": entry["general_code"],
         "full_code": entry["full_code"],

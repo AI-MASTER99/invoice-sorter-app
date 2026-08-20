@@ -62,9 +62,13 @@
         <span class="icon">🔍</span>
         <span>UK Tariff lookup</span>
       </div>
-      <div class="nav-item" data-page="clients">
+      <div class="nav-item" data-page="codes">
         <span class="icon">📋</span>
-        <span>Client lists</span>
+        <span>Commodity codes</span>
+      </div>
+      <div class="nav-item" data-page="clients">
+        <span class="icon">👥</span>
+        <span>Clients / REX</span>
       </div>
       <div class="nav-item" data-page="settings">
         <span class="icon">⚙</span>
@@ -292,18 +296,45 @@
     </main>
 
     <!-- ══════════════════════════════
-         PAGE: CLIENT LISTS (V-lookup)
+         PAGE: COMMODITY CODES (the shared V-lookup)
+    ══════════════════════════════ -->
+    <main class="content page-content hidden" id="page-codes">
+
+      <div class="card">
+        <div class="section-title" style="margin-bottom:4px">
+          Commodity codes
+          <span id="codes-count" style="color:var(--muted);font-size:13px;margin-left:6px"></span>
+        </div>
+        <div style="color:var(--muted);font-size:12px;margin-bottom:12px">
+          One company-wide list used for every client: the full 10-digit commodity code
+          + the list description. The 8-digit part is the lookup key; the last 2 digits
+          fill the TARIC column. Saving an existing code updates its description.
+        </div>
+        <div class="add-user-fields">
+          <input class="settings-input" id="code-new-code" type="text" placeholder="Full code (8-10 digits, e.g. 0704901000)" maxlength="12" aria-label="Full commodity code" />
+          <input class="settings-input" id="code-new-desc" type="text" placeholder="Description (as it must appear on the export)" aria-label="Code description" />
+          <button class="btn-save-user" id="btn-code-add">＋ Add / update</button>
+        </div>
+        <div class="settings-msg hidden" id="codes-msg"></div>
+        <input class="memory-search" id="code-search" type="text" placeholder="Search the list…" aria-label="Search commodity codes" style="margin-top:12px" />
+        <div id="codes-list" style="margin-top:8px"></div>
+      </div>
+
+    </main><!-- /page-codes -->
+
+    <!-- ══════════════════════════════
+         PAGE: CLIENTS / REX registry
     ══════════════════════════════ -->
     <main class="content page-content hidden" id="page-clients">
 
-      <!-- Client list -->
-      <div class="card" style="margin-bottom:16px">
+      <div class="card">
         <div class="memory-header" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
           <div>
             <div class="section-title">Clients <span id="clients-count" style="color:var(--muted);font-size:13px;margin-left:6px"></span></div>
             <div style="color:var(--muted);font-size:12px;margin-top:4px">
-              Suppliers and their commodity-code lists (the V-lookup). Invoices from a
-              matched client fill the export from that client's list.
+              Every client with their REX number (EU Registered Exporter) and EORI.
+              Invoices are matched to a client by REX, EORI or name; the stored REX
+              fills the export when the invoice doesn't carry one.
             </div>
           </div>
         </div>
@@ -315,27 +346,6 @@
         </div>
         <div class="settings-msg hidden" id="clients-msg"></div>
         <div id="clients-list" style="margin-top:12px"></div>
-      </div>
-
-      <!-- Selected client's products -->
-      <div class="card hidden" id="client-products-card">
-        <div class="section-title" style="margin-bottom:4px">
-          Product list — <span id="client-products-title"></span>
-          <span id="client-products-count" style="color:var(--muted);font-size:13px;margin-left:6px"></span>
-        </div>
-        <div style="color:var(--muted);font-size:12px;margin-bottom:12px">
-          One row per product: the full 10-digit commodity code + the list description.
-          The 8-digit part is the lookup key; the last 2 digits fill the TARIC column.
-          Saving an existing code updates its description.
-        </div>
-        <div class="add-user-fields">
-          <input class="settings-input" id="product-new-code" type="text" placeholder="Full code (8-10 digits, e.g. 0704901000)" maxlength="12" aria-label="Full commodity code" />
-          <input class="settings-input" id="product-new-desc" type="text" placeholder="Description (as it must appear on the export)" aria-label="Product description" />
-          <button class="btn-save-user" id="btn-product-add">＋ Add / update</button>
-        </div>
-        <div class="settings-msg hidden" id="products-msg"></div>
-        <input class="memory-search" id="product-search" type="text" placeholder="Search this list…" aria-label="Search products" style="margin-top:12px" />
-        <div id="client-products-list" style="margin-top:8px"></div>
       </div>
 
     </main><!-- /page-clients -->
@@ -503,6 +513,6 @@
 <!-- TOAST CONTAINER -->
 <div id="toast-container"></div>
 
-<script src="/app.js?v=15"></script>
+<script src="/app.js?v=16"></script>
 </body>
 </html>

@@ -97,9 +97,11 @@ const ACTIONS = {
   'job-retry':      d => retryFailedJob(d.id),
   'job-dismiss':    d => dismissFailedJob(d.id),
   'job-cancel':     d => cancelJob(d.id),
-  'client-open':    d => openClientProducts(d.id, d.name || ''),
+  'client-edit':    d => startClientEdit(d.id),
+  'client-save':    d => saveClientEdit(d.id),
+  'client-cancel':  () => cancelClientEdit(),
   'client-del':     d => deleteClient(d.id, d.name || ''),
-  'product-del':    d => deleteClientProduct(d.id, d.desc || ''),
+  'code-del':       d => deleteCommodityCode(d.id, d.desc || ''),
 };
 
 document.addEventListener('click', (e) => {
@@ -151,7 +153,8 @@ function navigateTo(page) {
     invoices:  'Invoices',
     memory:    'Product Memory',
     tariff:    'UK Tariff Lookup',
-    clients:   'Client Lists',
+    codes:     'Commodity codes',
+    clients:   'Clients / REX',
     settings:  'Settings',
     admin:     'Admin panel',
   };
@@ -159,6 +162,7 @@ function navigateTo(page) {
 
   if (page === 'invoices') refreshInvoicesPage();
   if (page === 'memory')   refreshMemoryPage();
+  if (page === 'codes')    refreshCodesPage();
   if (page === 'clients')  refreshClientsPage();
   if (page === 'settings') refreshSettingsPage();
   if (page === 'admin')    refreshAdminPage();
@@ -788,78 +792,29 @@ function copyCode(code) {
   navigator.clipboard.writeText(code).then(() => toast(`Copied ${code}`, 'success'));
 }
 
-/* ── Client lists (V-lookup editor) ───────────────────────── */
-let _selectedClient = null;   // {id, name} of the open product list
-let _clientProducts = [];     // cache for the search filter
-let _prodSeq = 0;             // stale-render guard for the products fetch
+/* ── Commodity codes (the shared V-lookup editor) ─────────── */
+let _commodityCodes = [];     // cache for the search filter
 
-async function refreshClientsPage() {
-  const box = document.getElementById('clients-list');
+async function refreshCodesPage() {
+  const box = document.getElementById('codes-list');
   try {
-    const clients = await api('GET', '/api/clients');
-    document.getElementById('clients-count').textContent =
-      clients.length ? `(${clients.length})` : '';
-    if (!clients.length) {
-      box.innerHTML = '<div class="empty-state" style="padding:24px 0"><div class="empty-icon">📋</div>No clients yet. Add your first supplier above.</div>';
-      return;
-    }
-    box.innerHTML = `
-      <table class="memory-table">
-        <thead><tr><th>Client</th><th>REX</th><th>EORI</th><th>Products</th><th></th></tr></thead>
-        <tbody>
-          ${clients.map(c => `
-            <tr${_selectedClient && _selectedClient.id === c.id ? ' style="background:var(--bg-hover, rgba(0,0,0,0.04))"' : ''}>
-              <td><strong>${escHtml(c.name)}</strong></td>
-              <td><span class="code-mono">${escHtml(c.rex || '—')}</span></td>
-              <td><span class="code-mono">${escHtml(c.eori || '—')}</span></td>
-              <td>${c.product_count}</td>
-              <td style="text-align:right">
-                <div style="display:flex;gap:6px;justify-content:flex-end">
-                  <button class="btn-export btn-review" data-action="client-open" data-id="${escHtml(c.id)}" data-name="${escHtml(c.name)}">📂 Open list</button>
-                  <button class="btn-export btn-retry" data-action="client-del" data-id="${escHtml(c.id)}" data-name="${escHtml(c.name)}">Delete</button>
-                </div>
-              </td>
-            </tr>`).join('')}
-        </tbody>
-      </table>`;
+    _commodityCodes = await api('GET', '/api/commodity-codes');
+    renderCommodityCodes();
   } catch (e) {
-    box.innerHTML = `<div style="color:var(--red);font-size:13px">Could not load clients: ${escHtml(e.message)}</div>`;
+    box.innerHTML = `<div style="color:var(--red);font-size:13px">Could not load the list: ${escHtml(e.message)}</div>`;
   }
 }
 
-async function openClientProducts(clientId, clientName) {
-  _selectedClient = { id: clientId, name: clientName };
-  document.getElementById('client-products-title').textContent = clientName;
-  document.getElementById('client-products-card').classList.remove('hidden');
-  document.getElementById('product-search').value = '';
-  await loadClientProducts();
-  refreshClientsPage();   // repaint selection highlight
-}
-
-async function loadClientProducts() {
-  if (!_selectedClient) return;
-  const seq = ++_prodSeq;
-  const box = document.getElementById('client-products-list');
-  try {
-    const rows = await api('GET', `/api/clients/${_selectedClient.id}/products`);
-    if (seq !== _prodSeq) return;   // a newer client was opened — drop stale rows
-    _clientProducts = rows;
-    renderClientProducts();
-  } catch (e) {
-    box.innerHTML = `<div style="color:var(--red);font-size:13px">Could not load products: ${escHtml(e.message)}</div>`;
-  }
-}
-
-function renderClientProducts() {
-  const box = document.getElementById('client-products-list');
-  const q = (document.getElementById('product-search').value || '').toLowerCase();
-  const items = _clientProducts.filter(p =>
+function renderCommodityCodes() {
+  const box = document.getElementById('codes-list');
+  const q = (document.getElementById('code-search').value || '').toLowerCase();
+  const items = _commodityCodes.filter(p =>
     !q || (p.description || '').toLowerCase().includes(q)
        || (p.full_code || '').includes(q));
-  document.getElementById('client-products-count').textContent =
-    `(${items.length}${q ? ` of ${_clientProducts.length}` : ''})`;
+  document.getElementById('codes-count').textContent =
+    `(${items.length}${q ? ` of ${_commodityCodes.length}` : ''})`;
   if (!items.length) {
-    box.innerHTML = `<div class="empty-state" style="padding:24px 0">${q ? 'No matches.' : 'This list is empty — add the first product above.'}</div>`;
+    box.innerHTML = `<div class="empty-state" style="padding:24px 0">${q ? 'No matches.' : 'The list is empty — add the first code above.'}</div>`;
     return;
   }
   box.innerHTML = `
@@ -873,7 +828,7 @@ function renderClientProducts() {
             <td><span class="code-mono">${escHtml(p.full_code)}</span></td>
             <td>${escHtml(p.description || '')}</td>
             <td style="text-align:right">
-              <button class="btn-delete" title="Remove from list" data-action="product-del" data-id="${escHtml(p.id)}" data-desc="${escHtml(p.description || p.full_code)}">🗑</button>
+              <button class="btn-delete" title="Remove from the list" data-action="code-del" data-id="${escHtml(p.id)}" data-desc="${escHtml(p.description || p.full_code)}">🗑</button>
             </td>
           </tr>`).join('')}
       </tbody>
@@ -885,6 +840,122 @@ function _clientsMsg(elId, text, ok) {
   msg.textContent = text;
   msg.className = `settings-msg ${ok ? 'success' : 'error'} show`;
   setTimeout(() => msg.classList.remove('show'), 5000);
+}
+
+document.getElementById('btn-code-add')?.addEventListener('click', async () => {
+  const full_code = document.getElementById('code-new-code').value.trim();
+  const description = document.getElementById('code-new-desc').value.trim();
+  if (!full_code || !description) {
+    _clientsMsg('codes-msg', 'Both the full code and the description are required.', false);
+    return;
+  }
+  try {
+    await api('POST', '/api/commodity-codes', { full_code, description });
+    _clientsMsg('codes-msg', '✓ Saved.', true);
+    document.getElementById('code-new-code').value = '';
+    document.getElementById('code-new-desc').value = '';
+    await refreshCodesPage();
+  } catch (e) { _clientsMsg('codes-msg', 'Error: ' + e.message, false); }
+});
+
+async function deleteCommodityCode(codeId, desc) {
+  if (!confirm(`Remove "${desc}" from the commodity-code list?\n\nEvery client uses this list — the code stops matching for all of them.`)) return;
+  try {
+    await api('DELETE', `/api/commodity-codes/${codeId}`);
+    toast('Removed from the list', 'success');
+    await refreshCodesPage();
+  } catch (e) { toast('Delete failed: ' + e.message, 'error'); }
+}
+
+document.getElementById('code-search')?.addEventListener('input', renderCommodityCodes);
+
+/* ── Clients / REX registry ───────────────────────────────── */
+let _clients = [];            // cache so edit mode re-renders without a refetch
+let _editingClientId = null;  // row currently in edit mode
+
+async function refreshClientsPage() {
+  const box = document.getElementById('clients-list');
+  try {
+    _clients = await api('GET', '/api/clients');
+    renderClients();
+  } catch (e) {
+    box.innerHTML = `<div style="color:var(--red);font-size:13px">Could not load clients: ${escHtml(e.message)}</div>`;
+  }
+}
+
+function renderClients() {
+  const box = document.getElementById('clients-list');
+  document.getElementById('clients-count').textContent =
+    _clients.length ? `(${_clients.length})` : '';
+  if (!_clients.length) {
+    box.innerHTML = '<div class="empty-state" style="padding:24px 0"><div class="empty-icon">👥</div>No clients yet. Add your first supplier above.</div>';
+    return;
+  }
+  box.innerHTML = `
+    <table class="memory-table">
+      <thead><tr><th>Client</th><th>REX</th><th>EORI</th><th></th></tr></thead>
+      <tbody>
+        ${_clients.map(c => _editingClientId === c.id ? clientEditRow(c) : clientRow(c)).join('')}
+      </tbody>
+    </table>`;
+}
+
+function clientRow(c) {
+  // Deleting a client is admin-only server-side; hide the button from users.
+  const del = currentRole !== 'user'
+    ? `<button class="btn-export btn-retry" data-action="client-del" data-id="${escHtml(c.id)}" data-name="${escHtml(c.name)}">Delete</button>`
+    : '';
+  return `
+    <tr>
+      <td><strong>${escHtml(c.name)}</strong></td>
+      <td><span class="code-mono">${escHtml(c.rex || '—')}</span></td>
+      <td><span class="code-mono">${escHtml(c.eori || '—')}</span></td>
+      <td style="text-align:right">
+        <div style="display:flex;gap:6px;justify-content:flex-end">
+          <button class="btn-export btn-review" data-action="client-edit" data-id="${escHtml(c.id)}">✏️ Edit</button>
+          ${del}
+        </div>
+      </td>
+    </tr>`;
+}
+
+function clientEditRow(c) {
+  // escHtml is safe in attribute values (quotes are escaped) — see its note.
+  return `
+    <tr>
+      <td><input class="settings-input" id="client-edit-name" type="text" value="${escHtml(c.name)}" aria-label="Client name" /></td>
+      <td><input class="settings-input" id="client-edit-rex" type="text" value="${escHtml(c.rex || '')}" placeholder="REX (e.g. ITREXIT0616…)" aria-label="REX number" /></td>
+      <td><input class="settings-input" id="client-edit-eori" type="text" value="${escHtml(c.eori || '')}" placeholder="EORI" aria-label="EORI number" /></td>
+      <td style="text-align:right">
+        <div style="display:flex;gap:6px;justify-content:flex-end">
+          <button class="btn-export btn-full" data-action="client-save" data-id="${escHtml(c.id)}">Save</button>
+          <button class="btn-export btn-raw" data-action="client-cancel">Cancel</button>
+        </div>
+      </td>
+    </tr>`;
+}
+
+function startClientEdit(clientId) {
+  _editingClientId = clientId;
+  renderClients();
+}
+
+function cancelClientEdit() {
+  _editingClientId = null;
+  renderClients();
+}
+
+async function saveClientEdit(clientId) {
+  const name = document.getElementById('client-edit-name').value.trim();
+  const rex  = document.getElementById('client-edit-rex').value.trim();
+  const eori = document.getElementById('client-edit-eori').value.trim();
+  if (!name) { _clientsMsg('clients-msg', 'Client name is required.', false); return; }
+  try {
+    await api('PUT', `/api/clients/${clientId}`, { name, rex, eori });
+    _editingClientId = null;
+    toast('Client updated', 'success');
+    await refreshClientsPage();
+  } catch (e) { _clientsMsg('clients-msg', 'Error: ' + e.message, false); }
 }
 
 document.getElementById('btn-client-add')?.addEventListener('click', async () => {
@@ -903,48 +974,14 @@ document.getElementById('btn-client-add')?.addEventListener('click', async () =>
 });
 
 async function deleteClient(clientId, name) {
-  if (!confirm(`Delete client "${name}" and their ENTIRE product list?\n\nInvoices from this supplier will no longer match a list (rows get flagged NOT IN LIST).`)) return;
+  if (!confirm(`Delete client "${name}" from the registry?\n\nInvoices from this supplier will no longer match a client, so exports lose the stored REX fallback.`)) return;
   try {
     await api('DELETE', `/api/clients/${clientId}`);
     toast(`Deleted ${name}`, 'success');
-    if (_selectedClient && _selectedClient.id === clientId) {
-      _selectedClient = null;
-      document.getElementById('client-products-card').classList.add('hidden');
-    }
+    if (_editingClientId === clientId) _editingClientId = null;
     refreshClientsPage();
   } catch (e) { toast('Delete failed: ' + e.message, 'error'); }
 }
-
-document.getElementById('btn-product-add')?.addEventListener('click', async () => {
-  if (!_selectedClient) return;
-  const full_code = document.getElementById('product-new-code').value.trim();
-  const description = document.getElementById('product-new-desc').value.trim();
-  if (!full_code || !description) {
-    _clientsMsg('products-msg', 'Both the full code and the description are required.', false);
-    return;
-  }
-  try {
-    await api('POST', `/api/clients/${_selectedClient.id}/products`, { full_code, description });
-    _clientsMsg('products-msg', '✓ Saved.', true);
-    document.getElementById('product-new-code').value = '';
-    document.getElementById('product-new-desc').value = '';
-    await loadClientProducts();
-    refreshClientsPage();   // product count changed
-  } catch (e) { _clientsMsg('products-msg', 'Error: ' + e.message, false); }
-});
-
-async function deleteClientProduct(productId, desc) {
-  if (!_selectedClient) return;
-  if (!confirm(`Remove "${desc}" from ${_selectedClient.name}'s list?`)) return;
-  try {
-    await api('DELETE', `/api/clients/${_selectedClient.id}/products/${productId}`);
-    toast('Removed from list', 'success');
-    await loadClientProducts();
-    refreshClientsPage();
-  } catch (e) { toast('Delete failed: ' + e.message, 'error'); }
-}
-
-document.getElementById('product-search')?.addEventListener('input', renderClientProducts);
 
 /* ── Settings page ────────────────────────────────────────── */
 async function refreshSettingsPage() {

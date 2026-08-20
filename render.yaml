@@ -41,18 +41,19 @@ services:
         value: claude-opus-4-8
       - key: AI_MODEL_LIGHT
         value: claude-sonnet-4-6
-      # Turn ON the per-client commodity-code list (the "V-lookup"): export
-      # columns come from the matched client's product list (list description,
-      # full 10-digit code + TARIC, CDS docs); products not in the list are
-      # flagged NOT-IN-LIST. Without it the app silently falls back to raw
-      # invoice data (8-digit codes, no TARIC).
+      # Turn ON the company-wide commodity-code list (the "V-lookup", shared
+      # by every client): export columns come from the list (list description,
+      # full 10-digit code + TARIC, CDS docs); codes not in the list are
+      # flagged NOT-IN-LIST. Without it — or while the list is empty — the
+      # app silently falls back to raw invoice data (8-digit codes, no TARIC).
+      # Name kept from the per-client era for deployment continuity.
       - key: USE_CLIENT_LIST
         value: "1"
       # Storage retention: a daily purge deletes upload/export files older
       # than this many days so the buckets never blow the free-tier quota
       # again (they filled to 20 GB → project restricted → app down). The
-      # per-client V-lookup lists live in Postgres and are never touched.
-      # 0 disables the purge.
+      # commodity-code list and clients registry live in Postgres and are
+      # never touched. 0 disables the purge.
       - key: STORAGE_RETENTION_DAYS
         value: "7"
     autoDeploy: true

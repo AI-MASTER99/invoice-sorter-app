@@ -126,17 +126,21 @@ if os.environ.get("AI_MODEL"):
     AI_MODEL_PRIMARY = os.environ["AI_MODEL"]
     AI_MODEL_LIGHT   = os.environ["AI_MODEL"]
 
-# Feature flag: source commodity sub-codes from the per-client list in the DB
-# instead of the gov.uk trade-tariff website. Off by default → unchanged
-# behaviour; flip to 1 in .env to use the client lists (Spoor C).
+# Feature flag: source commodity sub-codes from the company-wide commodity
+# list in the DB (commodity_codes table — shared by all clients) instead of
+# the gov.uk trade-tariff website. Off by default → unchanged behaviour;
+# flip to 1 in .env to use the list (Spoor C). Name kept from the per-client
+# era for deployment continuity. A company whose list is still empty falls
+# back to the gov.uk path even when the flag is on.
 USE_CLIENT_LIST = os.environ.get("USE_CLIENT_LIST") == "1"
 
 # Storage retention: the per-invoice files (original upload + the two Excel
 # exports) are only needed briefly — long enough for the user to download
 # their result. Kept forever they filled the free-tier Storage quota (20 GB
 # seen → project restricted → app down). A daily background purge deletes
-# storage objects older than this many days. The per-client "V-lookup" lists
-# (clients / client_products tables) are NOT touched — only the two buckets.
+# storage objects older than this many days. The commodity-code list and the
+# client registry (commodity_codes / clients tables) are NOT touched — only
+# the two buckets.
 # 0 disables the purge. Default 7.
 try:
     STORAGE_RETENTION_DAYS = int(os.environ.get("STORAGE_RETENTION_DAYS", "7"))
@@ -578,19 +582,19 @@ def _norm_general_code(commodity_code: str) -> str:
     return digits
 
 
-def lookup_client_list(company_id: str, client_id: str, commodity_code: str) -> dict:
-    """Client-list equivalent of lookup_tariff.
+def lookup_commodity_list(company_id: str, commodity_code: str) -> dict:
+    """Commodity-list equivalent of lookup_tariff.
 
-    VLOOKUP the invoice's general commodity code in this client's product list
+    VLOOKUP the invoice's general commodity code in the company-wide list
     and return the SAME shape (description / duty / vat / subcodes[]), so
     match_subcodes() and the enrichment loop work unchanged. Each list row
     becomes a subcode carrying the COMPLETE code and the LIST description.
-    An empty subcodes list means the code is not in this client's list, which
-    the enrichment marks as NOT IN LIST.
+    An empty subcodes list means the code is not in the list, which the
+    enrichment marks as NOT IN LIST.
     """
     from datetime import datetime, timezone
     general = _norm_general_code(commodity_code)
-    products = (db.get_client_products_by_general_code(company_id, client_id, general)
+    products = (db.get_commodity_codes_by_general_code(company_id, general)
                 if general else [])
     subcodes = [{
         "code": p.get("full_code") or "",
@@ -604,7 +608,7 @@ def lookup_client_list(company_id: str, client_id: str, commodity_code: str) -> 
         "vat": "0%",
         "subcodes": subcodes,
         "fetched_at": datetime.now(timezone.utc).isoformat(),
-        "source": "client_list",
+        "source": "commodity_list",
     }
 
 
@@ -2722,9 +2726,10 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
         status = "verified" if verified else "subcode_needed"
 
         # Step 4 — Commodity-code lookup.
-        # Resolve which client this invoice belongs to (Spoor C). When the flag
-        # is on AND a client matches, codes come from that client's list instead
-        # of the gov.uk website.
+        # When the flag is on and the company-wide list has entries, codes come
+        # from that shared list (Spoor C) instead of the gov.uk website. The
+        # client match no longer selects a list — it only supplies the stored
+        # REX as a fallback for the export when the invoice didn't carry one.
         update(80, "Looking up commodity codes…")
         client_row = None
         supplier_rex = (data_a.get("supplier_rex") or "").strip()
@@ -2741,7 +2746,9 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
                 eori=(data_a.get("supplier_eori") or "").strip(),
                 name=(data_a.get("supplier_name") or "").strip(),
             )
-        use_list = bool(USE_CLIENT_LIST and client_row)
+        # An empty list means the company hasn't loaded one yet — fall back to
+        # the gov.uk path rather than flagging every row NOT IN LIST.
+        use_list = bool(USE_CLIENT_LIST and db.count_commodity_codes(company_id) > 0)
 
         memory_entries = db.list_memory(company_id)
         memory_by_key = {
@@ -2759,8 +2766,8 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
                 continue
             seen_codes.add(code)
             if use_list:
-                # Client list is authoritative — bypass the gov.uk cache/site.
-                tariff_data[code] = lookup_client_list(company_id, client_row["id"], code)
+                # The company list is authoritative — bypass the gov.uk cache/site.
+                tariff_data[code] = lookup_commodity_list(company_id, code)
                 continue
             cached = None
             for m in memory_by_code.get(code, []):
@@ -2797,9 +2804,9 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
 
         # Step 4c — Enrich each row with its matched sub-code.
         if use_list:
-            # Client-list output (Spoor C/D): write the COMPLETE code + the LIST
-            # description into the export columns; flag products not in the list.
-            # Product memory is ignored here — the client list is the source.
+            # Commodity-list output (Spoor C/D): write the COMPLETE code + the
+            # LIST description into the export columns; flag products not in the
+            # list. Product memory is ignored here — the list is the source.
             for row in final_rows:
                 code = row.get("Comm./imp. cod", "").strip()
                 desc = row.get("Description of Goods", "").strip()
@@ -2821,7 +2828,7 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
                     if chosen["description"]:
                         row["Description of Goods"] = chosen["description"]
                 else:
-                    # Not in this client's list — keep working, flag clearly.
+                    # Not in the company's list — keep working, flag clearly.
                     if not desc.startswith(review.NOT_IN_LIST_MARKER):
                         row["Description of Goods"] = f"{review.NOT_IN_LIST_MARKER} {desc}".strip()
                     row["_not_in_list"] = True
@@ -2859,7 +2866,7 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
         # Persist memory updates to database — BUT ONLY IF the invoice is verified.
         # Unverified / subcode_needed invoices don't touch product memory to avoid
         # learning wrong data. Memory is populated later when the user confirms
-        # the invoice via /resolve. Skipped entirely in client-list mode — the
+        # the invoice via /resolve. Skipped entirely in commodity-list mode — the
         # list is the source of truth, not the learned memory cache.
         if verified and not use_list:
             for row in final_rows:
@@ -3625,12 +3632,14 @@ async def api_change_password(
 
 
 # ---------------------------------------------------------------------------
-# Clients + product lists (the "V-lookup") — in-app editor endpoints
+# Clients registry + commodity-code list (the "V-lookup") — editor endpoints
 # ---------------------------------------------------------------------------
-# The per-supplier commodity-code lists that drive the Items export.
-# Reading is open to every user (operators need to see what will match);
-# mutations are admin-only. All rows are tenant-scoped via RLS + the
-# explicit company_id filters in the DAL.
+# The company-wide commodity-code list drives the Items export; the clients
+# registry holds each supplier's identity (name, REX, EORI) for invoice
+# matching and the export's REX fallback. Every user can read AND edit both
+# (operators maintain the lists day-to-day); only deleting a client stays
+# admin-only. All rows are tenant-scoped via RLS + the explicit company_id
+# filters in the DAL.
 
 def _clean_str(v, max_len: int = 200) -> str:
     return str(v or "").strip()[:max_len]
@@ -3638,15 +3647,11 @@ def _clean_str(v, max_len: int = 200) -> str:
 
 @app.get("/api/clients")
 async def api_list_clients(ctx: dict = Depends(authed)):
-    clients = db.list_clients(ctx["company_id"])
-    return [{
-        **c,
-        "product_count": db.count_client_products(ctx["company_id"], c["id"]),
-    } for c in clients]
+    return db.list_clients(ctx["company_id"])
 
 
 @app.post("/api/clients")
-async def api_create_client(body: dict = {}, ctx: dict = Depends(admin_authed)):
+async def api_create_client(body: dict = {}, ctx: dict = Depends(authed)):
     name = _clean_str(body.get("name"))
     if not name:
         raise HTTPException(400, "Client name is required")
@@ -3661,7 +3666,7 @@ async def api_create_client(body: dict = {}, ctx: dict = Depends(admin_authed)):
 
 
 @app.put("/api/clients/{client_id}")
-async def api_update_client(client_id: str, body: dict = {}, ctx: dict = Depends(admin_authed)):
+async def api_update_client(client_id: str, body: dict = {}, ctx: dict = Depends(authed)):
     if not db.get_client(ctx["company_id"], client_id):
         raise HTTPException(404, "Client not found")
     updates = {}
@@ -3683,24 +3688,20 @@ async def api_update_client(client_id: str, body: dict = {}, ctx: dict = Depends
 async def api_delete_client(client_id: str, ctx: dict = Depends(admin_authed)):
     if not db.get_client(ctx["company_id"], client_id):
         raise HTTPException(404, "Client not found")
-    db.delete_client(ctx["company_id"], client_id)   # products cascade
+    db.delete_client(ctx["company_id"], client_id)
     return {"ok": True}
 
 
-@app.get("/api/clients/{client_id}/products")
-async def api_list_client_products(client_id: str, ctx: dict = Depends(authed)):
-    if not db.get_client(ctx["company_id"], client_id):
-        raise HTTPException(404, "Client not found")
-    return db.list_client_products(ctx["company_id"], client_id)
+@app.get("/api/commodity-codes")
+async def api_list_commodity_codes(ctx: dict = Depends(authed)):
+    return db.list_commodity_codes(ctx["company_id"])
 
 
-@app.post("/api/clients/{client_id}/products")
-async def api_upsert_client_product(client_id: str, body: dict = {}, ctx: dict = Depends(admin_authed)):
+@app.post("/api/commodity-codes")
+async def api_upsert_commodity_code(body: dict = {}, ctx: dict = Depends(authed)):
     """Add/update one V-lookup row. Keyed on full_code (upsert): saving an
     existing code updates its description. general_code (the 8-digit
     VLOOKUP key) is derived from the full code."""
-    if not db.get_client(ctx["company_id"], client_id):
-        raise HTTPException(404, "Client not found")
     full_code = re.sub(r"\D", "", str(body.get("full_code") or ""))
     if not 8 <= len(full_code) <= 10:
         raise HTTPException(400, "Full code must be 8-10 digits (e.g. 0704901000)")
@@ -3713,14 +3714,12 @@ async def api_upsert_client_product(client_id: str, body: dict = {}, ctx: dict =
         "taric_code":   full_code[8:10],
         "description":  description,
     }
-    return db.upsert_client_product(ctx["company_id"], client_id, entry)
+    return db.upsert_commodity_code(ctx["company_id"], entry)
 
 
-@app.delete("/api/clients/{client_id}/products/{product_id}")
-async def api_delete_client_product(client_id: str, product_id: str, ctx: dict = Depends(admin_authed)):
-    if not db.get_client(ctx["company_id"], client_id):
-        raise HTTPException(404, "Client not found")
-    db.delete_client_product(ctx["company_id"], client_id, product_id)
+@app.delete("/api/commodity-codes/{code_id}")
+async def api_delete_commodity_code(code_id: str, ctx: dict = Depends(authed)):
+    db.delete_commodity_code(ctx["company_id"], code_id)
     return {"ok": True}
 
 

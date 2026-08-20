@@ -24,8 +24,8 @@ Rules implemented:
          left blank when no REX is known so the gap surfaces to the reviewer
          (never the invoice number — deliberate, colleague-confirmed
          divergence from gov.uk guidance).
-  List documents — product-specific docs from the client's V-lookup list
-         (client_products.documents) follow the always-present ones.
+  List documents — product-specific docs from the company's V-lookup list
+         (commodity_codes.documents) follow the always-present ones.
   N853 — CHED-P veterinary certificate. The operator's rule: required
          whenever the commodity code starts with an animal-origin prefix
          (see _N853_PREFIXES). The BTOM low-risk-dairy nuance is NOT yet
