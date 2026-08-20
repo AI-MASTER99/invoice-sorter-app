@@ -43,6 +43,7 @@ from passlib.context import CryptContext
 from starlette.middleware.sessions import SessionMiddleware
 
 # Database layer (Supabase)
+import cds_list
 import database as db
 import review
 import tariff_rules
@@ -3715,6 +3716,57 @@ async def api_upsert_commodity_code(body: dict = {}, ctx: dict = Depends(authed)
         "description":  description,
     }
     return db.upsert_commodity_code(ctx["company_id"], entry)
+
+
+# A code list is a few hundred KB of text; the invoice cap (25 MB) is far
+# more than a sheet of codes can be, and the parse happens in RAM.
+MAX_CODE_LIST_BYTES = 5 * 1024 * 1024
+
+
+@app.post("/api/commodity-codes/import")
+async def api_import_commodity_codes(file: UploadFile = File(...),
+                                     ctx: dict = Depends(authed)):
+    """Bulk-add a commodity-code list (.xlsx or .csv) to the company list.
+
+    The sheet is one row per code — a "Commodity Code" column (or a
+    combined "20059980/98"), an optional "Additional Taric", and a
+    "Description". Only codes the list does not already hold are written:
+    a code already there keeps its description, so re-importing the same
+    sheet — or one that overlaps — never duplicates a row or overwrites a
+    wording that came from a real declaration.
+    """
+    if not file.filename:
+        raise HTTPException(400, "No filename provided")
+    if Path(file.filename).suffix.lower() not in (".xlsx", ".xlsm", ".csv"):
+        raise HTTPException(400, "The list must be a .xlsx or .csv file")
+
+    buf = bytearray()
+    while chunk := await file.read(1024 * 1024):
+        buf.extend(chunk)
+        if len(buf) > MAX_CODE_LIST_BYTES:
+            raise HTTPException(
+                413, f"File too large (max {MAX_CODE_LIST_BYTES // (1024 * 1024)} MB)")
+    try:
+        entries, stats = cds_list.read_code_list(bytes(buf))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception:
+        logger.exception("commodity-code import failed to parse")
+        raise HTTPException(400, "Could not read that file as a code list")
+    if not entries:
+        raise HTTPException(400, "No usable commodity codes in that file")
+
+    have = {c["full_code"] for c in db.list_commodity_codes(ctx["company_id"])}
+    fresh = [cds_list.product_payload(e) for e in entries
+             if e["full_code"] not in have]
+    if fresh:
+        db.upsert_commodity_codes(ctx["company_id"], fresh)
+    return {
+        "added": len(fresh),
+        "already_present": len(entries) - len(fresh),
+        "skipped": stats["skipped_no_code"],
+        "total": db.count_commodity_codes(ctx["company_id"]),
+    }
 
 
 @app.delete("/api/commodity-codes/{code_id}")

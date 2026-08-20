@@ -311,22 +311,30 @@ def _header_index(header: list[str], names: tuple[str, ...]) -> int:
     return -1
 
 
-def _list_rows(path) -> list[list]:
-    """Rows of a code list, from .xlsx or .csv, as raw cell lists."""
-    if str(path).lower().endswith((".xlsx", ".xlsm")):
+# An .xlsx is a zip; sniffing the magic beats trusting an upload's filename.
+_XLSX_MAGIC = b"PK\x03\x04"
+
+
+def _list_rows(source) -> list[list]:
+    """Rows of a code list — path or bytes, .xlsx or CSV — as raw cell lists."""
+    if isinstance(source, (bytes, bytearray)):
+        raw = bytes(source)
+    else:
+        with open(source, "rb") as fh:
+            raw = fh.read()
+    if raw.startswith(_XLSX_MAGIC):
         import openpyxl                                   # optional at import
-        wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+        wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True,
+                                    read_only=True)
         try:
             return [list(r) for r in wb.active.iter_rows(values_only=True)]
         finally:
             wb.close()
-    with open(path, "rb") as fh:
-        text = _decode(fh.read())
-    return [row for row in csv.reader(io.StringIO(text, newline=""))]
+    return list(csv.reader(io.StringIO(_decode(raw), newline="")))
 
 
-def read_code_list(path) -> tuple[list[dict], dict]:
-    """Read a one-row-per-code list into list entries.
+def read_code_list(source) -> tuple[list[dict], dict]:
+    """Read a one-row-per-code list (path or uploaded bytes) into list entries.
 
     Returns (entries, stats). Entries carry no provenance — no REX, no
     origin, `lines` 0 and no `last_used` — because a code list records
@@ -336,7 +344,7 @@ def read_code_list(path) -> tuple[list[dict], dict]:
     leaves them out of the export: padding a stub would invent a code that
     was never declared.
     """
-    rows = _list_rows(path)
+    rows = _list_rows(source)
     stats = {"rows": 0, "skipped_no_code": 0, "skipped": []}
     if not rows:
         stats["entries"] = 0
@@ -348,8 +356,8 @@ def read_code_list(path) -> tuple[list[dict], dict]:
     i_desc = _header_index(header, _LIST_DESC_HEADERS)
     if i_code < 0 or i_desc < 0:
         raise ValueError(
-            f"{path}: need a commodity-code and a description column, got "
-            f"{[str(h) for h in header]}")
+            "The sheet needs a commodity-code column and a description "
+            f"column; found {[str(h) for h in header if h] or 'no headers'}")
 
     def cell(row, i):
         return "" if i < 0 or i >= len(row) or row[i] is None else str(row[i])

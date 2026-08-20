@@ -316,6 +316,14 @@
           <button class="btn-save-user" id="btn-code-add">＋ Add / update</button>
         </div>
         <div class="settings-msg hidden" id="codes-msg"></div>
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:14px;padding-top:14px;border-top:1px solid var(--border)">
+          <input type="file" id="code-import-file" accept=".xlsx,.xlsm,.csv" aria-label="Commodity-code list to import" style="font-size:13px;max-width:100%" />
+          <button class="btn-save-user" id="btn-code-import">⬆ Import list</button>
+          <span style="color:var(--muted);font-size:12px">
+            A sheet of codes (.xlsx or .csv) with a code column and a description column.
+            Codes already in the list are skipped, never added twice.
+          </span>
+        </div>
         <input class="memory-search" id="code-search" type="text" placeholder="Search the list…" aria-label="Search commodity codes" style="margin-top:12px" />
         <div id="codes-list" style="margin-top:8px"></div>
       </div>
