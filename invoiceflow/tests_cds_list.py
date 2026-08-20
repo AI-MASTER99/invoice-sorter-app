@@ -171,7 +171,7 @@ def test_derived_round_trip(tmp_path):
     assert back == [{**e, "lines": e["lines"]} for e in entries]
 
 
-def test_product_payload_is_the_client_products_columns():
+def test_product_payload_is_the_commodity_codes_columns():
     entry = {"general_code": "07049010", "full_code": "0704901000",
              "taric_code": "00", "description": "CABBAGE", "lines": 3,
              "rex": "ITREX1", "origin": "IT"}

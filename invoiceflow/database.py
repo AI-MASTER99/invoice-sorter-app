@@ -397,10 +397,13 @@ def delete_memory_entry(memory_id: str, company_id: str) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════
-# CLIENTS + CLIENT PRODUCT LISTS
-# Per-supplier commodity-code lists that replace the gov.uk tariff
-# lookup. A "client" is the supplier/exporter; client_products is that
-# client's code list (general code -> full code + description + CDS fields).
+# CLIENTS + COMMODITY-CODE LIST
+# A "client" is the supplier/exporter — the registry holds their
+# identity (name, REX, EORI, aliases) used to match invoices and to
+# fill the export's REX fallback. Commodity codes live in ONE shared
+# company-wide list (commodity_codes: general code -> full code +
+# description + CDS fields) that replaces both the per-client lists
+# and the gov.uk tariff lookup.
 # ═══════════════════════════════════════════════════════════════
 def list_clients(company_id: str) -> list[dict]:
     r = (_client().table("clients").select("*")
@@ -427,7 +430,8 @@ def update_client(company_id: str, client_id: str, updates: dict) -> None:
 
 
 def delete_client(company_id: str, client_id: str) -> None:
-    """Deletes the client; client_products rows cascade (FK ON DELETE CASCADE)."""
+    """Deletes the client (any legacy client_products rows cascade via FK
+    until migration 007 drops that table)."""
     (_client().table("clients").delete()
      .eq("company_id", company_id).eq("id", client_id).execute())
 
@@ -468,46 +472,46 @@ def get_or_create_client(company_id: str, name: str,
     })
 
 
-def list_client_products(company_id: str, client_id: str) -> list[dict]:
-    r = (_client().table("client_products").select("*")
-         .eq("company_id", company_id).eq("client_id", client_id)
+def list_commodity_codes(company_id: str) -> list[dict]:
+    r = (_client().table("commodity_codes").select("*")
+         .eq("company_id", company_id)
          .order("general_code").execute())
     return r.data
 
 
-def get_client_products_by_general_code(company_id: str, client_id: str,
+def get_commodity_codes_by_general_code(company_id: str,
                                         general_code: str) -> list[dict]:
-    """The VLOOKUP: candidate subcodes for a general code in this client's list."""
-    r = (_client().table("client_products").select("*")
-         .eq("company_id", company_id).eq("client_id", client_id)
+    """The VLOOKUP: candidate subcodes for a general code in the company list."""
+    r = (_client().table("commodity_codes").select("*")
+         .eq("company_id", company_id)
          .eq("general_code", general_code).execute())
     return r.data
 
 
-def upsert_client_product(company_id: str, client_id: str, entry: dict) -> dict:
-    """Insert/update one list row, keyed on (company_id, client_id, full_code)."""
-    payload = {"company_id": company_id, "client_id": client_id, **entry}
-    r = (_client().table("client_products")
-         .upsert(payload, on_conflict="company_id,client_id,full_code").execute())
+def upsert_commodity_code(company_id: str, entry: dict) -> dict:
+    """Insert/update one list row, keyed on (company_id, full_code)."""
+    payload = {"company_id": company_id, **entry}
+    r = (_client().table("commodity_codes")
+         .upsert(payload, on_conflict="company_id,full_code").execute())
     return r.data[0] if r.data else {}
 
 
-def count_client_products(company_id: str, client_id: str) -> int:
-    r = (_client().table("client_products").select("id", count="exact")
-         .eq("company_id", company_id).eq("client_id", client_id).execute())
+def count_commodity_codes(company_id: str) -> int:
+    r = (_client().table("commodity_codes").select("id", count="exact")
+         .eq("company_id", company_id).execute())
     return r.count or 0
 
 
-def delete_client_products(company_id: str, client_id: str) -> None:
-    (_client().table("client_products").delete()
-     .eq("company_id", company_id).eq("client_id", client_id).execute())
+def delete_commodity_codes(company_id: str) -> None:
+    (_client().table("commodity_codes").delete()
+     .eq("company_id", company_id).execute())
 
 
-def delete_client_product(company_id: str, client_id: str, product_id: str) -> None:
+def delete_commodity_code(company_id: str, code_id: str) -> None:
     """Delete ONE list row (the in-app editor's per-row delete)."""
-    (_client().table("client_products").delete()
-     .eq("company_id", company_id).eq("client_id", client_id)
-     .eq("id", product_id).execute())
+    (_client().table("commodity_codes").delete()
+     .eq("company_id", company_id)
+     .eq("id", code_id).execute())
 
 
 # ═══════════════════════════════════════════════════════════════

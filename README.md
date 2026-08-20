@@ -37,26 +37,32 @@ Open http://localhost:8000/login (user `admin` + your `APP_PASSWORD`).
 
 Tests: `python -m pytest tests_review.py tests_rate_limit.py -q`
 
-## Commodity-code lists (the "V-lookup")
+## Commodity-code list (the "V-lookup")
 
-Each client's list lives in `client_products` and is loaded from a
-MultiFreight CDS "Items" export — the goods lines as they were accepted at
-the border. `invoiceflow/data/commodity_codes.csv` is that export folded to
-one row per (exporter REX, full code) by `invoiceflow/cds_list.py`.
+ONE company-wide list, shared by every client, lives in `commodity_codes`
+(the per-client `client_products` lists it replaced are kept only until
+migration 007 drops them). It is edited in the app (Commodity codes tool)
+or loaded from a MultiFreight CDS "Items" export — the goods lines as they
+were accepted at the border. `invoiceflow/data/commodity_codes.csv` is that
+export folded to one row per (exporter REX, full code) by
+`invoiceflow/cds_list.py`; the loader merges those to one row per code.
+
+Clients themselves live in the `clients` registry (Clients / REX tool):
+name, REX and EORI, used to match invoices to a client and to fill the
+export's REX when the invoice doesn't carry one.
 
 ```bash
-# which REX numbers are in the list, and which already have a client
-python scripts/load_client_list.py --list
+# what is in the list file, and which REX numbers already have a client
+python scripts/load_commodity_list.py --list
 
-# refresh the list of every client that exists in the DB (upsert, never deletes)
-python scripts/load_client_list.py
+# refresh the company list from the committed CSV (upsert, never deletes)
+python scripts/load_commodity_list.py
 
 # after a new export from MultiFreight
-python scripts/load_client_list.py --source "<CDS items export.csv>" --derive
+python scripts/load_commodity_list.py --source "<CDS items export.csv>" --derive
 ```
 
-`--help` covers loading a single client (`--rex`), giving one client every
-code in the file (`--client "<name>" --all-codes`), and `--dry-run`.
+`--help` covers wiping the list first (`--replace`) and `--dry-run`.
 
 ## Environment variables
 
@@ -71,7 +77,7 @@ See `invoiceflow/.env.example` for the authoritative, commented list.
 | `SUPABASE_JWT_SECRET` | Supabase JWT secret (signs per-request user JWTs for RLS) |
 | `SECRET_KEY` | Random string (≥32 chars) for session cookies |
 | `APP_PASSWORD` | Default admin password on first run |
-| `USE_CLIENT_LIST` | `1` = per-client commodity list (the "V-lookup"); production runs with this ON |
+| `USE_CLIENT_LIST` | `1` = company-wide commodity list (the "V-lookup", shared by all clients); production runs with this ON |
 | `AI_MODEL_PRIMARY` | Primary Claude model (default: `claude-opus-4-8`) |
 | `AI_MODEL_LIGHT` | Light Claude model (default: `claude-sonnet-4-6`) |
 | `AI_MODEL` | Legacy single-model override — sets both of the above |
