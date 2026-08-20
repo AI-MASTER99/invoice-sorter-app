@@ -64,6 +64,34 @@ python scripts/load_commodity_list.py --source "<CDS items export.csv>" --derive
 
 `--help` covers wiping the list first (`--replace`) and `--dry-run`.
 
+**The CSV is not the database.** `commodity_codes.csv` is the list as
+derived from the export; the app only shows what has been loaded into the
+`commodity_codes` table. If the Commodity codes tool shows far fewer codes
+than `--list` reports, the loader has not been run against that database —
+run `python scripts/load_commodity_list.py` (it upserts, so it is safe to
+re-run and never deletes a code).
+
+### Importing a plain code list
+
+A sheet of codes — one row per code, no CDS provenance — can be added
+either in the app (Commodity codes → **Import list**, accepting .xlsx or
+.csv) or from the command line:
+
+```bash
+# what the sheet would add (writes nothing)
+python scripts/add_commodity_codes.py "Commodity_Codes_2026.xlsx" --dry-run
+
+# merge it into the committed CSV, then load it
+python scripts/add_commodity_codes.py "Commodity_Codes_2026.xlsx"
+python scripts/load_commodity_list.py
+```
+
+Either route adds only the codes the list does not already hold: a code
+already present keeps its description (which came from a real declaration,
+as a sheet's wording did not), so an overlapping sheet never duplicates a
+row. Both refuse a code shorter than 8 digits rather than padding it into
+one that was never declared.
+
 ## Environment variables
 
 See `invoiceflow/.env.example` for the authoritative, commented list.

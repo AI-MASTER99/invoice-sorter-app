@@ -179,3 +179,109 @@ def test_product_payload_is_the_commodity_codes_columns():
         "general_code": "07049010", "full_code": "0704901000",
         "taric_code": "00", "description": "CABBAGE",
     }
+
+
+# ── A plain code list, merged in without duplicates ─────────────────────
+LIST_CSV = (
+    "Commodity Code,Additional Taric,Description\r\n"
+    "02013000,90,TARTARE DI FASONA\r\n"
+    "2101219,00,  ITALIAN   CURED MEAT \r\n"
+    "852910,00,ELEVATOR MATERIAL\r\n"
+    ",,\r\n"
+)
+
+
+def write_list(tmp_path, text=LIST_CSV, name="codes.csv"):
+    path = tmp_path / name
+    path.write_bytes(text.encode("cp1252"))
+    return path
+
+
+def test_read_code_list_reads_one_entry_per_row(tmp_path):
+    entries, stats = cl.read_code_list(write_list(tmp_path))
+    assert [e["full_code"] for e in entries] == ["0201300090", "0210121900"]
+    assert entries[0]["description"] == "TARTARE DI FASONA"
+    # 7-digit zero drop repaired, whitespace collapsed — same rules as the export.
+    assert entries[1]["general_code"] == "02101219"
+    assert entries[1]["description"] == "ITALIAN CURED MEAT"
+
+
+def test_read_code_list_skips_an_incomplete_code(tmp_path):
+    _, stats = cl.read_code_list(write_list(tmp_path))
+    assert stats["rows"] == 3                    # the blank row is not a row
+    assert stats["skipped_no_code"] == 1
+    assert stats["skipped"] == [("852910", "00", "ELEVATOR MATERIAL")]
+
+
+def test_read_code_list_carries_no_provenance(tmp_path):
+    entries, _ = cl.read_code_list(write_list(tmp_path))
+    # A code list says a code is used, not which declaration it came from.
+    assert entries[0]["rex"] == "" and entries[0]["origin"] == ""
+    assert entries[0]["lines"] == 0 and entries[0]["last_used"] == ""
+
+
+def test_read_code_list_accepts_a_combined_code_column(tmp_path):
+    path = write_list(tmp_path, "Code,Description\r\n20059980/98,PEPPERS\r\n")
+    entries, _ = cl.read_code_list(path)
+    assert entries[0]["full_code"] == "2005998098"
+
+
+def test_read_code_list_folds_a_repeated_code(tmp_path):
+    path = write_list(tmp_path, "Commodity Code,Additional Taric,Description\r\n"
+                                "02013000,90,TARTARE\r\n02013000,90,BEEF\r\n")
+    entries, _ = cl.read_code_list(path)
+    assert [e["description"] for e in entries] == ["TARTARE"]
+
+
+def test_read_code_list_needs_the_two_columns(tmp_path):
+    import pytest
+    with pytest.raises(ValueError):
+        cl.read_code_list(write_list(tmp_path, "Widget,Colour\r\na,b\r\n"))
+
+
+def test_add_entries_adds_only_the_missing_codes():
+    existing, _ = cl.parse_export(EXPORT_CSV.encode("cp1252"))   # 2005998098
+    additions = [
+        {"rex": "", "general_code": "20059980", "full_code": "2005998098",
+         "taric_code": "98", "description": "SHEET WORDING", "lines": 0},
+        {"rex": "", "general_code": "02013000", "full_code": "0201300090",
+         "taric_code": "90", "description": "TARTARE DI FASONA", "lines": 0},
+    ]
+    merged, stats = cl.add_entries(existing, additions)
+    assert (stats["added"], stats["already_present"]) == (1, 1)
+    assert [e["full_code"] for e in merged] == ["0201300090", "2005998098"]
+    # The code already declared keeps its export wording, not the sheet's.
+    assert merged[1]["description"] == "GRILLED PEPPERS caf\xe9"
+
+
+def test_add_entries_is_idempotent():
+    existing, _ = cl.parse_export(EXPORT_CSV.encode("cp1252"))
+    additions = [{"rex": "", "general_code": "02013000",
+                  "full_code": "0201300090", "taric_code": "90",
+                  "description": "TARTARE", "lines": 0}]
+    once, _ = cl.add_entries(existing, additions)
+    twice, stats = cl.add_entries(once, additions)
+    assert stats == {"added": 0, "already_present": 1}
+    assert twice == once
+
+
+def test_add_entries_dedupes_against_every_rex_group():
+    # The company list holds one row per code, so a code present under ANY
+    # exporter is present — merge_by_code would fold them into one row.
+    existing = [{"rex": "ITREX1", "general_code": "02013000",
+                 "full_code": "0201300090", "taric_code": "90",
+                 "description": "TARTARE", "lines": 4}]
+    additions = [{"rex": "", "general_code": "02013000",
+                  "full_code": "0201300090", "taric_code": "90",
+                  "description": "BEEF", "lines": 0}]
+    merged, stats = cl.add_entries(existing, additions)
+    assert stats["added"] == 0 and merged == existing
+
+
+def test_added_entries_survive_the_derived_round_trip(tmp_path):
+    existing, _ = cl.parse_export(EXPORT_CSV.encode("cp1252"))
+    additions, _ = cl.read_code_list(write_list(tmp_path))
+    merged, _ = cl.add_entries(existing, additions)
+    path = tmp_path / "commodity_codes.csv"
+    cl.write_derived(merged, path)
+    assert cl.read_derived(path) == merged

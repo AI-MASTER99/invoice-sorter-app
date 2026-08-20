@@ -30,6 +30,12 @@ company-wide (shared by all clients), so the REX only feeds the clients
 registry; lines with no U116 (a non-EU origin claims no preference) are
 grouped under REX "" and load like any other.
 
+A second, thinner source is supported alongside the export: a plain
+commodity-code list (spreadsheet or CSV, one row per code — see
+`read_code_list`). `add_entries` merges such a list into the derived one,
+adding only the codes it does not already hold, so re-running it or
+importing an overlapping sheet never writes a code twice.
+
 Run: python -m pytest tests_cds_list.py -q
 """
 from __future__ import annotations
@@ -279,3 +285,133 @@ def product_payload(entry: dict) -> dict:
         "taric_code": entry.get("taric_code") or entry["full_code"][8:10],
         "description": entry.get("description") or "",
     }
+
+
+# ── A plain code list (spreadsheet), merged into the derived list ───────
+# A CDS Items export is one row per declared goods line; a hand-kept or
+# exported code list is one row per code, with no provenance:
+#
+#     Commodity Code | Additional Taric | Description
+#     02013000       | 90               | TARTARE DI FASONA
+#
+# Both shapes end in the same list, so a spreadsheet can top up the list
+# with codes the export never carried.
+_LIST_CODE_HEADERS = ("commodity code", "code", "full code", "general code")
+_LIST_TARIC_HEADERS = ("additional taric", "taric", "taric code", "additional")
+_LIST_DESC_HEADERS = ("description", "commodity description", "goods")
+
+
+def _header_index(header: list[str], names: tuple[str, ...]) -> int:
+    """Position of the first column whose name matches, or -1."""
+    lowered = [re.sub(r"\s+", " ", str(h or "")).strip().casefold()
+               for h in header]
+    for name in names:
+        if name in lowered:
+            return lowered.index(name)
+    return -1
+
+
+# An .xlsx is a zip; sniffing the magic beats trusting an upload's filename.
+_XLSX_MAGIC = b"PK\x03\x04"
+
+
+def _list_rows(source) -> list[list]:
+    """Rows of a code list — path or bytes, .xlsx or CSV — as raw cell lists."""
+    if isinstance(source, (bytes, bytearray)):
+        raw = bytes(source)
+    else:
+        with open(source, "rb") as fh:
+            raw = fh.read()
+    if raw.startswith(_XLSX_MAGIC):
+        import openpyxl                                   # optional at import
+        wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True,
+                                    read_only=True)
+        try:
+            return [list(r) for r in wb.active.iter_rows(values_only=True)]
+        finally:
+            wb.close()
+    return list(csv.reader(io.StringIO(_decode(raw), newline="")))
+
+
+def read_code_list(source) -> tuple[list[dict], dict]:
+    """Read a one-row-per-code list (path or uploaded bytes) into list entries.
+
+    Returns (entries, stats). Entries carry no provenance — no REX, no
+    origin, `lines` 0 and no `last_used` — because a code list records
+    that a code is used, not any declaration it came from. Rows whose code
+    is not a full 8-digit one (a 6-digit stub such as '852910') are counted
+    in `stats['skipped_no_code']` and left out, exactly as `build_list`
+    leaves them out of the export: padding a stub would invent a code that
+    was never declared.
+    """
+    rows = _list_rows(source)
+    stats = {"rows": 0, "skipped_no_code": 0, "skipped": []}
+    if not rows:
+        stats["entries"] = 0
+        return [], stats
+
+    header, *body = rows
+    i_code = _header_index(header, _LIST_CODE_HEADERS)
+    i_taric = _header_index(header, _LIST_TARIC_HEADERS)
+    i_desc = _header_index(header, _LIST_DESC_HEADERS)
+    if i_code < 0 or i_desc < 0:
+        raise ValueError(
+            "The sheet needs a commodity-code column and a description "
+            f"column; found {[str(h) for h in header if h] or 'no headers'}")
+
+    def cell(row, i):
+        return "" if i < 0 or i >= len(row) or row[i] is None else str(row[i])
+
+    seen: dict[str, dict] = {}
+    for row in body:
+        if not any(str(c or "").strip() for c in row):
+            continue
+        stats["rows"] += 1
+        raw_code, raw_taric = cell(row, i_code).strip(), cell(row, i_taric)
+        general, taric = split_code(
+            raw_code if "/" in raw_code else f"{raw_code}/{raw_taric}")
+        desc = clean_description(cell(row, i_desc))
+        if not general or not desc:
+            stats["skipped_no_code"] += 1
+            stats["skipped"].append((raw_code, raw_taric.strip(), desc))
+            continue
+        full = general + taric
+        # The same code twice in one sheet is one entry, first wording wins.
+        seen.setdefault(full, {
+            "rex": "",
+            "general_code": general,
+            "full_code": full,
+            "taric_code": taric,
+            "description": desc,
+            "origin": "",
+            "preference": "",
+            "procedure": "",
+            "lines": 0,
+            "last_used": "",
+        })
+    entries = sorted(seen.values(), key=lambda e: e["full_code"])
+    stats["entries"] = len(entries)
+    return entries, stats
+
+
+def add_entries(existing: list[dict], additions: list[dict]) -> tuple[list[dict], dict]:
+    """Add only the codes the list does not already hold.
+
+    A code already in `existing` under ANY exporter REX is already in the
+    company-wide list (the loader folds every REX group to one row per
+    code), so it is never appended a second time — and its wording, backed
+    by real declared lines, is left alone. Returns (entries, stats) with
+    the merged list sorted the way `write_derived` expects.
+    """
+    have = {e["full_code"] for e in existing}
+    stats = {"added": 0, "already_present": 0}
+    merged = list(existing)
+    for entry in additions:
+        if entry["full_code"] in have:
+            stats["already_present"] += 1
+            continue
+        have.add(entry["full_code"])
+        merged.append(dict(entry))
+        stats["added"] += 1
+    merged.sort(key=lambda e: (e.get("rex", ""), e["full_code"]))
+    return merged, stats

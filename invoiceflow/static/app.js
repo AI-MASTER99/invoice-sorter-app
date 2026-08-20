@@ -842,6 +842,35 @@ function _clientsMsg(elId, text, ok) {
   setTimeout(() => msg.classList.remove('show'), 5000);
 }
 
+document.getElementById('btn-code-import')?.addEventListener('click', async () => {
+  const input = document.getElementById('code-import-file');
+  const file = input.files && input.files[0];
+  if (!file) {
+    _clientsMsg('codes-msg', 'Choose a .xlsx or .csv list to import first.', false);
+    return;
+  }
+  const btn = document.getElementById('btn-code-import');
+  btn.disabled = true;
+  _clientsMsg('codes-msg', `Reading ${file.name}…`, true);
+  try {
+    const fd = new FormData();
+    fd.append('file', file);
+    const r = await api('POST', '/api/commodity-codes/import', fd);
+    // Say what happened to every row, so a sheet that adds nothing reads as
+    // "already there" rather than as a failure.
+    const bits = [`${r.added} code${r.added === 1 ? '' : 's'} added`];
+    if (r.already_present) bits.push(`${r.already_present} already in the list`);
+    if (r.skipped) bits.push(`${r.skipped} row${r.skipped === 1 ? '' : 's'} without a usable code`);
+    _clientsMsg('codes-msg', `✓ ${bits.join(', ')} — the list now holds ${r.total}.`, true);
+    input.value = '';
+    await refreshCodesPage();
+  } catch (e) {
+    _clientsMsg('codes-msg', 'Import failed: ' + e.message, false);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
 document.getElementById('btn-code-add')?.addEventListener('click', async () => {
   const full_code = document.getElementById('code-new-code').value.trim();
   const description = document.getElementById('code-new-desc').value.trim();

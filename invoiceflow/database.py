@@ -472,11 +472,43 @@ def get_or_create_client(company_id: str, name: str,
     })
 
 
+_CODES_PAGE = 1000
+
+
 def list_commodity_codes(company_id: str) -> list[dict]:
-    r = (_client().table("commodity_codes").select("*")
-         .eq("company_id", company_id)
-         .order("general_code").execute())
-    return r.data
+    """The company's whole list, paged past PostgREST's row cap.
+
+    An unbounded select is capped by Supabase's "Max rows" setting (1000 by
+    default) and comes back silently short — with a list this size the app
+    would show a partial list with nothing to say the rest was missing.
+    Ordering by (general_code, full_code) is total, so paging cannot skip
+    or repeat a row; full_code is unique per company.
+    """
+    out: list[dict] = []
+    while True:
+        r = (_client().table("commodity_codes").select("*")
+             .eq("company_id", company_id)
+             .order("general_code").order("full_code")
+             .range(len(out), len(out) + _CODES_PAGE - 1).execute())
+        page = r.data or []
+        out.extend(page)
+        if len(page) < _CODES_PAGE:
+            return out
+
+
+def upsert_commodity_codes(company_id: str, entries: list[dict]) -> int:
+    """Upsert many list rows at once, keyed on (company_id, full_code).
+
+    One request per chunk instead of one per code — loading a full list is
+    ~1700 rows, which as individual upserts is ~1700 round trips.
+    """
+    written = 0
+    for i in range(0, len(entries), _CODES_PAGE):
+        chunk = [{"company_id": company_id, **e} for e in entries[i:i + _CODES_PAGE]]
+        r = (_client().table("commodity_codes")
+             .upsert(chunk, on_conflict="company_id,full_code").execute())
+        written += len(r.data or chunk)
+    return written
 
 
 def get_commodity_codes_by_general_code(company_id: str,
