@@ -770,9 +770,21 @@ layouts and languages.
 Field semantics
 
 invoice_number
-  The invoice/document number printed on the invoice (Fattura, Invoice,
-  Rechnung, Facture, Numero Documento). Same value for every row. NOT the
-  client reference, customer number, or a monetary amount.
+  The invoice/document number printed on the invoice — the value labelled
+  Invoice No., Fattura n., Numero documento, N. documento, Rechnung Nr.,
+  Facture n°. Same value for every row. Copy it exactly as printed,
+  leading zeros included ("0002236" stays "0002236").
+  NOT the client/customer code (Cod. cliente, Codice cliente, Customer
+  No., Kundennummer), NOT an order / DDT / delivery-note number, NOT the
+  VAT number, and NOT a monetary amount.
+  Italian invoices often print one header row of bare values side by
+  side — customer code, VAT number, document number, date, page — under
+  a row of labels (e.g. "Cod. cliente | Partita IVA | Numero documento |
+  Data documento | Pag."). Match each value to its label and take the
+  one under "Numero documento". If the text layer has lost the labels,
+  use the layout: the document number is the value printed next to the
+  document date. A customer code is the same on every invoice from a
+  supplier; the invoice number changes every time.
 
 currency_symbol
   The invoice's currency: €, $, £, or CHF. Used for display only.
@@ -919,8 +931,10 @@ EXTRACTION_TOOL = {
             "invoice_number": {
                 "type": "string",
                 "description": (
-                    "The invoice / document number printed on the invoice. "
-                    "NOT a client reference or monetary amount."
+                    "The invoice / document number printed on the invoice "
+                    "(Invoice No., Fattura n., Numero documento), exactly as "
+                    "printed. NOT the client/customer code (Cod. cliente), an "
+                    "order or DDT number, the VAT number, or a monetary amount."
                 ),
             },
             "supplier_name": {
@@ -2110,6 +2124,14 @@ _ITEMS_DEFAULTS = {
     "[6/11] Packages - Shipping Marks (01)": "N/M",
 }
 
+# DE 2/1 previous document, slot 01 on EVERY line: the commercial invoice
+# the declaration is raised against. Category Z (a document the declaration
+# refers to), type 380 (commercial invoice), reference = the invoice number
+# exactly as printed. Operator instruction 2026-09: always Z / 380 / the
+# invoice number — never the customer code or an order number.
+_ITEMS_PREVIOUS_DOC_CATEGORY = "Z"
+_ITEMS_PREVIOUS_DOC_TYPE = "380"
+
 # EU member-state ISO country codes — drives the origin-based preference rule.
 # Greece is "GR" in ISO 3166 but "EL" in EU customs nomenclature, so accept both.
 _EU_COUNTRY_CODES = {
@@ -2366,6 +2388,16 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
         # product-specific nat_add_code from the client list overrides it.
         put(out_row, "[6/17] National Additional Codes - Code (01)",
             cds.get("nat_add_code") or "VATZ", as_text=True)
+        # ── DE 2/1 previous document (01): the invoice itself ──
+        # Category and type are constants; the reference is the invoice
+        # number read off the invoice. When that is unknown the Ref cell is
+        # left blank so the gap surfaces to the reviewer (never guessed).
+        put(out_row, "[2/1] Previous Documents - Category (01)",
+            _ITEMS_PREVIOUS_DOC_CATEGORY, as_text=True)
+        put(out_row, "[2/1] Previous Documents - Type (01)",
+            _ITEMS_PREVIOUS_DOC_TYPE, as_text=True)
+        put(out_row, "[2/1] Previous Documents - Ref (01)",
+            g.get("invoice"), as_text=True)
         for di, doc in enumerate(docs[:6], start=1):
             put(out_row, f"[2/3] Documents - Code (0{di})", doc.get("code"), as_text=True)
             put(out_row, f"[2/3] Documents - ID (0{di})", doc.get("id"), as_text=True)
