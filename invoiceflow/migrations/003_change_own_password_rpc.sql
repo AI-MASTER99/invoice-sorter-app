@@ -27,7 +27,7 @@ BEGIN;
 -- in Supabase because auth.jwt() reads the request.jwt.claims GUC
 -- which is set per-request by GoTrue/PostgREST — independent of the
 -- SET ROLE that SECURITY DEFINER does. (Smoke-tested in §5.3 of
--- PHASE_B_PLAN.md.)
+-- docs/archive/PHASE_B_PLAN.md.)
 --
 -- SET search_path is critical: without it SECURITY DEFINER functions
 -- are exposed to search-path-based privilege escalation.

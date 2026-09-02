@@ -13,7 +13,6 @@ import sys
 from pathlib import Path
 
 import openpyxl
-import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
 import main as m  # noqa: E402 — relies on .env being valid

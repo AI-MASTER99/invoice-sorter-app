@@ -9,7 +9,6 @@ import base64
 import io
 import ipaddress
 import itertools
-import json
 import logging
 import os
 import queue
@@ -27,15 +26,15 @@ logger = logging.getLogger("invoiceflow")
 
 load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=True)
 
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 import anthropic
 import httpx
 import openpyxl
-from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
@@ -116,16 +115,15 @@ else:
 UPLOADS_DIR = _DATA_ROOT / "uploads"
 OUTPUT_DIR  = _DATA_ROOT / "output"
 
-# AI models — the primary one does the heavy lifting (extraction, verification,
-# sub-code matching — anything where quality directly affects customs outcomes).
-# The light one handles the simple totals extraction where Sonnet is plenty.
+# The Claude model for every call — extraction, verification, totals and
+# sub-code matching all affect customs outcomes, so they all use the same one.
+# (An AI_MODEL_LIGHT split for totals extraction was configured but never wired
+# in; it was removed rather than switched on unreviewed.)
 AI_MODEL_PRIMARY = os.environ.get("AI_MODEL_PRIMARY", "claude-opus-4-8")
-AI_MODEL_LIGHT   = os.environ.get("AI_MODEL_LIGHT",   "claude-sonnet-4-6")
 
-# Legacy single-model env var — if set, override both (for easy rollback)
+# Legacy single-model env var — if set, overrides AI_MODEL_PRIMARY (easy rollback)
 if os.environ.get("AI_MODEL"):
     AI_MODEL_PRIMARY = os.environ["AI_MODEL"]
-    AI_MODEL_LIGHT   = os.environ["AI_MODEL"]
 
 # Feature flag: source commodity sub-codes from the company-wide commodity
 # list in the DB (commodity_codes table — shared by all clients) instead of
@@ -292,7 +290,7 @@ async def authed(request: Request):
     buffered (`Response`/`JSONResponse`/`FileResponse`) so this is
     dormant; if you ever introduce a streaming handler, bind a fresh
     user-scoped client inside the generator manually. See
-    `migrations/PHASE_B_PLAN.md` §7/§8 (H2).
+    `docs/archive/PHASE_B_PLAN.md` §7/§8 (H2).
     """
     sess = request.session
     user_id    = sess.get("user_id")
@@ -1127,41 +1125,6 @@ Rules:
 - Never guess. Blank is better than wrong.
 """
 
-COLUMNS = [
-    "Invoice",
-    "Comm./imp. cod",
-    "Description of Goods",
-    "Origin",
-    "Country",
-    "Number of Packages",
-    "Gross Weight (KG)",
-    "Net Weight (KG)",
-    "Value",
-]
-
-
-def parse_tsv(tsv: str) -> list[dict]:
-    lines = [l for l in tsv.strip().splitlines() if l.strip()]
-    if not lines:
-        return []
-    # Find header row
-    header_line = 0
-    for i, line in enumerate(lines):
-        if "Invoice" in line or "Comm" in line:
-            header_line = i
-            break
-    headers = [h.strip() for h in lines[header_line].split("\t")]
-    rows = []
-    for line in lines[header_line + 1:]:
-        parts = line.split("\t")
-        # pad/trim to match headers
-        while len(parts) < len(headers):
-            parts.append("")
-        row = {headers[i]: parts[i].strip() for i in range(len(headers))}
-        rows.append(row)
-    return rows
-
-
 _ISO2_TO_COUNTRY = {
     "IT": "Italy", "ES": "Spain", "FR": "France", "DE": "Germany",
     "NL": "Netherlands", "BE": "Belgium", "PL": "Poland", "PT": "Portugal",
@@ -1249,7 +1212,7 @@ _is_fee_row = review._is_fee_row
 
 
 def normalise_row(row: dict) -> dict:
-    """Map any variant header names to canonical COLUMNS, and repair a
+    """Map any variant header names to the canonical column names, and repair a
     common Claude mistake where non-goods fee rows have their line total
     written into a weight column instead of Value."""
     mapping = {
@@ -1363,13 +1326,6 @@ def _norm_desc_for_match(s: str) -> str:
     """
     s = re.sub(r"[^a-z0-9]", "", (s or "").lower())
     return s[:25]
-
-
-def _loose_row_key(r: dict) -> tuple:
-    return (
-        re.sub(r"\D", "", r.get("Comm./imp. cod", "") or ""),
-        _norm_desc_for_match(r.get("Description of Goods", "")),
-    )
 
 
 def find_cell_disagreements(rows_a: list[dict], rows_b: list[dict]) -> list[set[str]]:
@@ -1653,36 +1609,6 @@ def rex_from_text(text: str) -> str:
         return ""
     m = _REX_RE.search(text.upper())
     return m.group(0) if m else ""
-
-
-def extract_pdf_pages(file_bytes: bytes) -> list[str]:
-    """Return extracted text per page as a list."""
-    try:
-        import pdfplumber
-        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-            return [(p.extract_text() or "") for p in pdf.pages]
-    except Exception:
-        return []
-
-
-def chunk_pages(pages: list[str], max_words_per_chunk: int = 1800) -> list[str]:
-    """Group pages into chunks that stay under the rate limit.
-    ~1800 words ≈ 2400 tokens, safely under 10K/min single-request budget."""
-    chunks: list[str] = []
-    current: list[str] = []
-    current_words = 0
-    for p in pages:
-        w = len(p.split())
-        if current and current_words + w > max_words_per_chunk:
-            chunks.append("\n\n--- PAGE BREAK ---\n\n".join(current))
-            current = [p]
-            current_words = w
-        else:
-            current.append(p)
-            current_words += w
-    if current:
-        chunks.append("\n\n--- PAGE BREAK ---\n\n".join(current))
-    return chunks
 
 
 def _untrusted_invoice_block(pdf_text: str) -> str:

@@ -11,8 +11,8 @@ Multi-tenant SaaS built on FastAPI + Claude + Supabase.
 ## Tech stack
 
 - **Backend**: FastAPI, Python 3.12
-- **AI**: Anthropic Claude — Opus (primary: extraction, verification, sub-code
-  matching) + Sonnet (light: totals extraction)
+- **AI**: Anthropic Claude — one model (`AI_MODEL_PRIMARY`, default Opus) for
+  extraction, verification, totals and sub-code matching
 - **Database + Storage**: Supabase (PostgreSQL + object storage)
 - **Hosting**: Render (free tier, EU region)
 - **Frontend**: Vanilla HTML/CSS/JS — no framework
@@ -35,7 +35,20 @@ uvicorn main:app --reload --port 8000
 
 Open http://localhost:8000/login (user `admin` + your `APP_PASSWORD`).
 
-Tests: `python -m pytest tests_review.py tests_rate_limit.py -q`
+### Tests
+
+```bash
+cd invoiceflow
+pip install -r requirements-dev.txt
+python -m pytest            # pytest.ini picks up every tests_*.py
+python -m pyflakes *.py ../scripts/*.py
+bash ../scripts/check_no_raw_sb.sh   # Phase B invariant: no service-role client in request handlers
+```
+
+Every test file imports `main`, so the `.env` must be valid (dummy values are
+fine for the unit tests). `tests_user_admin.py` talks to the real Supabase
+project in `.env` and fails without network access to it; the other files
+run offline.
 
 ## Commodity-code list (the "V-lookup")
 
@@ -92,6 +105,31 @@ as a sheet's wording did not), so an overlapping sheet never duplicates a
 row. Both refuse a code shorter than 8 digits rather than padding it into
 one that was never declared.
 
+## Database migrations
+
+`invoiceflow/migrations/` holds numbered SQL files, each with a `_rollback`
+and (usually) a `_verify` companion whose header states the expected
+result. Apply them through the Supabase SQL editor, or with a personal
+access token:
+
+```bash
+SUPABASE_PAT=sbp_... python scripts/apply_migration.py 006 --dry-run   # show what would be sent
+SUPABASE_PAT=sbp_... python scripts/apply_migration.py 006             # apply, then run 006_verify.sql
+```
+
+Migration 005 (tariff-engine tables) is written but not applied anywhere;
+nothing in the app reads those tables yet.
+
+## Repository layout
+
+| Path | What |
+|------|------|
+| `invoiceflow/` | The FastAPI app (`main.py`), data layer (`database.py`), review/tariff helpers, tests, migrations, static frontend |
+| `scripts/` | Operator tooling: commodity-list loading, storage cleanup, migration apply, the Phase B lint |
+| `docs/` | The rules-engine plan (open work) and `docs/archive/` for historical hand-overs and the Phase B design |
+| `website/` | The static landing page (www.invoice-sorter.com) |
+| `render.yaml` | Render deployment Blueprint (build/start commands, env var list) |
+
 ## Environment variables
 
 See `invoiceflow/.env.example` for the authoritative, commented list.
@@ -106,9 +144,8 @@ See `invoiceflow/.env.example` for the authoritative, commented list.
 | `SECRET_KEY` | Random string (≥32 chars) for session cookies |
 | `APP_PASSWORD` | Default admin password on first run |
 | `USE_CLIENT_LIST` | `1` = company-wide commodity list (the "V-lookup", shared by all clients); production runs with this ON |
-| `AI_MODEL_PRIMARY` | Primary Claude model (default: `claude-opus-4-8`) |
-| `AI_MODEL_LIGHT` | Light Claude model (default: `claude-sonnet-4-6`) |
-| `AI_MODEL` | Legacy single-model override — sets both of the above |
+| `AI_MODEL_PRIMARY` | Claude model for every call (default: `claude-opus-4-8`) |
+| `AI_MODEL` | Legacy override — same effect as `AI_MODEL_PRIMARY`, takes precedence |
 | `STORAGE_RETENTION_DAYS` | Auto-purge uploads/exports older than N days (default 7, 0 = off) |
 | `FORCE_ADMIN_RESET` | `1` = reset the admin password to `APP_PASSWORD` on boot (break-glass; remove after use) |
 | `DEV_MODE` | `1` = relax cookie security + allow localhost CORS (local dev only) |

@@ -17,14 +17,14 @@ it's service-role.
 
 Storage operations always go through _sb_service.storage explicitly —
 storage.objects has no RLS policies; tenant isolation comes from the
-{company_id}/… path-prefix in app code. See migrations/PHASE_B_PLAN.md
+{company_id}/… path-prefix in app code. See docs/archive/PHASE_B_PLAN.md
 for full rationale.
 """
 import json as _json
 import os
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env", override=True)
@@ -77,7 +77,7 @@ def make_user_client(jwt: str) -> Client:
 
     PERF NOTE: this constructs a fresh httpx.Client. If staging
     measurement shows >50ms p95 added to request latency, switch to a
-    pooled-client pattern. See PHASE_B_PLAN.md §8.4 (H3).
+    pooled-client pattern. See docs/archive/PHASE_B_PLAN.md §8.4 (H3).
     """
     return create_client(
         _url, _anon_key,
@@ -114,12 +114,6 @@ def storage_upload(bucket: str, path: str, data: bytes, content_type: str = "app
 def storage_download(bucket: str, path: str) -> bytes:
     """Download a file's bytes from storage."""
     return _sb_service.storage.from_(bucket).download(path)
-
-
-def storage_signed_url(bucket: str, path: str, expires_in: int = 3600) -> str:
-    """Generate a signed URL that allows temporary access to a private file."""
-    result = _sb_service.storage.from_(bucket).create_signed_url(path, expires_in)
-    return result.get("signedURL") or result.get("signedUrl") or ""
 
 
 def storage_delete(bucket: str, path: str) -> None:
@@ -338,16 +332,6 @@ def list_memory(company_id: str) -> list[dict]:
     return r.data
 
 
-def get_memory_by_code(company_id: str, code: str) -> list[dict]:
-    """Find all memory entries for a given commodity code (any description)."""
-    r = (_client().table("product_memory")
-         .select("*")
-         .eq("company_id", company_id)
-         .eq("code", code)
-         .execute())
-    return r.data
-
-
 def get_memory_entry(company_id: str, code: str, description: str) -> Optional[dict]:
     r = (_client().table("product_memory")
          .select("*")
@@ -460,16 +444,6 @@ def find_client_by_identity(company_id: str, *, rex: str = "",
         if r.data:
             return r.data[0]
     return None
-
-
-def get_or_create_client(company_id: str, name: str,
-                         rex: str = "", eori: str = "") -> dict:
-    existing = find_client_by_identity(company_id, rex=rex, eori=eori, name=name)
-    if existing:
-        return existing
-    return create_client_record(company_id, {
-        "name": name, "rex": rex or None, "eori": eori or None,
-    })
 
 
 _CODES_PAGE = 1000

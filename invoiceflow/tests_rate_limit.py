@@ -200,10 +200,15 @@ def test_x_forwarded_for_parsing() -> None:
             self.headers = headers
             self.client = _C() if has_client else None
 
-    assert m._client_ip(_R({"x-forwarded-for": "203.0.113.5, 10.0.0.1"})) == "203.0.113.5"
+    # The RIGHTMOST entry is the one our own edge appended; the leftmost is
+    # attacker-controlled (see _client_ip) and must never be used.
+    assert m._client_ip(_R({"x-forwarded-for": "203.0.113.5, 10.0.0.1"})) == "10.0.0.1"
+    assert m._client_ip(_R({"x-forwarded-for": "198.51.100.7"})) == "198.51.100.7"
+    # Malformed rightmost entry → fall back to the socket peer address.
+    assert m._client_ip(_R({"x-forwarded-for": "203.0.113.5, not-an-ip"}, has_client=True)) == "10.0.0.1"
     assert m._client_ip(_R({}, has_client=True)) == "10.0.0.1"
     assert m._client_ip(_R({})) == "unknown"
-    _step("XFF leftmost, fallback chain, and unknown all correct")
+    _step("XFF rightmost, malformed fallback, fallback chain, and unknown all correct")
 
 
 def test_no_op_clear_path() -> None:

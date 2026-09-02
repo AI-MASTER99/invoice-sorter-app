@@ -4,7 +4,7 @@ JWT minting for the per-request user-scoped Supabase client.
 Phase B switch: every authenticated request mints a short-lived
 HS256 JWT signed with SUPABASE_JWT_SECRET. The JWT is consumed
 inside the request scope only — never returned to the user, never
-logged. See migrations/PHASE_B_PLAN.md for the full design rationale.
+logged. See docs/archive/PHASE_B_PLAN.md for the full design rationale.
 
 The PostgREST `role` claim is HARDCODED to "authenticated" (the
 Postgres connection role). The application-level role
