@@ -115,16 +115,15 @@ else:
 UPLOADS_DIR = _DATA_ROOT / "uploads"
 OUTPUT_DIR  = _DATA_ROOT / "output"
 
-# AI models — the primary one does the heavy lifting (extraction, verification,
-# sub-code matching — anything where quality directly affects customs outcomes).
-# The light one handles the simple totals extraction where Sonnet is plenty.
+# The Claude model for every call — extraction, verification, totals and
+# sub-code matching all affect customs outcomes, so they all use the same one.
+# (An AI_MODEL_LIGHT split for totals extraction was configured but never wired
+# in; it was removed rather than switched on unreviewed.)
 AI_MODEL_PRIMARY = os.environ.get("AI_MODEL_PRIMARY", "claude-opus-4-8")
-AI_MODEL_LIGHT   = os.environ.get("AI_MODEL_LIGHT",   "claude-sonnet-4-6")
 
-# Legacy single-model env var — if set, override both (for easy rollback)
+# Legacy single-model env var — if set, overrides AI_MODEL_PRIMARY (easy rollback)
 if os.environ.get("AI_MODEL"):
     AI_MODEL_PRIMARY = os.environ["AI_MODEL"]
-    AI_MODEL_LIGHT   = os.environ["AI_MODEL"]
 
 # Feature flag: source commodity sub-codes from the company-wide commodity
 # list in the DB (commodity_codes table — shared by all clients) instead of
