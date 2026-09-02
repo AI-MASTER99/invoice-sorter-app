@@ -27,7 +27,7 @@ Usage
   python scripts/load_commodity_list.py
 
   # re-derive the committed list from a new export first
-  python scripts/load_commodity_list.py --source "C:/Users/Beverley/Downloads/CDS items.csv" --derive
+  python scripts/load_commodity_list.py --source "<CDS items export.csv>" --derive
 
   # start over: wipe the list, then load
   python scripts/load_commodity_list.py --replace

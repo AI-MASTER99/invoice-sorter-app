@@ -35,7 +35,20 @@ uvicorn main:app --reload --port 8000
 
 Open http://localhost:8000/login (user `admin` + your `APP_PASSWORD`).
 
-Tests: `python -m pytest tests_review.py tests_rate_limit.py -q`
+### Tests
+
+```bash
+cd invoiceflow
+pip install -r requirements-dev.txt
+python -m pytest            # pytest.ini picks up every tests_*.py
+python -m pyflakes *.py ../scripts/*.py
+bash ../scripts/check_no_raw_sb.sh   # Phase B invariant: no service-role client in request handlers
+```
+
+Every test file imports `main`, so the `.env` must be valid (dummy values are
+fine for the unit tests). `tests_user_admin.py` talks to the real Supabase
+project in `.env` and fails without network access to it; the other files
+run offline.
 
 ## Commodity-code list (the "V-lookup")
 
@@ -91,6 +104,31 @@ already present keeps its description (which came from a real declaration,
 as a sheet's wording did not), so an overlapping sheet never duplicates a
 row. Both refuse a code shorter than 8 digits rather than padding it into
 one that was never declared.
+
+## Database migrations
+
+`invoiceflow/migrations/` holds numbered SQL files, each with a `_rollback`
+and (usually) a `_verify` companion whose header states the expected
+result. Apply them through the Supabase SQL editor, or with a personal
+access token:
+
+```bash
+SUPABASE_PAT=sbp_... python scripts/apply_migration.py 006 --dry-run   # show what would be sent
+SUPABASE_PAT=sbp_... python scripts/apply_migration.py 006             # apply, then run 006_verify.sql
+```
+
+Migration 005 (tariff-engine tables) is written but not applied anywhere;
+nothing in the app reads those tables yet.
+
+## Repository layout
+
+| Path | What |
+|------|------|
+| `invoiceflow/` | The FastAPI app (`main.py`), data layer (`database.py`), review/tariff helpers, tests, migrations, static frontend |
+| `scripts/` | Operator tooling: commodity-list loading, storage cleanup, migration apply, the Phase B lint |
+| `docs/` | The rules-engine plan (open work) and `docs/archive/` for historical hand-overs and the Phase B design |
+| `website/` | The static landing page (www.invoice-sorter.com) |
+| `render.yaml`, `Procfile` | Render deployment (Blueprint + fallback start command) |
 
 ## Environment variables
 

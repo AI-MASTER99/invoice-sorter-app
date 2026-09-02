@@ -1,6 +1,8 @@
 # MultiFreight CDS Items — per-code "rule engine" implementation plan
 
-Status: **DESIGN + PHASE 1 (research)**. Nothing here is deployed.
+Status: **partially implemented.** `invoiceflow/tariff_rules.py` ships the first
+rules (Y929 food-only, N853 flag); migration 005 (the tariff-engine tables) is
+written but **not applied** to any database. Phases 3–5 below are still open.
 Firm constraints (do not break):
 - **Never guess.** Anything not determinable from authoritative data + the invoice → flag for a human.
 - **Local only until the user says "last-call".** No commit-push/deploy before that.
