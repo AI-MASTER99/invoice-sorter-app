@@ -285,3 +285,64 @@ def test_added_entries_survive_the_derived_round_trip(tmp_path):
     path = tmp_path / "commodity_codes.csv"
     cl.write_derived(merged, path)
     assert cl.read_derived(path) == merged
+
+
+# ── Sheets that don't start at A1, and 10-digit code columns ─────────────
+def test_read_code_list_finds_a_header_below_blank_rows(tmp_path):
+    # The Dornack supplier sheet carries two blank rows above its header.
+    path = write_list(tmp_path, ",,\r\n,,\r\n"
+                                "SUPPLIER,Commodity Code ,Taric,Description\r\n"
+                                "PIDY,19059080,00,BAKED PASTRY\r\n")
+    entries, stats = cl.read_code_list(path)
+    assert stats["rows"] == 1                    # the blank rows are not rows
+    assert entries[0]["full_code"] == "1905908000"
+    assert entries[0]["description"] == "BAKED PASTRY"
+
+
+def test_read_code_list_tolerates_a_trailing_space_in_a_header(tmp_path):
+    path = write_list(tmp_path, "Commodity Code ,Taric, Description \r\n"
+                                "19059080,00,BAKED PASTRY\r\n")
+    entries, _ = cl.read_code_list(path)
+    assert entries[0]["full_code"] == "1905908000"
+
+
+def test_read_code_list_error_names_the_first_real_row(tmp_path):
+    import pytest
+    path = write_list(tmp_path, ",,\r\nWidget,Colour\r\n")
+    with pytest.raises(ValueError, match="Widget"):
+        cl.read_code_list(path)
+
+
+def test_split_list_code_takes_a_10_digit_cell_as_the_full_code():
+    # '4202129990' is already the full code; the TARIC cell's 80 is the
+    # product-line suffix and must not be appended (that would be 12 digits).
+    assert cl._split_list_code("4202129990", "80") == ("42021299", "90")
+    assert cl._split_list_code("6505003000", "80") == ("65050030", "00")
+
+
+def test_split_list_code_takes_an_8_digit_cell_plus_its_taric():
+    assert cl._split_list_code("19059080", "00") == ("19059080", "00")
+    assert cl._split_list_code("84249080", "80") == ("84249080", "80")
+
+
+def test_split_list_code_still_reads_a_combined_column():
+    assert cl._split_list_code("20059980/98", "") == ("20059980", "98")
+
+
+def test_split_list_code_still_repairs_and_refuses():
+    assert cl._split_list_code("2101219", "00") == ("02101219", "00")
+    assert cl._split_list_code("852910", "00") == ("", "")
+
+
+def test_read_code_list_reads_a_numeric_code_cell(tmp_path):
+    """openpyxl hands back ints/floats; 19059080.0 must not become 9 digits."""
+    import openpyxl
+    wb = openpyxl.Workbook()
+    wb.active.append(["Commodity Code", "Taric", "Description"])
+    wb.active.append([19059080, "00", "BAKED PASTRY"])      # int
+    wb.active.append([44152090.0, "00", "PALLETS"])         # float
+    path = tmp_path / "numeric.xlsx"
+    wb.save(path)
+    entries, stats = cl.read_code_list(path)
+    assert stats["skipped_no_code"] == 0
+    assert [e["full_code"] for e in entries] == ["1905908000", "4415209000"]

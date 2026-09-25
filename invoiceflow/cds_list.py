@@ -311,6 +311,42 @@ def _header_index(header: list[str], names: tuple[str, ...]) -> int:
     return -1
 
 
+# Exported sheets often carry a title or blank rows above the header, so the
+# header is looked for rather than assumed to be row 1.
+_HEADER_SCAN_ROWS = 15
+
+
+def _find_header(rows: list[list]) -> tuple[int, list]:
+    """(index, row) of the first row naming both a code and a description column."""
+    for i, row in enumerate(rows[:_HEADER_SCAN_ROWS]):
+        if (_header_index(row, _LIST_CODE_HEADERS) >= 0
+                and _header_index(row, _LIST_DESC_HEADERS) >= 0):
+            return i, row
+    return -1, []
+
+
+def _split_list_code(raw_code: str, raw_taric: str) -> tuple[str, str]:
+    """A code list's code cell + TARIC cell -> (general 8, taric 2).
+
+    Two shapes occur, told apart by how many digits the code cell holds:
+
+      '19059080' + '00' -> ('19059080', '00')   8 digits: the TARIC cell is
+                                                the code's last two digits.
+      '4202129990' + '80' -> ('42021299', '90') 10 digits: the cell is ALREADY
+                                                the full code, and the TARIC
+                                                cell is the product-line
+                                                suffix (80), not part of it.
+
+    Appending the suffix to a 10-digit code would invent a 12-digit code. The
+    reading is confirmed by the list itself: every 10-digit code in the
+    Dornack sheet is already held at exactly that value, suffix excluded.
+    """
+    digits = re.sub(r"\D", "", str(raw_code or ""))
+    if len(digits) == 10:
+        return digits[:8], digits[8:]
+    return split_code(f"{raw_code}/{raw_taric}")
+
+
 # An .xlsx is a zip; sniffing the magic beats trusting an upload's filename.
 _XLSX_MAGIC = b"PK\x03\x04"
 
@@ -338,7 +374,9 @@ def read_code_list(source) -> tuple[list[dict], dict]:
 
     Returns (entries, stats). Entries carry no provenance — no REX, no
     origin, `lines` 0 and no `last_used` — because a code list records
-    that a code is used, not any declaration it came from. Rows whose code
+    that a code is used, not any declaration it came from. The header row
+    is searched for rather than assumed to be row 1, since exported sheets
+    often carry a title or blank rows above it. Rows whose code
     is not a full 8-digit one (a 6-digit stub such as '852910') are counted
     in `stats['skipped_no_code']` and left out, exactly as `build_list`
     leaves them out of the export: padding a stub would invent a code that
@@ -350,17 +388,26 @@ def read_code_list(source) -> tuple[list[dict], dict]:
         stats["entries"] = 0
         return [], stats
 
-    header, *body = rows
+    at, header = _find_header(rows)
+    if at < 0:
+        first = next((r for r in rows if any(str(c or "").strip() for c in r)), [])
+        raise ValueError(
+            "The sheet needs a commodity-code column and a description "
+            f"column; found {[str(h) for h in first if h] or 'no headers'}")
+    body = rows[at + 1:]
     i_code = _header_index(header, _LIST_CODE_HEADERS)
     i_taric = _header_index(header, _LIST_TARIC_HEADERS)
     i_desc = _header_index(header, _LIST_DESC_HEADERS)
-    if i_code < 0 or i_desc < 0:
-        raise ValueError(
-            "The sheet needs a commodity-code column and a description "
-            f"column; found {[str(h) for h in header if h] or 'no headers'}")
 
     def cell(row, i):
-        return "" if i < 0 or i >= len(row) or row[i] is None else str(row[i])
+        if i < 0 or i >= len(row) or row[i] is None:
+            return ""
+        v = row[i]
+        # A spreadsheet may hold a code as a number; 19059080.0 must not
+        # render as "19059080.0" and become a 9-digit code.
+        if isinstance(v, float) and v.is_integer():
+            return str(int(v))
+        return str(v)
 
     seen: dict[str, dict] = {}
     for row in body:
@@ -368,8 +415,7 @@ def read_code_list(source) -> tuple[list[dict], dict]:
             continue
         stats["rows"] += 1
         raw_code, raw_taric = cell(row, i_code).strip(), cell(row, i_taric)
-        general, taric = split_code(
-            raw_code if "/" in raw_code else f"{raw_code}/{raw_taric}")
+        general, taric = _split_list_code(raw_code, raw_taric)
         desc = clean_description(cell(row, i_desc))
         if not general or not desc:
             stats["skipped_no_code"] += 1
