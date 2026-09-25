@@ -173,11 +173,13 @@ SHEET = (b"Commodity Code,Additional Taric,Description\r\n"
          b"852910,00,ELEVATOR MATERIAL\r\n")   # 6-digit stub, unusable
 
 
-def _stub_list(monkeypatch, existing=(("07049010", "0704901000"),)):
+def _stub_list(monkeypatch, existing=(("07049010", "0704901000"),), rows=None):
     written = []
     monkeypatch.setattr(m.db, "list_commodity_codes",
-                        lambda cid: [{"general_code": g, "full_code": f}
-                                     for g, f in existing])
+                        lambda cid: rows if rows is not None else
+                        [{"general_code": g, "full_code": f,
+                          "taric_code": f[8:10], "description": "CABBAGE"}
+                         for g, f in existing])
     monkeypatch.setattr(m.db, "upsert_commodity_codes",
                         lambda cid, rows: written.extend(rows) or len(rows))
     monkeypatch.setattr(m.db, "count_commodity_codes",
@@ -188,7 +190,8 @@ def _stub_list(monkeypatch, existing=(("07049010", "0704901000"),)):
 def test_import_adds_only_the_codes_not_already_there(monkeypatch):
     written = _stub_list(monkeypatch)
     out = asyncio.run(m.api_import_commodity_codes(file=_Upload(SHEET), ctx=CTX))
-    assert out == {"added": 1, "already_present": 1, "skipped": 1, "total": 2}
+    assert out == {"added": 1, "filled": 0, "already_present": 1,
+                   "skipped": 1, "total": 2}
     # Only the new code is written, in the commodity_codes column shape.
     assert written == [{"general_code": "02013000", "full_code": "0201300090",
                         "taric_code": "90", "description": "TARTARE DI FASONA"}]
@@ -311,3 +314,59 @@ def test_exact_multiple_of_the_page_size_needs_the_empty_page(monkeypatch):
     _, calls = _fake_db(monkeypatch, 2000)
     assert len(db.list_commodity_codes("c1")) == 2000
     assert len(calls) == 3                      # 1000 + 1000 + the short one
+
+
+# A code already in the list keeps its wording — unless it hasn't got one.
+def test_import_fills_a_blank_description_and_taric():
+    """The migration-006 seed left rows blank; the sheet must fill them."""
+    import copy
+    blank = [{"general_code": "07049010", "full_code": "0704901000",
+              "taric_code": "", "description": ""}]
+    written = []
+
+    class _P:
+        def __init__(self, rows): self.rows = rows
+        def list_commodity_codes(self, cid): return copy.deepcopy(self.rows)
+        def upsert_commodity_codes(self, cid, r): written.extend(r); return len(r)
+        def count_commodity_codes(self, cid): return len(self.rows) + 1
+
+    stub, real = _P(blank), m.db
+    m.db = stub
+    try:
+        out = asyncio.run(m.api_import_commodity_codes(file=_Upload(SHEET), ctx=CTX))
+    finally:
+        m.db = real
+    assert (out["added"], out["filled"], out["already_present"]) == (1, 1, 0)
+    patched = [w for w in written if w["full_code"] == "0704901000"]
+    assert patched == [{"general_code": "07049010", "full_code": "0704901000",
+                        "taric_code": "00", "description": "CABBAGE"}]
+
+
+def test_import_does_not_overwrite_a_description_that_exists(monkeypatch):
+    """Only blanks are filled — a real wording outranks the sheet's."""
+    written = _stub_list(monkeypatch, rows=[
+        {"general_code": "07049010", "full_code": "0704901000",
+         "taric_code": "00", "description": "GREEN CABBAGE, WHOLE"}])
+    out = asyncio.run(m.api_import_commodity_codes(file=_Upload(SHEET), ctx=CTX))
+    assert (out["added"], out["filled"], out["already_present"]) == (1, 0, 1)
+    assert all(w["full_code"] != "0704901000" for w in written)
+
+
+def test_import_fills_only_the_blank_half(monkeypatch):
+    """A blank TARIC is filled while a real description is kept."""
+    written = _stub_list(monkeypatch, rows=[
+        {"general_code": "07049010", "full_code": "0704901000",
+         "taric_code": "", "description": "GREEN CABBAGE, WHOLE"}])
+    asyncio.run(m.api_import_commodity_codes(file=_Upload(SHEET), ctx=CTX))
+    [patched] = [w for w in written if w["full_code"] == "0704901000"]
+    assert patched["taric_code"] == "00"
+    assert patched["description"] == "GREEN CABBAGE, WHOLE"
+
+
+def test_import_payloads_all_share_one_shape(monkeypatch):
+    """PostgREST rejects a bulk upsert whose objects differ in shape."""
+    written = _stub_list(monkeypatch, rows=[
+        {"general_code": "07049010", "full_code": "0704901000",
+         "taric_code": "", "description": ""}])
+    asyncio.run(m.api_import_commodity_codes(file=_Upload(SHEET), ctx=CTX))
+    assert len({tuple(sorted(w)) for w in written}) == 1
