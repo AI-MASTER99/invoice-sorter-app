@@ -3688,10 +3688,15 @@ async def api_import_commodity_codes(file: UploadFile = File(...),
 
     The sheet is one row per code — a "Commodity Code" column (or a
     combined "20059980/98"), an optional "Additional Taric", and a
-    "Description". Only codes the list does not already hold are written:
-    a code already there keeps its description, so re-importing the same
-    sheet — or one that overlaps — never duplicates a row or overwrites a
-    wording that came from a real declaration.
+    "Description". Codes the list does not hold are added; a code already
+    there keeps its description, so re-importing the same sheet — or one
+    that overlaps — never duplicates a row or overwrites a wording that
+    came from a real declaration.
+
+    The one exception is a row whose description or TARIC is EMPTY: there
+    is no wording to protect, so the sheet fills the gap. Rows seeded from
+    the per-client lists (migration 006) arrived blank, and a blank
+    description reaches the customs export as a blank goods description.
     """
     if not file.filename:
         raise HTTPException(400, "No filename provided")
@@ -3714,14 +3719,36 @@ async def api_import_commodity_codes(file: UploadFile = File(...),
     if not entries:
         raise HTTPException(400, "No usable commodity codes in that file")
 
-    have = {c["full_code"] for c in db.list_commodity_codes(ctx["company_id"])}
-    fresh = [cds_list.product_payload(e) for e in entries
-             if e["full_code"] not in have]
-    if fresh:
-        db.upsert_commodity_codes(ctx["company_id"], fresh)
+    current = {c["full_code"]: c for c in db.list_commodity_codes(ctx["company_id"])}
+    fresh, filled = [], []
+    for entry in entries:
+        payload = cds_list.product_payload(entry)
+        row = current.get(entry["full_code"])
+        if row is None:
+            fresh.append(payload)
+            continue
+        # A code already in the list keeps its wording — unless it hasn't
+        # got one. Rows seeded from the per-client lists (migration 006)
+        # carry an empty description and TARIC; there is nothing there to
+        # protect, and a blank description reaches the export as a blank
+        # goods description. So blanks are filled and everything else is
+        # left exactly as it is.
+        have_desc = (row.get("description") or "").strip()
+        have_taric = (row.get("taric_code") or "").strip()
+        if (have_desc or not payload["description"]) and \
+           (have_taric or not payload["taric_code"]):
+            continue
+        # Every payload carries the same keys: PostgREST rejects a bulk
+        # upsert whose objects differ in shape.
+        filled.append({**payload,
+                       "description": have_desc or payload["description"],
+                       "taric_code": have_taric or payload["taric_code"]})
+    if fresh or filled:
+        db.upsert_commodity_codes(ctx["company_id"], fresh + filled)
     return {
         "added": len(fresh),
-        "already_present": len(entries) - len(fresh),
+        "filled": len(filled),
+        "already_present": len(entries) - len(fresh) - len(filled),
         "skipped": stats["skipped_no_code"],
         "total": db.count_commodity_codes(ctx["company_id"]),
     }

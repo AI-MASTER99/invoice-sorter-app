@@ -859,6 +859,7 @@ document.getElementById('btn-code-import')?.addEventListener('click', async () =
     // Say what happened to every row, so a sheet that adds nothing reads as
     // "already there" rather than as a failure.
     const bits = [`${r.added} code${r.added === 1 ? '' : 's'} added`];
+    if (r.filled) bits.push(`${r.filled} filled in`);
     if (r.already_present) bits.push(`${r.already_present} already in the list`);
     if (r.skipped) bits.push(`${r.skipped} row${r.skipped === 1 ? '' : 's'} without a usable code`);
     _clientsMsg('codes-msg', `✓ ${bits.join(', ')} — the list now holds ${r.total}.`, true);
