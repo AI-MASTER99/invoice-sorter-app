@@ -2383,11 +2383,17 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
         elif origin:
             put(out_row, "[4/17] Preference", "100", as_text=True)
         put(out_row, "[4/8] Method of Payment", cds.get("mop"), as_text=True)
-        # VATZ (zero-rated VAT) on every item — operator instruction 2026-07
-        # ("'VATZ' needs to be installed on column AY for all Items"). A
-        # product-specific nat_add_code from the client list overrides it.
+        # VATZ (zero-rated VAT) is a FOOD relief, so it goes on food lines
+        # only (ch. 01-24) — it used to go on every item, which put it on
+        # the ~65% of the list that is not food (operator correction,
+        # 2026-10: "remove VATZ … as this is only for food stuffs").
+        # A per-code nat_add_code from the commodity-code list still wins,
+        # which is how a food-chapter line that must NOT be zero-rated
+        # (chapter 22 alcohol) or needs another code (X570, 4605) is fixed.
         put(out_row, "[6/17] National Additional Codes - Code (01)",
-            cds.get("nat_add_code") or "VATZ", as_text=True)
+            cds.get("nat_add_code")
+            or ("VATZ" if tariff_rules.vatz_applies(g["c8"]) else ""),
+            as_text=True)
         # ── DE 2/1 previous document (01): the invoice itself ──
         # Category and type are constants; the reference is the invoice
         # number read off the invoice. When that is unknown the Ref cell is
@@ -3722,7 +3728,11 @@ async def api_import_commodity_codes(file: UploadFile = File(...),
     current = {c["full_code"]: c for c in db.list_commodity_codes(ctx["company_id"])}
     fresh, filled = [], []
     for entry in entries:
-        payload = cds_list.product_payload(entry)
+        # nat_add_code rides along only on this path: it overrides the
+        # export's VATZ default for one code, and a sheet that has no such
+        # column leaves it "" (meaning "use the default").
+        payload = {**cds_list.product_payload(entry),
+                   "nat_add_code": entry.get("nat_add_code", "")}
         row = current.get(entry["full_code"])
         if row is None:
             fresh.append(payload)
@@ -3733,16 +3743,14 @@ async def api_import_commodity_codes(file: UploadFile = File(...),
         # protect, and a blank description reaches the export as a blank
         # goods description. So blanks are filled and everything else is
         # left exactly as it is.
-        have_desc = (row.get("description") or "").strip()
-        have_taric = (row.get("taric_code") or "").strip()
-        if (have_desc or not payload["description"]) and \
-           (have_taric or not payload["taric_code"]):
+        kept = {f: (row.get(f) or "").strip()
+                for f in ("description", "taric_code", "nat_add_code")}
+        if all(kept[f] or not payload[f] for f in kept):
             continue
         # Every payload carries the same keys: PostgREST rejects a bulk
         # upsert whose objects differ in shape.
         filled.append({**payload,
-                       "description": have_desc or payload["description"],
-                       "taric_code": have_taric or payload["taric_code"]})
+                       **{f: kept[f] or payload[f] for f in kept}})
     if fresh or filled:
         db.upsert_commodity_codes(ctx["company_id"], fresh + filled)
     return {

@@ -32,7 +32,8 @@ import cds_list                       # noqa: E402
 
 DERIVED_CSV = ROOT / "invoiceflow" / "data" / "commodity_codes.csv"
 DEFAULT_OUT = ROOT / "Commodity_Codes_Full_List.xlsx"
-COLUMNS = ["Commodity Code", "Additional Taric", "Description"]
+COLUMNS = ["Commodity Code", "Additional Taric", "Description",
+           "[6/17] National Additional Codes - Code (01)"]
 
 
 def parse_args():
@@ -59,8 +60,9 @@ def main():
     ws.title = "Commodity Codes"
     ws.append(COLUMNS)
     for e in entries:
-        ws.append([e["general_code"], e["taric_code"], e["description"]])
-    for col, width in zip("ABC", (18, 16, 70)):
+        ws.append([e["general_code"], e["taric_code"], e["description"],
+                   e.get("nat_add_code", "")])
+    for col, width in zip("ABCD", (18, 16, 70, 34)):
         ws.column_dimensions[col].width = width
     for row in ws.iter_rows(min_row=2, max_col=2):
         for cell in row:

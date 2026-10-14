@@ -209,6 +209,9 @@ def build_list(rows: list[dict]) -> tuple[list[dict], dict]:
             "full_code": full,
             "taric_code": full[8:10],
             "description": choose_description(counter),
+            # The CDS export carries no national additional code; a
+            # spreadsheet import can fill it. One entry shape everywhere.
+            "nat_add_code": "",
             "origin": m["origin"],
             "preference": m["preference"],
             "procedure": m["procedure"],
@@ -228,8 +231,8 @@ def parse_export(source) -> tuple[list[dict], dict]:
 
 # ── The derived list, as committed to the repo ──────────────────────────
 DERIVED_COLUMNS = ["rex", "general_code", "full_code", "taric_code",
-                   "description", "origin", "preference", "procedure",
-                   "lines", "last_used"]
+                   "description", "nat_add_code", "origin", "preference",
+                   "procedure", "lines", "last_used"]
 
 
 def write_derived(entries: list[dict], path) -> None:
@@ -247,6 +250,9 @@ def read_derived(path) -> list[dict]:
         rows = list(csv.DictReader(fh))
     for r in rows:
         r["lines"] = int(r.get("lines") or 0)
+        # nat_add_code joined the format later; a file written before it
+        # simply has no such column.
+        r["nat_add_code"] = (r.get("nat_add_code") or "").strip()
     return rows
 
 
@@ -299,6 +305,24 @@ def product_payload(entry: dict) -> dict:
 _LIST_CODE_HEADERS = ("commodity code", "code", "full code", "general code")
 _LIST_TARIC_HEADERS = ("additional taric", "taric", "taric code", "additional")
 _LIST_DESC_HEADERS = ("description", "commodity description", "goods")
+
+
+def _nat_add_code_index(header: list) -> int:
+    """Position of the National Additional Codes column, or -1.
+
+    Matched loosely: the MultiFreight export names it
+    "[6/17] National Additional Codes - Code (01)", so the field number and
+    the slot suffix travel with the name. Only slot 01 is read - the list
+    holds one national additional code per commodity code.
+    """
+    for i, h in enumerate(header):
+        name = re.sub(r"\s+", " ", str(h or "")).strip().casefold()
+        if "national additional code" not in name:
+            continue
+        if "(0" in name and "(01)" not in name:
+            continue                      # a later slot (02, 03, …)
+        return i
+    return -1
 
 
 def _header_index(header: list[str], names: tuple[str, ...]) -> int:
@@ -374,7 +398,10 @@ def read_code_list(source) -> tuple[list[dict], dict]:
 
     Returns (entries, stats). Entries carry no provenance — no REX, no
     origin, `lines` 0 and no `last_used` — because a code list records
-    that a code is used, not any declaration it came from. The header row
+    that a code is used, not any declaration it came from. A National
+    Additional Codes column is read when present (it overrides the export's
+    VATZ default for that code); it is "" when the sheet has no such
+    column. The header row
     is searched for rather than assumed to be row 1, since exported sheets
     often carry a title or blank rows above it. Rows whose code
     is not a full 8-digit one (a 6-digit stub such as '852910') are counted
@@ -398,6 +425,7 @@ def read_code_list(source) -> tuple[list[dict], dict]:
     i_code = _header_index(header, _LIST_CODE_HEADERS)
     i_taric = _header_index(header, _LIST_TARIC_HEADERS)
     i_desc = _header_index(header, _LIST_DESC_HEADERS)
+    i_nac = _nat_add_code_index(header)
 
     def cell(row, i):
         if i < 0 or i >= len(row) or row[i] is None:
@@ -429,6 +457,7 @@ def read_code_list(source) -> tuple[list[dict], dict]:
             "full_code": full,
             "taric_code": taric,
             "description": desc,
+            "nat_add_code": cell(row, i_nac).strip().upper(),
             "origin": "",
             "preference": "",
             "procedure": "",

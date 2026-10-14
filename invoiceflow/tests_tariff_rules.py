@@ -155,3 +155,25 @@ def test_list_docs_input_not_mutated():
     src = [{"code": "N853", "id": "X", "status": "AE", "reason": ""}]
     tr.resolve_line_docs(code8="04061030", is_eu_origin=True, list_docs=src)
     assert len(src) == 1  # engine copies, never mutates caller state
+
+
+# ── VATZ: a food relief, not a blanket code ─────────────────────────────
+def test_vatz_applies_to_food_chapters():
+    for code in ("07049010", "19059080", "04061030", "2101219"):
+        assert tr.vatz_applies(code), code      # 7-digit zero drop included
+
+
+def test_vatz_does_not_apply_outside_the_food_chapters():
+    # The bulk of the list: machinery, textiles, chemicals, packaging.
+    for code in ("84282000", "39235090", "76109010", "65050090", "28112200"):
+        assert not tr.vatz_applies(code), code
+
+
+def test_vatz_boundary_is_chapter_24():
+    assert tr.vatz_applies("24031100")          # ch. 24 — in
+    assert not tr.vatz_applies("25010010")      # ch. 25 — out
+
+
+def test_vatz_chapter_22_is_in_range_and_needs_a_per_code_override():
+    """Documents the known gap: alcohol sits in a food chapter."""
+    assert tr.vatz_applies("22042166")          # wine — chapter test says yes

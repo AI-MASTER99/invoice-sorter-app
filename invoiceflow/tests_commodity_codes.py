@@ -194,7 +194,8 @@ def test_import_adds_only_the_codes_not_already_there(monkeypatch):
                    "skipped": 1, "total": 2}
     # Only the new code is written, in the commodity_codes column shape.
     assert written == [{"general_code": "02013000", "full_code": "0201300090",
-                        "taric_code": "90", "description": "TARTARE DI FASONA"}]
+                        "taric_code": "90", "description": "TARTARE DI FASONA",
+                        "nat_add_code": ""}]
 
 
 def test_import_of_an_entirely_known_sheet_writes_nothing(monkeypatch):
@@ -339,7 +340,8 @@ def test_import_fills_a_blank_description_and_taric():
     assert (out["added"], out["filled"], out["already_present"]) == (1, 1, 0)
     patched = [w for w in written if w["full_code"] == "0704901000"]
     assert patched == [{"general_code": "07049010", "full_code": "0704901000",
-                        "taric_code": "00", "description": "CABBAGE"}]
+                        "taric_code": "00", "description": "CABBAGE",
+                        "nat_add_code": ""}]
 
 
 def test_import_does_not_overwrite_a_description_that_exists(monkeypatch):
@@ -370,3 +372,31 @@ def test_import_payloads_all_share_one_shape(monkeypatch):
          "taric_code": "", "description": ""}])
     asyncio.run(m.api_import_commodity_codes(file=_Upload(SHEET), ctx=CTX))
     assert len({tuple(sorted(w)) for w in written}) == 1
+
+
+def test_import_fills_a_blank_national_additional_code(monkeypatch):
+    """Guy's sheet sets the code for a few products; blanks keep the default."""
+    sheet = (b"Commodity Code,Taric,"
+             b"[6/17] National Additional Codes - Code (01),Description\r\n"
+             b"27101999,90,X570,GREASE\r\n")
+    written = _stub_list(monkeypatch, rows=[
+        {"general_code": "27101999", "full_code": "2710199990",
+         "taric_code": "90", "description": "GREASE", "nat_add_code": ""}])
+    out = asyncio.run(m.api_import_commodity_codes(file=_Upload(sheet), ctx=CTX))
+    assert (out["added"], out["filled"]) == (0, 1)
+    [patched] = written
+    assert patched["nat_add_code"] == "X570"
+    assert patched["description"] == "GREASE"      # untouched
+
+
+def test_import_does_not_blank_an_existing_national_additional_code(monkeypatch):
+    """A sheet with the column empty must not wipe a code already set."""
+    sheet = (b"Commodity Code,Taric,"
+             b"[6/17] National Additional Codes - Code (01),Description\r\n"
+             b"27101999,90,,GREASE\r\n")
+    written = _stub_list(monkeypatch, rows=[
+        {"general_code": "27101999", "full_code": "2710199990",
+         "taric_code": "90", "description": "GREASE", "nat_add_code": "X570"}])
+    out = asyncio.run(m.api_import_commodity_codes(file=_Upload(sheet), ctx=CTX))
+    assert (out["added"], out["filled"]) == (0, 0)
+    assert written == []
