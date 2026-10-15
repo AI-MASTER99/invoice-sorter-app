@@ -469,6 +469,18 @@ def read_code_list(source) -> tuple[list[dict], dict]:
     return entries, stats
 
 
+def describes_goods(desc: str) -> bool:
+    """Is this cell a goods description, or a commodity code in the wrong column?
+
+    A description names goods, so it has letters in it. Three cells in the
+    2026-10 supplier sheet hold the code instead ("39199080" where the
+    list says STICKERS); written to the list they would reach the customs
+    declaration as the goods description. Anything with no letter at all -
+    digits, spaces, dots, slashes, dashes - is refused.
+    """
+    return any(ch.isalpha() for ch in str(desc or ""))
+
+
 def add_entries(existing: list[dict], additions: list[dict]) -> tuple[list[dict], dict]:
     """Add only the codes the list does not already hold.
 
