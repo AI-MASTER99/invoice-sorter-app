@@ -2885,7 +2885,18 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
                 key = f"{code}::{desc}"
                 subs = (tariff_data.get(code, {}) or {}).get("subcodes", []) or []
                 chosen = None
-                if matched_codes.get(key):
+                # The invoice's OWN code wins whenever it is already complete
+                # and the list holds it. The list keys on the 8-digit part, so
+                # one general code can offer several TARIC variants; picking
+                # among them by list order silently overrode what the invoice
+                # declared (CRC 2026-10: an invoice line reading 2903510090
+                # went out as 2903510000, which is not a declarable code, and
+                # 3910000090 went out as 3910000070, a semiconductor-specific
+                # subdivision). A declared TARIC is a fact, not a candidate.
+                invoice_full = tariff_rules.norm_digits(code)
+                if len(invoice_full) == 10:
+                    chosen = next((s for s in subs if s["code"] == invoice_full), None)
+                if chosen is None and matched_codes.get(key):
                     mc = matched_codes[key].get("matched_code", "")
                     chosen = next((s for s in subs if s["code"] == mc), None)
                 if chosen is None and subs:
