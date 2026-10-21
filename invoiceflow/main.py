@@ -3735,7 +3735,8 @@ async def api_import_commodity_codes(file: UploadFile = File(...),
         # export's VATZ default for one code, and a sheet that has no such
         # column leaves it "" (meaning "use the default").
         payload = {**cds_list.product_payload(entry),
-                   "nat_add_code": entry.get("nat_add_code", "")}
+                   "nat_add_code": entry.get("nat_add_code", ""),
+                   "documents": entry.get("documents") or []}
         row = current.get(entry["full_code"])
         if row is None:
             fresh.append(payload)
@@ -3756,6 +3757,11 @@ async def api_import_commodity_codes(file: UploadFile = File(...),
                 rejected.append(entry["full_code"])
         if payload["nat_add_code"]:
             new_vals["nat_add_code"] = payload["nat_add_code"]
+        # The DE 2/3 documents the sheet declares for this code. A sheet
+        # listing none leaves what is held alone, so a sheet that only
+        # covers codes never wipes another's documents.
+        kept["documents"] = row.get("documents") or []
+        new_vals["documents"] = payload["documents"] or kept["documents"]
         # TARIC can't disagree for the same full code, so it is only ever
         # filled when missing.
         new_vals["taric_code"] = kept["taric_code"] or payload["taric_code"]

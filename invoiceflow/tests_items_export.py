@@ -121,3 +121,43 @@ def test_a_list_national_additional_code_overrides_the_default():
     grease["_cds"] = {"nat_add_code": "X570", "documents": []}
     ws, col = _items([grease])
     assert _cell(ws, col, 4, _NAC).value == "X570"   # list wins
+
+
+# ── Documents carried by the commodity-code list ────────────────────────
+def test_a_list_document_is_declared_after_the_automatic_ones():
+    """CRC's DRY COOLANT SPRAY: Y926 comes from the list, not the engine."""
+    row = _row(code="29035100", invoice="000126985")
+    row["_cds"] = {"documents": [{"code": "Y926",
+                                  "id": "EXCLUDED FROM PROHIBITION",
+                                  "status": "",
+                                  "reason": "EXCLUDED FROM PROHIBITION"}]}
+    ws, col = _items([row], totals={"supplier_rex": "BEREX123"})
+    codes = [_cell(ws, col, 4, f"[2/3] Documents - Code (0{i})").value
+             for i in (1, 2, 3)]
+    assert codes == ["N935", "U116", "Y926"]        # engine's two, then the list's
+    assert _cell(ws, col, 4, "[2/3] Documents - ID (03)").value == \
+        "EXCLUDED FROM PROHIBITION"
+    assert _cell(ws, col, 4, "[2/3] Documents - Status (03)").value in (None, "")
+
+
+def test_a_line_with_no_list_documents_is_unchanged():
+    ws, col = _items([_row(code="29035100")])
+    assert _cell(ws, col, 4, "[2/3] Documents - Code (01)").value == "N935"
+    assert _cell(ws, col, 4, "[2/3] Documents - Code (03)").value in (None, "")
+
+
+def test_the_worst_real_line_fits_the_six_slots():
+    """Food + EU + two list documents = 5 of 6; nothing is dropped."""
+    row = _row(code="19059080", invoice="INV-1")
+    row["_cds"] = {"documents": [
+        {"code": "Y937", "id": "REG 2019/1793 EXEMPT", "status": "",
+         "reason": "REG 2019/1793 EXEMPT"},
+        {"code": "Y930", "id": "2007/275/EC EXEMPT", "status": "",
+         "reason": "2007/275/EC EXEMPT"}]}
+    ws, col = _items([row], totals={"supplier_rex": "FRREX1"})
+    codes = [_cell(ws, col, 4, f"[2/3] Documents - Code (0{i})").value
+             for i in range(1, 7)]
+    assert codes[:5] == ["N935", "Y929", "U116", "Y937", "Y930"]
+    assert codes[5] in (None, "")
+    # No ">6 DOCS" warning on the description.
+    assert "NOT DECLARED" not in (_cell(ws, col, 4, "[6/8] Description of Goods").value or "")
