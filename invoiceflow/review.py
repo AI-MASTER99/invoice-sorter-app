@@ -410,8 +410,58 @@ def check_fields(rows) -> list[dict]:
     return issues
 
 
+# A complete commodity code as printed on an invoice: ten digits, standing
+# on its own. Deliberately NOT eight — an 8-digit run is as likely to be an
+# order or customer number, and a false "missing goods line" alarm on every
+# invoice would be worse than no alarm at all.
+_PRINTED_CODE_RE = re.compile(r"(?<!\d)(\d{10})(?!\d)")
+
+
+def codes_in_text(pdf_text: str) -> list[str]:
+    """Complete commodity codes printed in the invoice's text layer.
+
+    Pure and deterministic — it reads the PDF's own characters, not the
+    model's reading of them, which is the point: it is the one signal that
+    does not share the extraction's blind spots.
+    """
+    return sorted({m.group(1) for m in _PRINTED_CODE_RE.finditer(pdf_text or "")})
+
+
+def check_missing_codes(rows, printed_codes) -> list[dict]:
+    """Codes the invoice prints that no extracted line carries.
+
+    A goods line the model never returned is otherwise invisible: nothing
+    downstream can miss what it never saw, the export is written anyway,
+    and the declaration is short by that line. Real case (CRC 000126985,
+    2026-10): the invoice printed 7310219100 for 1,080 pcs / EUR 453.60 and
+    the extraction simply did not return it, so the entry under-declared
+    the import with no warning anywhere.
+
+    Compared on the 8-digit part, since a row may legitimately hold either
+    form. Silent when the PDF has no text layer (nothing to compare).
+    """
+    printed = [c for c in (printed_codes or []) if c]
+    if not printed or not rows:
+        return []
+    have = {re.sub(r"\D", "", (r.get("Comm./imp. cod") or ""))[:8]
+            for r in rows}
+    have.discard("")
+    missing = [c for c in printed if c[:8] not in have]
+    if not missing:
+        return []
+    shown = ", ".join(missing[:6]) + (" …" if len(missing) > 6 else "")
+    return [_issue(
+        "high", "Goods lines", "commodity code",
+        f"{len(missing)} commodity code(s) printed on the invoice do not "
+        f"appear on any extracted line: {shown}. A goods line is probably "
+        f"missing, which would under-declare the import.",
+        "Compare the invoice against the lines above and add what is "
+        "missing before submitting.")]
+
+
 def build_review_issues(rows=None, totals=None, totals_check=None,
-                        ab_reasons=None, flagged_cells=None, tariff_data=None):
+                        ab_reasons=None, flagged_cells=None, tariff_data=None,
+                        printed_codes=None):
     """Single source of truth for the review screen's problem list.
 
     Runs the full Spoor-B validation: structure, totals reconciliation,
@@ -427,6 +477,7 @@ def build_review_issues(rows=None, totals=None, totals_check=None,
     issues += check_weights(rows)
     issues += check_fields(rows)
     issues += check_rows(rows, flagged_cells)
+    issues += check_missing_codes(rows, printed_codes)
     issues.sort(key=lambda x: _SEVERITY_ORDER.get(x["severity"], 9))
     return issues
 
@@ -470,5 +521,7 @@ def review_payload(invoice: dict | None) -> dict:
         ab_reasons=invoice.get("ab_reasons") or [],
         flagged_cells=flagged,
         tariff_data=invoice.get("tariff_data"),
+        printed_codes=(_totals.get("_printed_codes")
+                       if isinstance(_totals, dict) else None),
     )
     return {"summary": summarize(issues), "issues": issues}
