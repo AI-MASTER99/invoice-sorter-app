@@ -2383,11 +2383,17 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
         elif origin:
             put(out_row, "[4/17] Preference", "100", as_text=True)
         put(out_row, "[4/8] Method of Payment", cds.get("mop"), as_text=True)
-        # VATZ (zero-rated VAT) on every item — operator instruction 2026-07
-        # ("'VATZ' needs to be installed on column AY for all Items"). A
-        # product-specific nat_add_code from the client list overrides it.
+        # VATZ (zero-rated VAT) is a FOOD relief, so it goes on food lines
+        # only (ch. 01-24) — it used to go on every item, which put it on
+        # the ~65% of the list that is not food (operator correction,
+        # 2026-10: "remove VATZ … as this is only for food stuffs").
+        # A per-code nat_add_code from the commodity-code list still wins,
+        # which is how a food-chapter line that must NOT be zero-rated
+        # (chapter 22 alcohol) or needs another code (X570, 4605) is fixed.
         put(out_row, "[6/17] National Additional Codes - Code (01)",
-            cds.get("nat_add_code") or "VATZ", as_text=True)
+            cds.get("nat_add_code")
+            or ("VATZ" if tariff_rules.vatz_applies(g["c8"]) else ""),
+            as_text=True)
         # ── DE 2/1 previous document (01): the invoice itself ──
         # Category and type are constants; the reference is the invoice
         # number read off the invoice. When that is unknown the Ref cell is
@@ -3687,16 +3693,19 @@ async def api_import_commodity_codes(file: UploadFile = File(...),
     """Bulk-add a commodity-code list (.xlsx or .csv) to the company list.
 
     The sheet is one row per code — a "Commodity Code" column (or a
-    combined "20059980/98"), an optional "Additional Taric", and a
-    "Description". Codes the list does not hold are added; a code already
-    there keeps its description, so re-importing the same sheet — or one
-    that overlaps — never duplicates a row or overwrites a wording that
-    came from a real declaration.
+    combined "20059980/98"), an optional "Additional Taric", a
+    "Description", and optionally a "National Additional Codes" column.
+    Codes the list does not hold are added; a code it does hold is never
+    duplicated.
 
-    The one exception is a row whose description or TARIC is EMPTY: there
-    is no wording to protect, so the sheet fills the gap. Rows seeded from
-    the per-client lists (migration 006) arrived blank, and a blank
-    description reaches the customs export as a blank goods description.
+    On an existing code the sheet is treated as the operator's own
+    wording and a NON-EMPTY cell wins — a blank cell never wipes what is
+    held, so re-importing a partly-filled sheet is safe. Two guards: a
+    "description" with no letter in it is a commodity code typed into the
+    wrong column (three such cells came in the 2026-10 sheet) and is
+    refused rather than written to a customs declaration, and TARIC is
+    only ever filled when missing, since it cannot disagree for the same
+    full code.
     """
     if not file.filename:
         raise HTTPException(400, "No filename provided")
@@ -3720,35 +3729,49 @@ async def api_import_commodity_codes(file: UploadFile = File(...),
         raise HTTPException(400, "No usable commodity codes in that file")
 
     current = {c["full_code"]: c for c in db.list_commodity_codes(ctx["company_id"])}
-    fresh, filled = [], []
+    fresh, updated, rejected = [], [], []
     for entry in entries:
-        payload = cds_list.product_payload(entry)
+        # nat_add_code rides along only on this path: it overrides the
+        # export's VATZ default for one code, and a sheet that has no such
+        # column leaves it "" (meaning "use the default").
+        payload = {**cds_list.product_payload(entry),
+                   "nat_add_code": entry.get("nat_add_code", "")}
         row = current.get(entry["full_code"])
         if row is None:
             fresh.append(payload)
             continue
-        # A code already in the list keeps its wording — unless it hasn't
-        # got one. Rows seeded from the per-client lists (migration 006)
-        # carry an empty description and TARIC; there is nothing there to
-        # protect, and a blank description reaches the export as a blank
-        # goods description. So blanks are filled and everything else is
-        # left exactly as it is.
-        have_desc = (row.get("description") or "").strip()
-        have_taric = (row.get("taric_code") or "").strip()
-        if (have_desc or not payload["description"]) and \
-           (have_taric or not payload["taric_code"]):
+        # The sheet is the operator's own wording, so a non-empty cell
+        # wins over what is held (2026-10 decision: his descriptions are
+        # the specific ones — "PRE BAKED SWEET CHOCOLATE SHORTCRUST PASTRY
+        # SHELLS" where the list had "READY TO EAT BISCUITS"). A blank
+        # cell never wipes a value, and a "description" that is really a
+        # commodity code is refused rather than written to a declaration.
+        kept = {f: (row.get(f) or "").strip()
+                for f in ("description", "taric_code", "nat_add_code")}
+        new_vals = dict(kept)
+        if payload["description"]:
+            if cds_list.describes_goods(payload["description"]):
+                new_vals["description"] = payload["description"]
+            else:
+                rejected.append(entry["full_code"])
+        if payload["nat_add_code"]:
+            new_vals["nat_add_code"] = payload["nat_add_code"]
+        # TARIC can't disagree for the same full code, so it is only ever
+        # filled when missing.
+        new_vals["taric_code"] = kept["taric_code"] or payload["taric_code"]
+        if new_vals == kept:
             continue
         # Every payload carries the same keys: PostgREST rejects a bulk
         # upsert whose objects differ in shape.
-        filled.append({**payload,
-                       "description": have_desc or payload["description"],
-                       "taric_code": have_taric or payload["taric_code"]})
-    if fresh or filled:
-        db.upsert_commodity_codes(ctx["company_id"], fresh + filled)
+        updated.append({**payload, **new_vals})
+    if fresh or updated:
+        db.upsert_commodity_codes(ctx["company_id"], fresh + updated)
     return {
         "added": len(fresh),
-        "filled": len(filled),
-        "already_present": len(entries) - len(fresh) - len(filled),
+        "updated": len(updated),
+        "already_present": len(entries) - len(fresh) - len(updated),
+        "rejected": len(rejected),
+        "rejected_codes": rejected[:20],
         "skipped": stats["skipped_no_code"],
         "total": db.count_commodity_codes(ctx["company_id"]),
     }

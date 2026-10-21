@@ -346,3 +346,30 @@ def test_read_code_list_reads_a_numeric_code_cell(tmp_path):
     entries, stats = cl.read_code_list(path)
     assert stats["skipped_no_code"] == 0
     assert [e["full_code"] for e in entries] == ["1905908000", "4415209000"]
+
+
+# ── National Additional Codes column ────────────────────────────────────
+def test_read_code_list_reads_the_national_additional_code(tmp_path):
+    path = write_list(tmp_path,
+        "SUPPLIER,Commodity Code ,Taric,"
+        "[6/17] National Additional Codes - Code (01),Description\r\n"
+        "CRC,27101999,90,x570,GREASE\r\n"
+        "CRC,19059080,00,,BAKED PASTRY\r\n")
+    entries, _ = cl.read_code_list(path)
+    by = {e["full_code"]: e for e in entries}
+    assert by["2710199990"]["nat_add_code"] == "X570"      # upper-cased
+    assert by["1905908000"]["nat_add_code"] == ""          # blank = default
+
+
+def test_read_code_list_without_that_column_leaves_it_blank(tmp_path):
+    entries, _ = cl.read_code_list(write_list(tmp_path))
+    assert all(e["nat_add_code"] == "" for e in entries)
+
+
+def test_nat_add_code_column_matched_loosely_but_slot_01_only():
+    assert cl._nat_add_code_index(
+        ["[6/17] National Additional Codes - Code (01)"]) == 0
+    assert cl._nat_add_code_index(["National Additional Code"]) == 0
+    assert cl._nat_add_code_index(
+        ["[6/17] National Additional Codes - Code (02)"]) == -1
+    assert cl._nat_add_code_index(["Description"]) == -1

@@ -122,6 +122,24 @@ def y929_applies(code: str) -> bool:
     return ch is not None and 1 <= ch <= _FOOD_CHAPTER_MAX
 
 
+def vatz_applies(code: str) -> bool:
+    """VATZ (zero-rated VAT) belongs on foodstuffs only (ch. 01-24).
+
+    VATZ used to go on EVERY goods line (operator instruction 2026-07).
+    That is wrong for the bulk of the list: zero-rating is a food relief,
+    and 1110 of the 1720 codes are outside the food chapters. The chapter
+    test is the same one Y929 uses, so "food" means one thing in this
+    module.
+
+    It is a chapter test, not UK VAT law: chapter 22 (beverages) is inside
+    the range but alcohol is standard-rated, so a wine line gets VATZ it
+    should not have. A per-code `nat_add_code` on the commodity-code list
+    overrides this for exactly those cases and is the intended fix - see
+    `_items_workbook` in main.py.
+    """
+    return y929_applies(code)
+
+
 def n853_required(code: str) -> bool:
     """Operator's rule: animal-origin prefix → CHED-P (N853) is expected."""
     digits = _norm_digits(code)

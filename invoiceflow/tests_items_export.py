@@ -87,3 +87,37 @@ def test_only_the_first_previous_document_slot_is_used():
 def test_a_fee_row_is_not_an_items_line():
     ws, col = _items([_row(), _row(code="", **{"Description of Goods": "TRANSPORT"})])
     assert _cell(ws, col, 5, "[2/1] Previous Documents - Category (01)").value in (None, "")
+
+
+# ── [6/17] National Additional Codes — VATZ is a food relief ────────────
+_NAC = "[6/17] National Additional Codes - Code (01)"
+
+
+def test_vatz_goes_on_a_food_line():
+    ws, col = _items([_row(code="19059080")])        # baked pastry, ch. 19
+    assert _cell(ws, col, 4, _NAC).value == "VATZ"
+
+
+def test_vatz_stays_off_a_non_food_line():
+    # Was "VATZ on every item"; the bulk of the list is not food.
+    ws, col = _items([_row(code="76109010")])        # aluminium ladder, ch. 76
+    assert _cell(ws, col, 4, _NAC).value in (None, "")
+
+
+def test_each_line_is_judged_on_its_own_code():
+    ws, col = _items([_row(code="19059080"), _row(code="84282000")])
+    assert _cell(ws, col, 4, _NAC).value == "VATZ"
+    assert _cell(ws, col, 5, _NAC).value in (None, "")
+
+
+def test_a_list_national_additional_code_overrides_the_default():
+    """How a chapter-22 wine line, or an X570 product, is corrected."""
+    wine = _row(code="22042166")
+    wine["_cds"] = {"nat_add_code": "", "documents": []}
+    ws, col = _items([wine])
+    assert _cell(ws, col, 4, _NAC).value == "VATZ"   # chapter test alone
+
+    grease = _row(code="27101999")
+    grease["_cds"] = {"nat_add_code": "X570", "documents": []}
+    ws, col = _items([grease])
+    assert _cell(ws, col, 4, _NAC).value == "X570"   # list wins
