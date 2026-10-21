@@ -397,12 +397,17 @@ def test_auto_added_documents_are_not_carried_on_the_list():
     assert cl.AUTO_LINE_DOCS == {"N935", "Y929", "U116"}
 
 
-def test_wording_in_the_status_column_becomes_the_statement(tmp_path):
-    """A CDS status is two letters; prose there is the exemption wording."""
+def test_wording_in_the_status_column_becomes_the_reason_only(tmp_path):
+    """A CDS status is two letters; prose there is the exemption wording.
+
+    It goes to the reason and nowhere else — the sheet leaves the
+    identifier empty, and filling it would repeat the same sentence in two
+    cells of the declaration.
+    """
     [e], _ = cl.read_code_list(write_list(tmp_path, DOC_SHEET))
     [y926] = e["documents"]
     assert y926["status"] == ""                               # not the prose
-    assert y926["id"] == "EXCLUDED FROM PROHIBITION"
+    assert y926["id"] == ""                                   # as the sheet has it
     assert y926["reason"] == "EXCLUDED FROM PROHIBITION"
 
 

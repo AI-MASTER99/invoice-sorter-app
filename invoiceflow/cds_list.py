@@ -442,17 +442,21 @@ def _row_documents(row, doc_cols: dict, cell) -> list[dict]:
         reason = cell(row, f.get("reason", -1)).strip()
         # A CDS document status is a two-letter code (JE, AC, XB…). The
         # supplier sheet puts the exemption WORDING in that column instead
-        # ("EXCLUDED FROM PROHIBITION"), which is not a status and would be
-        # written into the status cell as-is. Treated as the statement
-        # text, it lands where resolve_line_docs already puts Y929's:
-        # identifier and reason, status left empty.
+        # ("EXCLUDED FROM PROHIBITION"), which is not a status and must not
+        # be written into the status cell. It is the statement text, so it
+        # falls through to the reason — and ONLY the reason. The identifier
+        # stays exactly as the sheet has it, which for these Y-codes is
+        # empty: filling it too would put the same sentence in two cells of
+        # the declaration, which is not what the sheet says. (Y929, built by
+        # resolve_line_docs rather than read from a sheet, keeps its own
+        # id+reason shape — that one is proven at the border.)
         if _DOC_STATUS_RE.match(raw_status.upper()):
             status, statement = raw_status.upper(), ""
         else:
             status, statement = "", raw_status
         docs.append({
             "code": code,
-            "id": doc_id or statement,
+            "id": doc_id,
             "status": status,
             "reason": reason or statement,
         })
