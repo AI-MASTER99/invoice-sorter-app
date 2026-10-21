@@ -2129,6 +2129,10 @@ _ITEMS_DEFAULTS = {
 # refers to), type 380 (commercial invoice), reference = the invoice number
 # exactly as printed. Operator instruction 2026-09: always Z / 380 / the
 # invoice number — never the customer code or an order number.
+# The template processes Items rows 4..102 ("Tips and Tricks" sheet, Q
+# "Which lines will be processed"). Nothing below row 102 is data.
+_ITEMS_MAX_ROW = 102
+
 _ITEMS_PREVIOUS_DOC_CATEGORY = "Z"
 _ITEMS_PREVIOUS_DOC_TYPE = "380"
 
@@ -2157,19 +2161,42 @@ _DOC_SLOT_FIELDS = (
 
 
 def _ensure_document_slots(ws, want: int = 6) -> None:
-    """Widen the Items sheet to `want` document slots.
+    """Widen the Items sheet to `want` document slots, in place after slot 03.
 
     The stock MultiFreight template ships with only 3 slots — which
     N935 + Y929 + U116 already consume on an EU food line, so any product
-    certificate (e.g. N853) used to overflow into a description note.
-    Operators normally add the extra columns by hand; do it here instead:
-    APPEND the 9-column slot blocks for slots 04..06 after the last used
-    column, copying header style + width from the slot-03 block. Appending
-    (rather than inserting mid-sheet) keeps every existing column at its
-    original position — safe for position-sensitive importers — and avoids
-    openpyxl's pathologically slow insert_cols on this template (it carries
-    a stray styled cell at row ~1M). Idempotent — if the template already
-    has the extra slots, nothing changes.
+    certificate (e.g. N853) overflowed into a description note. Operators
+    normally add the extra columns by hand; do it here instead.
+
+    The blocks are INSERTED directly after slot 03 so the six slots read
+    consecutively, which is how the operator works the sheet by eye. That
+    is sanctioned by the template's own FAQ ("Tips and Tricks" sheet): Q
+    "Do I have to leave all the columns in the order found" -> "No, you can
+    reorder the columns on the template to suit your own preferences", and
+    Q "Can I rename the column headings found on line 3" -> "No, if you do
+    rename the columns the spreadheet will be totally rejected". Order is
+    free; header TEXT is the contract, and is never touched. (An earlier
+    version appended the blocks at the far end on the theory that the
+    importer is position-sensitive — the FAQ says it is not.)
+
+    Two things make the insert safe and fast:
+
+      * The template carries a handful of valueless styled cells at row
+        ~1048565, so ws.max_row is ~1M. openpyxl's insert_cols materialises
+        a Cell per row of every shifted column, which at that height means
+        tens of millions of objects and minutes of work. The strays are
+        dropped first, after which the insert costs milliseconds.
+      * insert_cols moves cells ONLY. column_dimensions (which carry the
+        template's widths and its hidden column bands) are shifted by hand
+        afterwards — without that, slots 04-06 land inside a hidden band
+        and the operator cannot see the columns they asked for.
+
+    Anything else keyed by column position (data validations, conditional
+    formatting, tables, autofilter, defined names) cannot be shifted
+    reliably. This template has none; if a future revision gains any, the
+    function falls back to appending rather than silently corrupting them.
+
+    Idempotent — if the sheet already has the extra slots, nothing changes.
     """
     from copy import copy as _copy
 
@@ -2182,11 +2209,24 @@ def _ensure_document_slots(ws, want: int = 6) -> None:
     if not src_start:
         return  # unexpected template layout — leave untouched
     block = len(_DOC_SLOT_FIELDS)                 # 9 columns per slot
-    append_at = max(headers.values()) + 1         # first free column
+    added = want - 3
+    # Anchor on the slot-03 Code column, never on its last header: the
+    # template mislabels slot 03's two write-off headers as "(02)".
+    insert_at = src_start + block
+    last_col = max(headers.values())
+
+    if _can_shift_columns(ws):
+        _prune_stray_cells(ws, keep_through=_ITEMS_MAX_ROW)
+        ws.insert_cols(insert_at, amount=block * added)
+        _shift_column_dimensions(ws, insert_at, block * added)
+        start = insert_at
+    else:
+        start = last_col + 1                      # fall back to appending
+
     for s, slot in enumerate(range(4, want + 1)):
         for f, field in enumerate(_DOC_SLOT_FIELDS):
             src_c = ws.cell(row=3, column=src_start + f)
-            dst_col = append_at + s * block + f
+            dst_col = start + s * block + f
             dst = ws.cell(row=3, column=dst_col,
                           value=field.format(n=f"0{slot}"))
             dst.font = _copy(src_c.font)
@@ -2195,8 +2235,73 @@ def _ensure_document_slots(ws, want: int = 6) -> None:
             dst.alignment = _copy(src_c.alignment)
             src_letter = get_column_letter(src_start + f)
             if src_letter in ws.column_dimensions:
-                ws.column_dimensions[get_column_letter(dst_col)].width = \
-                    ws.column_dimensions[src_letter].width
+                nd = ws.column_dimensions[get_column_letter(dst_col)]
+                nd.width = ws.column_dimensions[src_letter].width
+                # Never inherit slot 03's hidden flag: these are the
+                # columns the operator asked to be able to see.
+                nd.hidden = False
+
+
+def _can_shift_columns(ws) -> bool:
+    """False when the sheet holds anything else anchored to a column.
+
+    insert_cols rewrites cell positions and nothing else, so a sheet
+    carrying data validations, conditional formatting, a table, an
+    autofilter or a print area would keep those pointing at the
+    pre-shift columns — silently wrong. The stock template has none of
+    them; this is a guard for a future revision, not for today.
+    """
+    if getattr(ws, "data_validations", None) and ws.data_validations.dataValidation:
+        return False
+    if getattr(ws, "conditional_formatting", None) and list(ws.conditional_formatting):
+        return False
+    if getattr(ws, "tables", None):
+        return False
+    if getattr(ws, "auto_filter", None) is not None and ws.auto_filter.ref:
+        return False
+    if getattr(ws, "print_area", None):
+        return False
+    return True
+
+
+def _prune_stray_cells(ws, keep_through: int) -> None:
+    """Drop valueless cells far below the data region.
+
+    The template carries a few styled-but-empty cells at row ~1048565.
+    They hold nothing, but they set ws.max_row, and openpyxl's insert_cols
+    walks every row up to it — tens of millions of Cell objects. Dropping
+    them first turns a multi-minute, multi-gigabyte call into milliseconds.
+    A cell that actually holds a value is never dropped.
+    """
+    doomed = [(r, c) for (r, c), cell in ws._cells.items()
+              if r > keep_through and cell.value in (None, "")]
+    for key in doomed:
+        del ws._cells[key]
+    if doomed:
+        ws._current_row = max((r for r, _ in ws._cells), default=0)
+
+
+def _shift_column_dimensions(ws, insert_at: int, amount: int) -> None:
+    """Move column widths / hidden bands right, which insert_cols does not.
+
+    Each entry spans min..max. The template's bands sit wholly to one side
+    of the insertion point; one that straddled it would have to be split,
+    which is not something to guess at — the caller's guard keeps us out
+    of that case for this template, and a straddling band is left alone.
+    """
+    moved = {}
+    for letter in list(ws.column_dimensions):
+        dim = ws.column_dimensions[letter]
+        if dim.min is None or dim.min < insert_at:
+            continue
+        del ws.column_dimensions[letter]
+        dim.min += amount
+        dim.max = (dim.max or dim.min) + amount
+        new_letter = get_column_letter(dim.min)
+        dim.index = new_letter
+        moved[new_letter] = dim
+    for letter, dim in moved.items():
+        ws.column_dimensions[letter] = dim
 
 
 def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> bytes:
@@ -2303,7 +2408,7 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
             groups.append(entry)
 
     out_row = 4
-    MAX_ROW = 102  # template processes Items rows 4..102
+    MAX_ROW = _ITEMS_MAX_ROW  # template processes Items rows 4..102
     max_lines = MAX_ROW - out_row + 1  # = 99 writable Items rows
     if len(groups) > max_lines:
         # Fail loudly rather than silently truncating the customs declaration —
