@@ -493,7 +493,6 @@ def _subs(*full_codes):
 
 def _enrich(rows, tariff_data, matched=None):
     """Run just the use_list enrichment branch over `rows`."""
-    import re as _re
     for row in rows:
         code = row.get("Comm./imp. cod", "").strip()
         desc = row.get("Description of Goods", "").strip()
