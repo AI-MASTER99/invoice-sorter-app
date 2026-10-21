@@ -146,6 +146,12 @@ def n853_required(code: str) -> bool:
     return len(digits) >= 3 and digits[:3] in _N853_PREFIXES
 
 
+# The documents resolve_line_docs puts on EVERY line it applies to, so a
+# commodity-code list must NOT also carry them: the export would declare
+# each one twice and burn two of the six document slots.
+AUTO_LINE_DOCS = frozenset({"N935", "Y929", "U116"})
+
+
 def resolve_line_docs(
     *,
     code8: str,

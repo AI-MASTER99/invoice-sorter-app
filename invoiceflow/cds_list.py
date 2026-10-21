@@ -42,8 +42,11 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import re
 from collections import Counter, defaultdict
+
+from tariff_rules import AUTO_LINE_DOCS
 
 # The MultiFreight export is Windows-encoded (accented supplier names in
 # the description column decode as invalid UTF-8).
@@ -209,9 +212,11 @@ def build_list(rows: list[dict]) -> tuple[list[dict], dict]:
             "full_code": full,
             "taric_code": full[8:10],
             "description": choose_description(counter),
-            # The CDS export carries no national additional code; a
-            # spreadsheet import can fill it. One entry shape everywhere.
+            # The CDS export carries neither a national additional code
+            # nor per-code documents; a spreadsheet import fills them.
+            # One entry shape everywhere.
             "nat_add_code": "",
+            "documents": [],
             "origin": m["origin"],
             "preference": m["preference"],
             "procedure": m["procedure"],
@@ -231,8 +236,8 @@ def parse_export(source) -> tuple[list[dict], dict]:
 
 # ── The derived list, as committed to the repo ──────────────────────────
 DERIVED_COLUMNS = ["rex", "general_code", "full_code", "taric_code",
-                   "description", "nat_add_code", "origin", "preference",
-                   "procedure", "lines", "last_used"]
+                   "description", "nat_add_code", "documents", "origin",
+                   "preference", "procedure", "lines", "last_used"]
 
 
 def write_derived(entries: list[dict], path) -> None:
@@ -241,7 +246,10 @@ def write_derived(entries: list[dict], path) -> None:
         w = csv.DictWriter(fh, fieldnames=DERIVED_COLUMNS)
         w.writeheader()
         for e in entries:
-            w.writerow({k: e.get(k, "") for k in DERIVED_COLUMNS})
+            row = {k: e.get(k, "") for k in DERIVED_COLUMNS}
+            # documents is structured; JSON keeps it one CSV field.
+            row["documents"] = json.dumps(e["documents"]) if e.get("documents") else ""
+            w.writerow(row)
 
 
 def read_derived(path) -> list[dict]:
@@ -250,9 +258,14 @@ def read_derived(path) -> list[dict]:
         rows = list(csv.DictReader(fh))
     for r in rows:
         r["lines"] = int(r.get("lines") or 0)
-        # nat_add_code joined the format later; a file written before it
-        # simply has no such column.
+        # nat_add_code and documents joined the format later; a file
+        # written before them simply has no such column.
         r["nat_add_code"] = (r.get("nat_add_code") or "").strip()
+        raw = (r.get("documents") or "").strip()
+        try:
+            r["documents"] = json.loads(raw) if raw else []
+        except ValueError:
+            r["documents"] = []
     return rows
 
 
@@ -305,6 +318,23 @@ def product_payload(entry: dict) -> dict:
 _LIST_CODE_HEADERS = ("commodity code", "code", "full code", "general code")
 _LIST_TARIC_HEADERS = ("additional taric", "taric", "taric code", "additional")
 _LIST_DESC_HEADERS = ("description", "commodity description", "goods")
+
+
+# "[2/3] Documents - Code (01)" / "- Status (01)" / "- ID (01)" / "- Reason (01)"
+_DOC_COL_RE = re.compile(r"documents?\s*-\s*(code|status|id|reason)\s*\((\d+)\)")
+# Every CDS document status code is two letters (JE, AC, XB, …).
+_DOC_STATUS_RE = re.compile(r"^[A-Z]{2}$")
+
+
+def _document_indexes(header: list) -> dict:
+    """{slot number: {field: column index}} for the DE 2/3 document columns."""
+    out: dict[str, dict[str, int]] = {}
+    for i, h in enumerate(header):
+        name = re.sub(r"\s+", " ", str(h or "")).strip().casefold()
+        m = _DOC_COL_RE.search(name)
+        if m:
+            out.setdefault(m.group(2), {})[m.group(1)] = i
+    return out
 
 
 def _nat_add_code_index(header: list) -> int:
@@ -393,6 +423,46 @@ def _list_rows(source) -> list[list]:
     return list(csv.reader(io.StringIO(_decode(raw), newline="")))
 
 
+def _row_documents(row, doc_cols: dict, cell) -> list[dict]:
+    """The DE 2/3 documents one sheet row declares, in slot order.
+
+    N935/Y929/U116 are dropped: `tariff_rules.resolve_line_docs` already
+    puts those on every line they apply to, so carrying them here would
+    declare each one twice and spend two of the six document slots. A
+    sheet that lists only those is therefore read as "no extra documents".
+    """
+    docs = []
+    for slot in sorted(doc_cols, key=lambda k: int(k)):
+        f = doc_cols[slot]
+        code = cell(row, f.get("code", -1)).strip().upper()
+        if not code or code in AUTO_LINE_DOCS:
+            continue
+        raw_status = cell(row, f.get("status", -1)).strip()
+        doc_id = cell(row, f.get("id", -1)).strip()
+        reason = cell(row, f.get("reason", -1)).strip()
+        # A CDS document status is a two-letter code (JE, AC, XB…). The
+        # supplier sheet puts the exemption WORDING in that column instead
+        # ("EXCLUDED FROM PROHIBITION"), which is not a status and must not
+        # be written into the status cell. It is the statement text, so it
+        # falls through to the reason — and ONLY the reason. The identifier
+        # stays exactly as the sheet has it, which for these Y-codes is
+        # empty: filling it too would put the same sentence in two cells of
+        # the declaration, which is not what the sheet says. (Y929, built by
+        # resolve_line_docs rather than read from a sheet, keeps its own
+        # id+reason shape — that one is proven at the border.)
+        if _DOC_STATUS_RE.match(raw_status.upper()):
+            status, statement = raw_status.upper(), ""
+        else:
+            status, statement = "", raw_status
+        docs.append({
+            "code": code,
+            "id": doc_id,
+            "status": status,
+            "reason": reason or statement,
+        })
+    return docs
+
+
 def read_code_list(source) -> tuple[list[dict], dict]:
     """Read a one-row-per-code list (path or uploaded bytes) into list entries.
 
@@ -426,6 +496,7 @@ def read_code_list(source) -> tuple[list[dict], dict]:
     i_taric = _header_index(header, _LIST_TARIC_HEADERS)
     i_desc = _header_index(header, _LIST_DESC_HEADERS)
     i_nac = _nat_add_code_index(header)
+    doc_cols = _document_indexes(header)
 
     def cell(row, i):
         if i < 0 or i >= len(row) or row[i] is None:
@@ -458,6 +529,7 @@ def read_code_list(source) -> tuple[list[dict], dict]:
             "taric_code": taric,
             "description": desc,
             "nat_add_code": cell(row, i_nac).strip().upper(),
+            "documents": _row_documents(row, doc_cols, cell),
             "origin": "",
             "preference": "",
             "procedure": "",

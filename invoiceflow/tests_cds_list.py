@@ -373,3 +373,62 @@ def test_nat_add_code_column_matched_loosely_but_slot_01_only():
     assert cl._nat_add_code_index(
         ["[6/17] National Additional Codes - Code (02)"]) == -1
     assert cl._nat_add_code_index(["Description"]) == -1
+
+
+# ── DE 2/3 document columns ─────────────────────────────────────────────
+DOC_SHEET = (
+    "Commodity Code ,Taric,Description,"
+    "[2/3] Documents - Code (01),[2/3] Documents - Status (01),"
+    "[2/3] Documents - ID (01),[2/3] Documents - Reason (01),"
+    "[2/3] Documents - Code (02),[2/3] Documents - Status (02),"
+    "[2/3] Documents - ID (02),[2/3] Documents - Reason (02)\r\n"
+    "29035100,90,DRY COOLANT SPRAY,N935,JE,,,Y926,EXCLUDED FROM PROHIBITION,,\r\n"
+)
+
+
+def test_read_code_list_reads_the_document_slots(tmp_path):
+    [e], _ = cl.read_code_list(write_list(tmp_path, DOC_SHEET))
+    assert [d["code"] for d in e["documents"]] == ["Y926"]   # N935 dropped
+
+
+def test_auto_added_documents_are_not_carried_on_the_list():
+    # N935/Y929/U116 go on every line they apply to from the rule engine;
+    # carrying them here would declare each twice.
+    assert cl.AUTO_LINE_DOCS == {"N935", "Y929", "U116"}
+
+
+def test_wording_in_the_status_column_becomes_the_reason_only(tmp_path):
+    """A CDS status is two letters; prose there is the exemption wording.
+
+    It goes to the reason and nowhere else — the sheet leaves the
+    identifier empty, and filling it would repeat the same sentence in two
+    cells of the declaration.
+    """
+    [e], _ = cl.read_code_list(write_list(tmp_path, DOC_SHEET))
+    [y926] = e["documents"]
+    assert y926["status"] == ""                               # not the prose
+    assert y926["id"] == ""                                   # as the sheet has it
+    assert y926["reason"] == "EXCLUDED FROM PROHIBITION"
+
+
+def test_a_real_two_letter_status_is_kept(tmp_path):
+    sheet = ("Commodity Code,Taric,Description,"
+             "[2/3] Documents - Code (01),[2/3] Documents - Status (01),"
+             "[2/3] Documents - ID (01),[2/3] Documents - Reason (01)\r\n"
+             "84139100,90,PUMP PARTS,C644,ac,CERT-1,\r\n")
+    [e], _ = cl.read_code_list(write_list(tmp_path, sheet))
+    [doc] = e["documents"]
+    assert (doc["status"], doc["id"]) == ("AC", "CERT-1")
+
+
+def test_a_sheet_with_no_document_columns_has_no_documents(tmp_path):
+    entries, _ = cl.read_code_list(write_list(tmp_path))
+    assert all(e["documents"] == [] for e in entries)
+
+
+def test_document_slots_are_read_in_order(tmp_path):
+    sheet = ("Commodity Code,Taric,Description,"
+             "[2/3] Documents - Code (02),[2/3] Documents - Code (01)\r\n"
+             "84139100,90,PUMP PARTS,Y902,Y923\r\n")
+    [e], _ = cl.read_code_list(write_list(tmp_path, sheet))
+    assert [d["code"] for d in e["documents"]] == ["Y923", "Y902"]

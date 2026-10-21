@@ -196,7 +196,7 @@ def test_import_adds_only_the_codes_not_already_there(monkeypatch):
     # Only the new code is written, in the commodity_codes column shape.
     assert written == [{"general_code": "02013000", "full_code": "0201300090",
                         "taric_code": "90", "description": "TARTARE DI FASONA",
-                        "nat_add_code": ""}]
+                        "nat_add_code": "", "documents": []}]
 
 
 def test_re_importing_the_same_sheet_writes_nothing(monkeypatch):
@@ -347,7 +347,7 @@ def test_import_fills_a_blank_description_and_taric():
     patched = [w for w in written if w["full_code"] == "0704901000"]
     assert patched == [{"general_code": "07049010", "full_code": "0704901000",
                         "taric_code": "00", "description": "CABBAGE",
-                        "nat_add_code": ""}]
+                        "nat_add_code": "", "documents": []}]
 
 
 def test_import_lets_the_sheet_replace_an_existing_description(monkeypatch):
@@ -439,3 +439,46 @@ def test_describes_goods_guard():
     assert not cds_list.describes_goods("39199080")
     assert not cds_list.describes_goods("1905 90 80")
     assert not cds_list.describes_goods("")
+
+
+# ── Documents stored by the import ──────────────────────────────────────
+DOCS_SHEET = (b"Commodity Code,Taric,Description,"
+              b"[2/3] Documents - Code (01),[2/3] Documents - Status (01),"
+              b"[2/3] Documents - ID (01),[2/3] Documents - Reason (01)\r\n"
+              b"29035100,90,DRY COOLANT SPRAY,Y926,EXCLUDED FROM PROHIBITION,,\r\n")
+
+
+def test_import_stores_the_sheets_documents(monkeypatch):
+    written = _stub_list(monkeypatch, rows=[
+        {"general_code": "29035100", "full_code": "2903510090",
+         "taric_code": "90", "description": "DRY COOLANT SPRAY",
+         "nat_add_code": "", "documents": []}])
+    out = asyncio.run(m.api_import_commodity_codes(file=_Upload(DOCS_SHEET), ctx=CTX))
+    assert out["updated"] == 1
+    [patched] = written
+    assert [d["code"] for d in patched["documents"]] == ["Y926"]
+
+
+def test_a_sheet_without_document_columns_keeps_the_documents_held(monkeypatch):
+    """A codes-only sheet must not wipe documents set by another sheet."""
+    held = [{"code": "Y926", "id": "X", "status": "", "reason": "X"}]
+    written = _stub_list(monkeypatch, rows=[
+        {"general_code": "07049010", "full_code": "0704901000",
+         "taric_code": "00", "description": "CABBAGE",
+         "nat_add_code": "", "documents": held}])
+    asyncio.run(m.api_import_commodity_codes(file=_Upload(SHEET), ctx=CTX))
+    for w in written:
+        if w["full_code"] == "0704901000":
+            assert w["documents"] == held
+
+
+def test_re_importing_a_document_sheet_changes_nothing(monkeypatch):
+    written = _stub_list(monkeypatch, rows=[
+        {"general_code": "29035100", "full_code": "2903510090",
+         "taric_code": "90", "description": "DRY COOLANT SPRAY",
+         "nat_add_code": "",
+         "documents": [{"code": "Y926", "id": "EXCLUDED FROM PROHIBITION",
+                        "status": "", "reason": "EXCLUDED FROM PROHIBITION"}]}])
+    out = asyncio.run(m.api_import_commodity_codes(file=_Upload(DOCS_SHEET), ctx=CTX))
+    assert (out["added"], out["updated"]) == (0, 0)
+    assert written == []
