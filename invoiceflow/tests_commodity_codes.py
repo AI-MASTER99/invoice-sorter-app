@@ -552,3 +552,21 @@ def test_a_dropped_leading_zero_still_matches_the_list():
     rows = [{"Comm./imp. cod": "406103090", "Description of Goods": "CHEESE"}]
     _enrich(rows, {"406103090": _subs("0406103000", "0406103090")})
     assert rows[0]["_chosen"] == "0406103090"
+
+
+# ── The lookup key is derived, so a complete code still finds its row ───
+def test_a_complete_invoice_code_still_finds_the_list_row():
+    """The list stores 8 digits; the invoice may print 10."""
+    assert m._norm_general_code("2903510090") == "29035100"
+    assert m._norm_general_code("29035100") == "29035100"
+
+
+def test_the_key_still_repairs_a_dropped_leading_zero():
+    assert m._norm_general_code("2013000") == "02013000"
+    assert m._norm_general_code("0201300090") == "02013000"
+
+
+def test_the_extraction_prompt_no_longer_truncates_eu_codes():
+    """The TARIC cannot be recovered once the prompt throws it away."""
+    assert "COPY IT EXACTLY as" in m.PROMPT_EXTRACT
+    assert "8 digits\n  (pad with zeros or truncate)" not in m.PROMPT_EXTRACT

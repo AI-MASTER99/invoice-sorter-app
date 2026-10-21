@@ -573,12 +573,19 @@ async def lookup_tariff(commodity_code: str) -> dict:
 
 
 def _norm_general_code(commodity_code: str) -> str:
-    """Digits-only key for the client-list VLOOKUP. Lists store the general
-    code zero-padded to 8 (e.g. '07049010'); pad short codes to match."""
+    """Digits-only key for the client-list VLOOKUP.
+
+    The list stores the general code as exactly 8 digits ('07049010'), so
+    this both pads a short code (chapters 01-09 lose their leading zero in
+    Excel) and TRUNCATES a long one. Truncating matters: the invoice may
+    print the complete 10-digit code, and the extra two digits are the
+    TARIC — part of the answer, not part of the key. Without the truncation
+    a complete code finds nothing and the line is flagged NOT IN LIST.
+    """
     digits = re.sub(r"\D", "", commodity_code or "")
     if digits and len(digits) < 8:
         digits = digits.zfill(8)
-    return digits
+    return digits[:8]
 
 
 def lookup_commodity_list(company_id: str, commodity_code: str) -> dict:
@@ -810,10 +817,13 @@ commodity_code  — HS/customs/commodity/nomenclature code.
   "Warenverzeichnis", "Code douanier", "NC", "Zolltarifnummer", or
   similar.
 
-  If (and ONLY if) a valid printed code is found: format it as —
-  EU supplier (VAT prefix IT/ES/FR/DE/NL/BE/PL/PT/…) → 8 digits
-  (pad with zeros or truncate). UK supplier (GB) → 10 digits.
-  Unknown → copy exactly. Never change the digits themselves.
+  If (and ONLY if) a valid printed code is found: COPY IT EXACTLY as
+  printed — every digit, in order. Do NOT pad it and do NOT truncate it,
+  whoever the supplier is. An EU invoice often prints the complete
+  10-digit code (e.g. "3403990000"); its last two digits are the TARIC
+  subdivision and the declaration needs them. Shortening it to 8 throws
+  the TARIC away and it cannot be recovered. Never change the digits
+  themselves.
 
 description  — product description as written on the invoice.
   Do NOT prepend the supplier's SKU / article code / product code from
@@ -2362,7 +2372,9 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
     index: dict[tuple, dict] = {}
     for row in final_rows:
         desc = (row.get("Description of Goods", "") or "").strip()
-        if _is_fee_row(desc):
+        # Judge "is this a fee line?" on the invoice's own wording, never on
+        # the list description that replaced it — see _invoice_desc above.
+        if _is_fee_row(row.get("_invoice_desc") or desc):
             continue          # fee/charge rows are not commodity item lines
         # Restore a dropped leading zero (odd length ≥5) before splitting, so
         # chapter-01-09 codes classify correctly downstream (Y929/N853).
@@ -2907,6 +2919,14 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
                     row["_cds"] = chosen.get("product") or {}  # rich CDS fields for Items tab
                     row["Comm./imp. cod"] = chosen["code"]
                     if chosen["description"]:
+                        # Keep what the INVOICE said. The fee/charge test in
+                        # _items_workbook runs after this and would otherwise
+                        # judge a goods line on a word from our own list:
+                        # 7310219100 is held as "METAL PACKAGING", and
+                        # _is_fee_row matches "packaging", so an aerosol-can
+                        # line would be deleted with no marker and no review
+                        # issue. The invoice's wording is what decides.
+                        row["_invoice_desc"] = desc
                         row["Description of Goods"] = chosen["description"]
                 else:
                     # Not in the company's list — keep working, flag clearly.
@@ -3058,6 +3078,14 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
         # read off the invoice; fall back to the matched client's stored REX from
         # the list (clients.rex, e.g. ITREXIT…). Never the invoice number.
         totals["supplier_rex"] = supplier_rex or ((client_row or {}).get("rex") or "").strip()
+        # The complete commodity codes the invoice PRINTS, read straight from
+        # the text layer. review.check_missing_codes compares them against the
+        # extracted lines, which is the only check that does not share the
+        # extraction's blind spots: a goods line the model never returned is
+        # invisible to everything downstream (CRC 000126985 lost 7310219100,
+        # 1080 pcs / EUR 453.60, with no warning anywhere). Empty for an
+        # image-only scan, which simply means no comparison is possible.
+        totals["_printed_codes"] = review.codes_in_text(pdf_text)
         # Persist the A/B disagreement flags so review_payload can raise its
         # "two readings disagree" issues later. The invoices table has NO
         # flagged_cells column, so nest them inside the existing `totals`

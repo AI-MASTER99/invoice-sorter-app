@@ -225,3 +225,30 @@ def test_all_six_slots_are_written_and_the_seventh_still_warns():
              for i in range(1, 7)]
     assert codes == ["N935", "Y929", "U116", "Y937", "C644", "Y900"]
     assert "NOT DECLARED: Y923" in _cell(ws, col, 4, "[6/8] Description of Goods").value
+
+
+# ── A list wording must not turn a goods line into a "fee" ──────────────
+def test_a_goods_line_survives_a_list_wording_that_reads_like_a_fee():
+    """7310219100 is held as "METAL PACKAGING"; _is_fee_row matches that."""
+    row = _row(code="7310219100", invoice="000126985")
+    row["Description of Goods"] = "METAL PACKAGING"      # from the list
+    row["_invoice_desc"] = "AECAN 65X195 CLIPS WHITE"    # from the invoice
+    ws, col = _items([row])
+    assert _cell(ws, col, 4, "[6/14] Commodity Code").value == "73102191"
+    assert _cell(ws, col, 4, "[6/14] TARIC Code").value == "00"
+
+
+def test_a_real_fee_line_is_still_left_out():
+    fee = _row(code="", invoice="000126985")
+    fee["Description of Goods"] = "TRANSPORT COSTS"
+    ws, col = _items([fee])
+    assert _cell(ws, col, 4, "[6/14] Commodity Code").value in (None, "")
+
+
+def test_the_invoice_wording_decides_even_when_it_reads_like_a_fee():
+    """The invoice calling it a charge still wins over a list wording."""
+    row = _row(code="7310219100")
+    row["Description of Goods"] = "EMPTY AEROSOL CANS"
+    row["_invoice_desc"] = "PACKAGING SURCHARGE"
+    ws, col = _items([row])
+    assert _cell(ws, col, 4, "[6/14] Commodity Code").value in (None, "")

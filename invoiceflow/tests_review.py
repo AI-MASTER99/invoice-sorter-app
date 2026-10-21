@@ -355,3 +355,49 @@ def test_review_payload_tolerates_missing_and_none():
     # Old invoice with only rows, no totals_check / ab_reasons
     payload = review.review_payload({"rows": [_row()]})
     assert payload["issues"] == []
+
+
+# ── A goods line the extraction never returned ──────────────────────────
+def test_codes_in_text_reads_complete_codes_only():
+    txt = ("000126985 1757065 CLIPS WHITE 7310219100 1,080.00 453.60\n"
+           "000126985 1030516 HYDRAULIC OIL 3403990000 38.00 2,155.74\n")
+    assert review.codes_in_text(txt) == ["3403990000", "7310219100"]
+
+
+def test_codes_in_text_ignores_runs_that_are_not_ten_digits():
+    # 8 digits is as likely an order number; 11+ is not a code either.
+    assert review.codes_in_text("12345678 123456789012 x") == []
+
+
+def test_a_printed_code_on_no_line_is_flagged():
+    """CRC 000126985: 7310219100 was printed and never extracted."""
+    rows = [{"Comm./imp. cod": "3403990000"}]
+    [issue] = review.check_missing_codes(rows, ["3403990000", "7310219100"])
+    assert issue["severity"] == "high"
+    assert "7310219100" in issue["message"]
+    assert "under-declare" in issue["message"]
+
+
+def test_no_flag_when_every_printed_code_is_accounted_for():
+    rows = [{"Comm./imp. cod": "3403990000"}, {"Comm./imp. cod": "7310219100"}]
+    assert review.check_missing_codes(rows, ["3403990000", "7310219100"]) == []
+
+
+def test_an_eight_digit_row_still_matches_a_printed_ten_digit_code():
+    """The extraction may hold either form; the first 8 digits decide."""
+    rows = [{"Comm./imp. cod": "34039900"}]
+    assert review.check_missing_codes(rows, ["3403990000"]) == []
+
+
+def test_silent_without_a_text_layer():
+    """An image-only scan yields no printed codes, so nothing to compare."""
+    assert review.check_missing_codes([{"Comm./imp. cod": "34039900"}], []) == []
+    assert review.check_missing_codes([], ["3403990000"]) == []
+
+
+def test_the_check_runs_inside_build_review_issues():
+    issues = review.build_review_issues(
+        rows=[{"Comm./imp. cod": "3403990000",
+               "Description of Goods": "OIL"}],
+        printed_codes=["3403990000", "7310219100"])
+    assert any("7310219100" in i["message"] for i in issues)
