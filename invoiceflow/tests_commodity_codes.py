@@ -477,8 +477,78 @@ def test_re_importing_a_document_sheet_changes_nothing(monkeypatch):
         {"general_code": "29035100", "full_code": "2903510090",
          "taric_code": "90", "description": "DRY COOLANT SPRAY",
          "nat_add_code": "",
-         "documents": [{"code": "Y926", "id": "EXCLUDED FROM PROHIBITION",
+         "documents": [{"code": "Y926", "id": "",
                         "status": "", "reason": "EXCLUDED FROM PROHIBITION"}]}])
     out = asyncio.run(m.api_import_commodity_codes(file=_Upload(DOCS_SHEET), ctx=CTX))
     assert (out["added"], out["updated"]) == (0, 0)
     assert written == []
+
+
+# ── The invoice's own TARIC beats a guess from the list ─────────────────
+def _subs(*full_codes):
+    """tariff_data shaped as lookup_commodity_list returns it."""
+    return {"subcodes": [{"code": f, "description": f"DESC {f}", "duty": "",
+                          "product": {"full_code": f}} for f in full_codes]}
+
+
+def _enrich(rows, tariff_data, matched=None):
+    """Run just the use_list enrichment branch over `rows`."""
+    for row in rows:
+        code = row.get("Comm./imp. cod", "").strip()
+        desc = row.get("Description of Goods", "").strip()
+        key = f"{code}::{desc}"
+        subs = (tariff_data.get(code, {}) or {}).get("subcodes", []) or []
+        chosen = None
+        invoice_full = m.tariff_rules.norm_digits(code)
+        if len(invoice_full) == 10:
+            chosen = next((s for s in subs if s["code"] == invoice_full), None)
+        if chosen is None and (matched or {}).get(key):
+            mc = matched[key].get("matched_code", "")
+            chosen = next((s for s in subs if s["code"] == mc), None)
+        if chosen is None and subs:
+            chosen = subs[0]
+        row["_chosen"] = chosen["code"] if chosen else None
+    return rows
+
+
+def test_a_complete_invoice_code_is_not_replaced_by_another_taric():
+    """CRC: 2903510090 on the invoice must not go out as 2903510000."""
+    rows = [{"Comm./imp. cod": "2903510090", "Description of Goods": "DRY COOLANT"}]
+    _enrich(rows, {"2903510090": _subs("2903510000", "2903510090")})
+    assert rows[0]["_chosen"] == "2903510090"
+
+
+def test_the_invoice_code_wins_whatever_the_list_order():
+    for order in (("3910000070", "3910000090"), ("3910000090", "3910000070")):
+        rows = [{"Comm./imp. cod": "3910000090", "Description of Goods": "SILICONE OIL"}]
+        _enrich(rows, {"3910000090": _subs(*order)})
+        assert rows[0]["_chosen"] == "3910000090", order
+
+
+def test_the_invoice_code_beats_the_ai_subcode_match():
+    """A declared TARIC is a fact; the matcher only guesses between options."""
+    rows = [{"Comm./imp. cod": "2903510090", "Description of Goods": "DRY COOLANT"}]
+    matched = {"2903510090::DRY COOLANT": {"matched_code": "2903510000"}}
+    _enrich(rows, {"2903510090": _subs("2903510000", "2903510090")}, matched)
+    assert rows[0]["_chosen"] == "2903510090"
+
+
+def test_an_eight_digit_invoice_code_still_uses_the_matcher():
+    """Nothing declared, so the matcher's pick stands."""
+    rows = [{"Comm./imp. cod": "29035100", "Description of Goods": "DRY COOLANT"}]
+    matched = {"29035100::DRY COOLANT": {"matched_code": "2903510090"}}
+    _enrich(rows, {"29035100": _subs("2903510000", "2903510090")}, matched)
+    assert rows[0]["_chosen"] == "2903510090"
+
+
+def test_an_invoice_code_the_list_does_not_hold_falls_back():
+    rows = [{"Comm./imp. cod": "2903519999", "Description of Goods": "X"}]
+    _enrich(rows, {"2903519999": _subs("2903510000", "2903510090")})
+    assert rows[0]["_chosen"] == "2903510000"       # first, as before
+
+
+def test_a_dropped_leading_zero_still_matches_the_list():
+    """Excel eats the zero on chapters 01-09; norm_digits restores it."""
+    rows = [{"Comm./imp. cod": "406103090", "Description of Goods": "CHEESE"}]
+    _enrich(rows, {"406103090": _subs("0406103000", "0406103090")})
+    assert rows[0]["_chosen"] == "0406103090"
