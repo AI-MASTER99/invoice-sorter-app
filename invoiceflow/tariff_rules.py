@@ -58,6 +58,12 @@ _N853_PREFIXES = frozenset({
 # chapters 01-24.
 _FOOD_CHAPTER_MAX = 24
 
+# Chapters inside that range that VATZ is NOT defaulted onto. Chapter 22
+# (beverages, spirits and vinegar) is overwhelmingly standard-rated drink.
+# A frozenset rather than `!= 22` because the same question is open for
+# other pockets of the range (ch. 24 tobacco, confectionery in 1704/1806).
+_VATZ_EXCLUDED_CHAPTERS = frozenset({22})
+
 
 def norm_digits(code: str) -> str:
     """Digits only, with a dropped leading zero restored.
@@ -123,21 +129,38 @@ def y929_applies(code: str) -> bool:
 
 
 def vatz_applies(code: str) -> bool:
-    """VATZ (zero-rated VAT) belongs on foodstuffs only (ch. 01-24).
+    """VATZ (zero-rated VAT): the food chapters (01-24) except chapter 22.
 
     VATZ used to go on EVERY goods line (operator instruction 2026-07).
     That is wrong for the bulk of the list: zero-rating is a food relief,
-    and 1110 of the 1720 codes are outside the food chapters. The chapter
-    test is the same one Y929 uses, so "food" means one thing in this
-    module.
+    and 1110 of the 1720 codes are outside the food chapters.
 
-    It is a chapter test, not UK VAT law: chapter 22 (beverages) is inside
-    the range but alcohol is standard-rated, so a wine line gets VATZ it
-    should not have. A per-code `nat_add_code` on the commodity-code list
-    overrides this for exactly those cases and is the intended fix - see
-    `_items_workbook` in main.py.
+    Chapter 22 is then subtracted. It is a chapter test, not UK VAT law,
+    and chapter 22 is the place the two diverge worst: "beverages, spirits
+    and vinegar" sits inside the agri-food range while most of it is
+    standard-rated drink. Asked whether to drop the whole chapter or
+    correct it per code, the customs specialist answered "may be best to
+    exclude" (2026-10), so the chapter is out. Two consequences worth
+    knowing before this is widened or narrowed again:
+
+      * the genuinely zero-rated minority of the chapter (vinegar 2209,
+        plant-milk drinks) loses VATZ with it. Leaving the list blank does
+        NOT give it back — a blank `nat_add_code` means "use this default",
+        and for chapter 22 the default is now nothing. Only a value in the
+        cell is written, so those codes need the literal "VATZ" typed into
+        the list's National Additional Codes column, through the sheet
+        import (the single-code form does not carry the field). See
+        `_items_workbook` in main.py.
+      * he also wrote "we have very few VATZ on our imports … VATZ is not
+        required", which reads wider than one chapter. That is a separate,
+        unanswered question; the list is company-wide, so dropping the
+        default outright would also strip VATZ from another client's food
+        business, where it is correct.
+
+    Y929 is deliberately NOT narrowed the same way: wine IS covered by
+    Reg. 834/2007, so the organic exemption still belongs on ch. 22 lines.
     """
-    return y929_applies(code)
+    return y929_applies(code) and _chapter(code) not in _VATZ_EXCLUDED_CHAPTERS
 
 
 def n853_required(code: str) -> bool:

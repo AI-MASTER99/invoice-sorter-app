@@ -863,6 +863,7 @@ document.getElementById('btn-code-import')?.addEventListener('click', async () =
     if (r.already_present) bits.push(`${r.already_present} unchanged`);
     if (r.rejected) bits.push(`${r.rejected} description${r.rejected === 1 ? '' : 's'} refused (looks like a code, not goods)`);
     if (r.skipped) bits.push(`${r.skipped} row${r.skipped === 1 ? '' : 's'} without a usable code`);
+    if (r.merged) bits.push(`${r.merged} repeat row${r.merged === 1 ? '' : 's'} merged into the code above`);
     _clientsMsg('codes-msg', `✓ ${bits.join(', ')} — the list now holds ${r.total}.`, true);
     input.value = '';
     await refreshCodesPage();
@@ -1172,10 +1173,17 @@ dropZone.addEventListener('drop', e => {
 });
 
 async function handleBulkUpload(files) {
-  const allowed = ['.pdf','.jpg','.jpeg','.png','.docx'];
+  const allowed = ['.pdf','.jpg','.jpeg','.png','.docx','.xlsx','.xlsm','.csv'];
   const valid = files.filter(f => {
     const ext = f.name.substring(f.name.lastIndexOf('.')).toLowerCase();
-    if (!allowed.includes(ext)) { toast(`Skipped ${f.name} — unsupported type`, 'error'); return false; }
+    if (!allowed.includes(ext)) {
+      // .xls is the one rejection with a one-click remedy, and the whole
+      // point of accepting workbooks is that a spreadsheet beats a
+      // printout of it — so say how to get there.
+      const hint = ext === '.xls' ? ' — open it and save as .xlsx first' : ' — unsupported type';
+      toast(`Skipped ${f.name}${hint}`, 'error');
+      return false;
+    }
     return true;
   });
   if (valid.length === 0) return;

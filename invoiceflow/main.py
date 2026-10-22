@@ -6,6 +6,7 @@ runs dual-verification, looks up UK Trade Tariff, exports to Excel.
 
 import asyncio
 import base64
+import csv
 import io
 import ipaddress
 import itertools
@@ -1618,6 +1619,266 @@ def extract_pdf_text(file_bytes: bytes) -> str:
         return ""
 
 
+# ── Spreadsheets as a source document ──────────────────────────────────
+# A supplier who sends the invoice as a spreadsheet is the best case there
+# is: the cells are already apart, so nothing can run into the column
+# beside it. Printing it to PDF first is what loses goods lines — on a real
+# entry the description column was too narrow, and "NICKEL CLIPS WHITE"
+# with net weight 86.40 beside it came out of the PDF text layer as
+# "NI8168.I4C0 L4PS WHITE86.40". The line was never extracted and the entry
+# under-declared the import. Reading the workbook removes that whole class
+# of failure, so an operator who HAS the spreadsheet should never print it.
+_SPREADSHEET_MIMES = frozenset({
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",  # .xlsx
+    "application/vnd.ms-excel.sheet.macroEnabled.12",                     # .xlsm
+    "text/csv",
+})
+
+# Guard rails on the rendered text. An invoice is tens of rows of short
+# fields; everything past that is either a mistake or an attack, and the
+# worker has 512 MB for every tenant at once. A 12 KB workbook can declare
+# a million populated cells, so the row and column caps alone are not a
+# memory bound — the character budget is.
+_SHEET_MAX_ROWS = 2000
+_SHEET_MAX_COLS = 80
+_SHEET_MAX_SHEETS = 50
+_CELL_MAX_CHARS = 2000            # Excel allows 32767; an invoice field is tiny
+_RENDER_MAX_CHARS = 2_000_000     # whole document, across every sheet
+# Below this much ROW content the file is not an invoice. Deliberately
+# well under the 100 characters _process_invoice demands of a PDF's text:
+# the pipe separators and the sheet headers do not count here, and a
+# genuine two-line invoice sheet carries under 100 characters of cells.
+_MIN_BODY_CHARS = 40
+_CELL_SEPARATOR = " | "
+# A formula whose cached result the writing program never stored. Rendering
+# it as "" would blank a money column and, when a whole row is formulas,
+# drop the goods line — the failure this reader exists to prevent.
+_UNCALCULATED = "#UNCALCULATED"
+
+
+def is_spreadsheet(mime: str) -> bool:
+    """Is this upload a workbook or CSV rather than a PDF/image?"""
+    return mime in _SPREADSHEET_MIMES
+
+
+class UnreadableUpload(Exception):
+    """The upload carried nothing the pipeline can read.
+
+    Raised instead of falling through to the raw-file path, which labels
+    whatever it is given as a PDF: a workbook sent that way is rejected by
+    the model with an error that says nothing useful to the operator.
+    """
+
+
+# A number format of nothing but zeros ("0000000000") is how a spreadsheet
+# shows a commodity code whose leading zero must not be lost: chapters
+# 01-09 are stored as the integer 406103000 and DISPLAYED as 0406103000.
+_ZERO_PAD_FORMAT = re.compile(r"^0+$")
+
+
+def _sheet_cell_text(value, number_format: str = "") -> str:
+    """One cell as the text the model should read.
+
+    openpyxl hands back Python types, so a commodity code held as a number
+    arrives as 2922498590.0 and a quantity as 1080.0. Writing those
+    verbatim would put a decimal point inside a customs code, so a whole
+    float is rendered as the integer it is.
+
+    Whitespace inside a cell is collapsed to single spaces. A description
+    typed with Alt+Enter holds a real newline, and emitting it would split
+    one row across two lines: every value after the break would then read
+    one column to the left, so a commodity code lands in the net-weight
+    column. One cell must never end a line.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, int) and not isinstance(value, bool):
+        text = str(value)
+        # Restore the zero the sheet displays but does not store, so a
+        # chapter 01-09 code is still ten digits to review.codes_in_text.
+        if _ZERO_PAD_FORMAT.match(number_format or ""):
+            text = text.rjust(len(number_format), "0")
+        return text[:_CELL_MAX_CHARS]
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value))[:_CELL_MAX_CHARS]
+        # Binary floats print their error: the real invoice total came back
+        # as 74289.64000000001 where every document says 74,289.64.
+        return f"{value:.6f}".rstrip("0").rstrip(".")[:_CELL_MAX_CHARS]
+    return re.sub(r"\s+", " ", str(value)).strip()[:_CELL_MAX_CHARS]
+
+
+def _render_sheet_rows(label: str, text_rows, budget: int) -> tuple[str, int, int]:
+    """One sheet as text: one line per row, cells kept apart.
+
+    `text_rows` yields already-rendered cells. Returns the block, the
+    number of characters of ROW content in it, and the character budget
+    left. The row-content count is what decides whether the upload is
+    readable: the sheet header below is boilerplate this function writes
+    itself, and counting it would let three characters of real data in an
+    otherwise empty template pass for a legible invoice.
+    """
+    out: list[str] = []
+    data_chars = 0
+    for cells in text_rows:
+        if len(out) >= _SHEET_MAX_ROWS:
+            out.append(f"--- TRUNCATED at {_SHEET_MAX_ROWS} rows ---")
+            break
+        cells = list(cells)[:_SHEET_MAX_COLS]
+        while cells and not cells[-1]:          # drop the trailing empties
+            cells.pop()
+        if not cells:
+            continue
+        line = _CELL_SEPARATOR.join(cells)
+        if len(line) > budget:
+            out.append(f"--- TRUNCATED at {_RENDER_MAX_CHARS} characters ---")
+            budget = 0
+            break
+        budget -= len(line)
+        data_chars += len(line)
+        out.append(line)
+    if not data_chars:
+        return "", 0, budget
+    header = (f"--- SHEET: {label} (one row per line, cells separated by"
+              f' "{_CELL_SEPARATOR.strip()}") ---')
+    return header + "\n" + "\n".join(out), data_chars, budget
+
+
+def _workbook_rows(file_bytes: bytes):
+    """Yield (sheet title, rows-of-rendered-cells) for every worksheet.
+
+    Read twice, in step. The value pass (data_only=True) is what we want,
+    but it returns None for a formula whose result the writing program
+    never cached — and openpyxl and Apache POI both emit workbooks like
+    that. Blanking those cells would empty a money column, and a row that
+    is nothing but formulas would be dropped as if it were a spacer: one
+    goods line gone, which is the exact failure this reader exists to
+    prevent. The formula pass tells the two apart, so an uncalculated cell
+    is marked rather than lost.
+    """
+    values = openpyxl.load_workbook(io.BytesIO(file_bytes),
+                                    read_only=True, data_only=True)
+    formulas = openpyxl.load_workbook(io.BytesIO(file_bytes),
+                                      read_only=True, data_only=False)
+    try:
+        for ws_v, ws_f in zip(values.worksheets[:_SHEET_MAX_SHEETS],
+                              formulas.worksheets[:_SHEET_MAX_SHEETS]):
+            # read_only mode otherwise trusts the sheet's own <dimension>,
+            # and a streaming writer that understates it would hide every
+            # row past the first with nothing to show for it.
+            ws_v.reset_dimensions()
+            ws_f.reset_dimensions()
+
+            def rows(ws_v=ws_v, ws_f=ws_f):
+                for row_v, row_f in zip(ws_v.iter_rows(), ws_f.iter_rows()):
+                    cells = []
+                    for cell_v, cell_f in zip(row_v, row_f):
+                        text = _sheet_cell_text(cell_v.value,
+                                                cell_v.number_format or "")
+                        if not text and isinstance(cell_f.value, str) \
+                                and cell_f.value.startswith("="):
+                            text = _UNCALCULATED
+                        cells.append(text)
+                    yield cells
+
+            yield ws_v.title, rows()
+    finally:
+        values.close()
+        formulas.close()
+
+
+def _csv_rows(file_bytes: bytes):
+    """Yield ("CSV", rows-of-rendered-cells) for an uploaded CSV."""
+    text = file_bytes.decode("utf-8-sig", errors="replace")
+    try:
+        dialect = csv.Sniffer().sniff(text[:4096], delimiters=",;\t|")
+    except csv.Error:
+        dialect = csv.excel
+    reader = csv.reader(io.StringIO(text, newline=""), dialect)
+    yield "CSV", ([_sheet_cell_text(c) for c in row] for row in reader)
+
+
+def extract_spreadsheet_text(file_bytes: bytes, mime: str) -> str:
+    """Render an uploaded workbook or CSV as text, one line per row.
+
+    The result goes down exactly the same path as pdfplumber's text, so
+    every downstream reader — both extraction prompts, the totals
+    reconciliation, review.codes_in_text — works unchanged. Cells are
+    separated by a pipe rather than a space precisely because a space is
+    what fails in a printed PDF.
+
+    Returns "" when the file holds no row content at all. Whether what it
+    does hold is ENOUGH is not decided here — see spreadsheet_body_chars
+    and the two callers that gate on it. The whole render is capped at
+    _RENDER_MAX_CHARS: a 12 KB workbook can declare a million populated
+    cells, and this runs on one small worker shared by every tenant.
+    """
+    blocks: list[str] = []
+    budget = _RENDER_MAX_CHARS
+    body_chars = 0
+    try:
+        sheets = _csv_rows(file_bytes) if mime == "text/csv" \
+            else _workbook_rows(file_bytes)
+        for label, rows in sheets:
+            block, data_chars, budget = _render_sheet_rows(label, rows, budget)
+            if block:
+                blocks.append(block)
+                body_chars += data_chars
+            if budget <= 0:
+                break
+    except MemoryError:
+        # Never relabel an out-of-memory as a file-format problem: the file
+        # may be fine and the advice to resave it would be a wild goose
+        # chase. Let it surface as the generic failure it is.
+        raise
+    except UnreadableUpload:
+        raise
+    except Exception as exc:
+        raise UnreadableUpload(
+            "That spreadsheet could not be opened. Save it again as .xlsx "
+            "or .csv and upload it once more."
+        ) from exc
+    return "\n\n".join(blocks) if body_chars else ""
+
+
+def spreadsheet_body_chars(text: str) -> int:
+    """Meaningful characters of ROW content in a rendered spreadsheet.
+
+    The sheet headers and the pipe separators are this module's own
+    writing. Counting them, as the generic PDF threshold would, lets an
+    empty three-tab template with a stray character in it pass for a
+    legible invoice — and the job then spends four model calls finding
+    out otherwise, failing with a message that says nothing useful.
+    """
+    body = "\n".join(line for line in text.splitlines()
+                     if not line.startswith("---"))
+    return len(re.sub(r"[\s|\-]", "", body))
+
+
+def _require_spreadsheet_text(file_bytes: bytes, mime: str) -> str:
+    """The sheet's text, or a message the operator can act on."""
+    text = extract_spreadsheet_text(file_bytes, mime)
+    if spreadsheet_body_chars(text) < _MIN_BODY_CHARS:
+        raise UnreadableUpload(
+            "That spreadsheet has no rows to read. Check the goods lines "
+            "are in the file you uploaded and not in a linked one."
+        )
+    return text
+
+
+def _document_text(file_bytes: bytes, mime: str) -> str:
+    """Text for any upload we can read locally; "" when there is none."""
+    if mime == "application/pdf":
+        return extract_pdf_text(file_bytes)
+    if is_spreadsheet(mime):
+        return extract_spreadsheet_text(file_bytes, mime)
+    return ""
+
+
 # REX numbers have an unmistakable shape — a 2-letter country code, the literal
 # "REX", then an identifier (e.g. ITREXIT06167560157). They're printed in the
 # statement-on-origin / "REGISTRAZIONE DOGANALE" block, not in a labelled field,
@@ -1706,7 +1967,17 @@ async def run_extraction(client: anthropic.AsyncAnthropic, file_bytes: bytes, mi
     model = model or AI_MODEL_PRIMARY
     content_blocks: list = []
 
-    if mime == "application/pdf":
+    if is_spreadsheet(mime):
+        # A workbook has no visual fallback — there is nothing to OCR, and
+        # the raw-file branch below would label it a PDF. Its text is the
+        # whole document, so an empty render is a hard error.
+        content_blocks.append({
+            "type": "text",
+            "text": _untrusted_invoice_block(
+                _require_spreadsheet_text(file_bytes, mime)),
+            "cache_control": {"type": "ephemeral"},
+        })
+    elif mime == "application/pdf":
         pdf_text = extract_pdf_text(file_bytes)
         meaningful = re.sub(r"[\s\-]|PAGE\s*BREAK", "", pdf_text or "")
         if len(meaningful) >= 100:
@@ -1815,7 +2086,14 @@ async def run_extraction_structured(
     model = model or AI_MODEL_PRIMARY
     content_blocks: list = []
 
-    if mime == "application/pdf":
+    if is_spreadsheet(mime):
+        content_blocks.append({
+            "type": "text",
+            "text": _untrusted_invoice_block(
+                _require_spreadsheet_text(file_bytes, mime)),
+            "cache_control": {"type": "ephemeral"},
+        })
+    elif mime == "application/pdf":
         pdf_text = extract_pdf_text(file_bytes)
         meaningful = re.sub(r"[\s\-]|PAGE\s*BREAK", "", pdf_text or "")
         if len(meaningful) >= 100:
@@ -2504,9 +2782,12 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
         # only (ch. 01-24) — it used to go on every item, which put it on
         # the ~65% of the list that is not food (operator correction,
         # 2026-10: "remove VATZ … as this is only for food stuffs").
-        # A per-code nat_add_code from the commodity-code list still wins,
-        # which is how a food-chapter line that must NOT be zero-rated
-        # (chapter 22 alcohol) or needs another code (X570, 4605) is fixed.
+        # Chapter 22 (drinks) is out of that range from 2026-10 — see
+        # tariff_rules.vatz_applies. A per-code nat_add_code from the
+        # commodity-code list still wins, which is how a line needing a
+        # different code (X570, 4605) is set. Note it can only SUBSTITUTE
+        # a value: a blank cell means "use the VATZ default", so there is
+        # no way to say "no national additional code on this line".
         put(out_row, "[6/17] National Additional Codes - Code (01)",
             cds.get("nat_add_code")
             or ("VATZ" if tariff_rules.vatz_applies(g["c8"]) else ""),
@@ -2665,6 +2946,9 @@ def _user_facing_job_error(exc: Exception) -> str:
     operator-actionable cases keep a specific hint; everything else is
     generic — the full traceback is in the server log.
     """
+    if isinstance(exc, UnreadableUpload):
+        # Authored here, no internals in it, and the operator can act on it.
+        return str(exc)
     if isinstance(exc, anthropic.AuthenticationError):
         return "AI service rejected the API key — check the ANTHROPIC_API_KEY setting."
     if isinstance(exc, anthropic.RateLimitError):
@@ -2698,16 +2982,26 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
     try:
         file_bytes = file_path.read_bytes()
 
-        # PDF → local text extraction for cheaper API calls
-        if mime == "application/pdf":
-            pdf_text = extract_pdf_text(file_bytes)
-        else:
-            pdf_text = ""
+        # PDF or spreadsheet → local text extraction for cheaper API calls
+        pdf_text = _document_text(file_bytes, mime)
 
         # Scanned / image-based PDFs: pdfplumber returns only page breaks
         # and whitespace. Don't send that to Claude — fall back to vision.
         meaningful = re.sub(r"[\s\-]|PAGE\s*BREAK", "", pdf_text or "")
         has_usable_text = len(meaningful) >= 100
+        if is_spreadsheet(mime):
+            # Judged on cell content, not on the sheet headers this module
+            # writes itself — see spreadsheet_body_chars.
+            has_usable_text = \
+                spreadsheet_body_chars(pdf_text) >= _MIN_BODY_CHARS
+        if is_spreadsheet(mime) and not has_usable_text:
+            # There is no vision fallback for a workbook, and the raw-file
+            # path would send it labelled as a PDF. Stop with something the
+            # operator can act on instead.
+            raise UnreadableUpload(
+                "That spreadsheet has no rows to read. Check the goods "
+                "lines are in the file you uploaded and not in a linked one."
+            )
 
         update(10, "Extracting data (Run A)…")
         if has_usable_text:
@@ -3262,6 +3556,13 @@ MIME_MAP = {
     ".jpeg": "image/jpeg",
     ".png": "image/png",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    # A supplier's own spreadsheet beats the PDF it would be printed to:
+    # see extract_spreadsheet_text. .xls (the pre-2007 binary format) is
+    # deliberately absent — openpyxl cannot read it, so accepting it would
+    # fail after the upload rather than at it.
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12",
+    ".csv":  "text/csv",
 }
 
 # Hard upload size cap (defends the single worker's RAM/disk against an
@@ -3923,6 +4224,10 @@ async def api_import_commodity_codes(file: UploadFile = File(...),
         "rejected": len(rejected),
         "rejected_codes": rejected[:20],
         "skipped": stats["skipped_no_code"],
+        # A sheet that lists one code on several rows yields fewer entries
+        # than it has rows. Reported so the difference is visible rather
+        # than looking like rows went missing.
+        "merged": stats.get("merged_duplicate_rows", 0),
         "total": db.count_commodity_codes(ctx["company_id"]),
     }
 

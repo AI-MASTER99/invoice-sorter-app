@@ -443,24 +443,88 @@ def _row_documents(row, doc_cols: dict, cell) -> list[dict]:
         # A CDS document status is a two-letter code (JE, AC, XB…). The
         # supplier sheet puts the exemption WORDING in that column instead
         # ("EXCLUDED FROM PROHIBITION"), which is not a status and must not
-        # be written into the status cell. It is the statement text, so it
-        # falls through to the reason — and ONLY the reason. The identifier
-        # stays exactly as the sheet has it, which for these Y-codes is
-        # empty: filling it too would put the same sentence in two cells of
-        # the declaration, which is not what the sheet says. (Y929, built by
-        # resolve_line_docs rather than read from a sheet, keeps its own
-        # id+reason shape — that one is proven at the border.)
+        # be written into the status cell. It is the STATEMENT TEXT, and a
+        # Y-code statement is declared in the identifier AND the reason with
+        # the status left empty. Both cells are what CDS expects, not a
+        # duplicate to be tidied away: it is the shape resolve_line_docs
+        # already builds for Y929, and the shape a real accepted export
+        # shows (Code/ID/Part/Status/Reason):
+        #   Y929/EXCLUDED FROM REG 834/2007///Excluded from Reg 834/2007//
+        # The customs specialist confirmed it in writing (2026-10) for
+        # Y923, Y926, Y902, Y032, Y924, Y930, 901Y, 991Y and 9Y17.
+        # A real identifier in the sheet's ID cell still wins — a C644
+        # certificate number must never be overwritten by prose — and the
+        # statement then fills the reason alone.
         if _DOC_STATUS_RE.match(raw_status.upper()):
             status, statement = raw_status.upper(), ""
         else:
             status, statement = "", raw_status
         docs.append({
             "code": code,
-            "id": doc_id,
+            "id": doc_id or statement,
             "status": status,
             "reason": reason or statement,
         })
     return docs
+
+
+def _id_rank(doc: dict) -> int:
+    """How much the identifier is worth: 2 a reference, 1 a statement, 0 none.
+
+    `_row_documents` falls back to the statement text when the sheet leaves
+    the ID cell empty, which makes the identifier equal to the reason. That
+    fallback must never outrank a genuine document reference — a CHED or
+    certificate number — carried by another row for the same code.
+    """
+    ident = (doc.get("id") or "").strip()
+    if not ident:
+        return 0
+    return 1 if ident == (doc.get("reason") or "").strip() else 2
+
+
+def _merge_one_document(held: dict, extra: dict) -> dict:
+    """Two rows declaring the SAME document code, as one document.
+
+    Field by field, not whole-row: each cell the first row left blank is
+    filled from the second, and the better identifier wins outright. Where
+    both rows fill the same cell with different wording the first row's
+    text stands — the rows describe one commodity code, and choosing
+    between two human-written sentences is not the parser's call.
+    """
+    merged = dict(held)
+    for field in ("status", "reason"):
+        merged[field] = ((held.get(field) or "").strip()
+                         or (extra.get(field) or "").strip())
+    best = extra if _id_rank(extra) > _id_rank(held) else held
+    merged["id"] = (best.get("id") or "").strip()
+    return merged
+
+
+def merge_documents(held: list[dict], extra: list[dict]) -> list[dict]:
+    """The documents of two rows for the SAME commodity code, as one list.
+
+    A supplier sheet repeats a code when the same product ships under
+    different descriptions, and the rows are rarely filled in equally: in
+    the list we were sent, 2710 19 99 90 appears twice, once carrying only
+    a bare Y902 and once carrying a filled Y902 PLUS 9Y17 ("Not produced
+    from Russian crude oil"). Keeping the first row and discarding the
+    second — what this function replaces — silently dropped a prohibition
+    exemption from the declaration.
+
+    So the documents are the UNION, keyed by document code, each one merged
+    per `_merge_one_document`. First-seen order is kept, because that is
+    the slot order the sheet asks for.
+    """
+    by_code: dict[str, dict] = {}
+    order: list[str] = []
+    for doc in list(held) + list(extra):
+        code = doc.get("code") or ""
+        if code not in by_code:
+            by_code[code] = dict(doc)
+            order.append(code)
+        else:
+            by_code[code] = _merge_one_document(by_code[code], doc)
+    return [by_code[c] for c in order]
 
 
 def read_code_list(source) -> tuple[list[dict], dict]:
@@ -480,7 +544,8 @@ def read_code_list(source) -> tuple[list[dict], dict]:
     was never declared.
     """
     rows = _list_rows(source)
-    stats = {"rows": 0, "skipped_no_code": 0, "skipped": []}
+    stats = {"rows": 0, "skipped_no_code": 0, "skipped": [],
+             "merged_duplicate_rows": 0}
     if not rows:
         stats["entries"] = 0
         return [], stats
@@ -521,21 +586,34 @@ def read_code_list(source) -> tuple[list[dict], dict]:
             stats["skipped"].append((raw_code, raw_taric.strip(), desc))
             continue
         full = general + taric
-        # The same code twice in one sheet is one entry, first wording wins.
-        seen.setdefault(full, {
-            "rex": "",
-            "general_code": general,
-            "full_code": full,
-            "taric_code": taric,
-            "description": desc,
-            "nat_add_code": cell(row, i_nac).strip().upper(),
-            "documents": _row_documents(row, doc_cols, cell),
-            "origin": "",
-            "preference": "",
-            "procedure": "",
-            "lines": 0,
-            "last_used": "",
-        })
+        nac = cell(row, i_nac).strip().upper()
+        docs = _row_documents(row, doc_cols, cell)
+        held = seen.get(full)
+        if held is None:
+            seen[full] = {
+                "rex": "",
+                "general_code": general,
+                "full_code": full,
+                "taric_code": taric,
+                "description": desc,
+                "nat_add_code": nac,
+                "documents": docs,
+                "origin": "",
+                "preference": "",
+                "procedure": "",
+                "lines": 0,
+                "last_used": "",
+            }
+            continue
+        # The same code twice in one sheet is still ONE list entry, but the
+        # later rows are not thrown away: their documents are merged in and
+        # a national additional code the first row left blank is picked up.
+        # The first row's wording stays the description — the rows describe
+        # the same commodity code, and choosing between two human-written
+        # descriptions is not the parser's call.
+        stats["merged_duplicate_rows"] += 1
+        held["documents"] = merge_documents(held["documents"], docs)
+        held["nat_add_code"] = held["nat_add_code"] or nac
     entries = sorted(seen.values(), key=lambda e: e["full_code"])
     stats["entries"] = len(entries)
     return entries, stats

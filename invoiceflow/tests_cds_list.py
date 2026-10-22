@@ -397,18 +397,130 @@ def test_auto_added_documents_are_not_carried_on_the_list():
     assert cl.AUTO_LINE_DOCS == {"N935", "Y929", "U116"}
 
 
-def test_wording_in_the_status_column_becomes_the_reason_only(tmp_path):
+def test_wording_in_the_status_column_becomes_the_statement(tmp_path):
     """A CDS status is two letters; prose there is the exemption wording.
 
-    It goes to the reason and nowhere else — the sheet leaves the
-    identifier empty, and filling it would repeat the same sentence in two
-    cells of the declaration.
+    It is the statement text, so it lands where resolve_line_docs already
+    puts Y929's and where the customs specialist confirmed it belongs
+    (2026-10): the identifier AND the reason, status left empty.
     """
     [e], _ = cl.read_code_list(write_list(tmp_path, DOC_SHEET))
     [y926] = e["documents"]
     assert y926["status"] == ""                               # not the prose
-    assert y926["id"] == ""                                   # as the sheet has it
+    assert y926["id"] == "EXCLUDED FROM PROHIBITION"
     assert y926["reason"] == "EXCLUDED FROM PROHIBITION"
+
+
+def test_a_real_identifier_beats_the_status_wording(tmp_path):
+    """A sheet row with BOTH a reference and prose: the reference wins.
+
+    A certificate number must never be overwritten by an exemption
+    sentence; the sentence falls through to the reason alone.
+    """
+    sheet = ("Commodity Code,Taric,Description,"
+             "[2/3] Documents - Code (01),[2/3] Documents - Status (01),"
+             "[2/3] Documents - ID (01),[2/3] Documents - Reason (01)\r\n"
+             "84139100,90,PUMP PARTS,C644,EXCLUDED PRODUCT,CERT-9,\r\n")
+    [e], _ = cl.read_code_list(write_list(tmp_path, sheet))
+    [doc] = e["documents"]
+    assert (doc["id"], doc["status"], doc["reason"]) == (
+        "CERT-9", "", "EXCLUDED PRODUCT")
+
+
+# ── The same code on more than one sheet row ────────────────────────────
+DUP_SHEET = (
+    "Commodity Code ,Taric,[6/17] National Additional Codes - Code (01),"
+    "Description,"
+    "[2/3] Documents - Code (01),[2/3] Documents - Status (01),"
+    "[2/3] Documents - ID (01),[2/3] Documents - Reason (01),"
+    "[2/3] Documents - Code (02),[2/3] Documents - Status (02),"
+    "[2/3] Documents - ID (02),[2/3] Documents - Reason (02)\r\n"
+    # the sparse row first, exactly as the supplier list has it
+    "27101999,90,,MULTIPURPOSE GREASE,N935,JE,,,Y902,,,\r\n"
+    "27101999,90,X570,MULTIPURPOSE GREASE,"
+    "9Y17,Not Produced from Russian crude oil,,"
+    "Not Produced from Russian crude oil,"
+    "Y902,Not in footnote list,,Not in footnote list\r\n"
+)
+
+
+def test_a_repeated_code_keeps_the_documents_of_every_row(tmp_path):
+    """The real failure this guards: a supplier list repeated 2710 19 99 90,
+    the first row carrying a bare Y902 and the second carrying 9Y17 ("not
+    produced from Russian crude oil"). Keeping only the first row dropped a
+    prohibition exemption off the declaration without a word."""
+    [e], stats = cl.read_code_list(write_list(tmp_path, DUP_SHEET))
+    assert stats["rows"] == 2 and stats["merged_duplicate_rows"] == 1
+    by_code = {d["code"]: d for d in e["documents"]}
+    assert set(by_code) == {"Y902", "9Y17"}
+    # the filled Y902 replaces the empty one it was first seen as
+    assert by_code["Y902"]["reason"] == "Not in footnote list"
+    assert by_code["9Y17"]["id"] == "Not Produced from Russian crude oil"
+
+
+def test_a_repeated_code_is_still_one_entry_with_the_first_wording(tmp_path):
+    """Merging documents must not multiply the entry, and choosing between
+    two human-written descriptions is not the parser's call."""
+    [e], _ = cl.read_code_list(write_list(tmp_path, DUP_SHEET))
+    assert e["full_code"] == "2710199990"
+    assert e["description"] == "MULTIPURPOSE GREASE"
+    # a national additional code the first row left blank is picked up
+    assert e["nat_add_code"] == "X570"
+
+
+def test_merge_documents_keeps_slot_order_and_fills_the_blanks():
+    held = [{"code": "Y902", "id": "", "status": "", "reason": ""}]
+    extra = [{"code": "9Y17", "id": "NO RU OIL", "status": "", "reason": "NO RU OIL"},
+             {"code": "Y902", "id": "FOOTNOTE", "status": "", "reason": "FOOTNOTE"}]
+    merged = cl.merge_documents(held, extra)
+    assert [d["code"] for d in merged] == ["Y902", "9Y17"]   # first-seen order
+    assert merged[0]["reason"] == "FOOTNOTE"                 # blank filled in
+
+
+def test_a_reference_on_a_repeated_code_is_not_replaced_by_prose(tmp_path):
+    """The identifier rule has to hold ACROSS rows, not only within one.
+
+    `_row_documents` repeats the statement text into the identifier when
+    the sheet leaves the ID cell blank. Scoring whole rows by how full
+    they are would let that fallback outrank a row carrying the real
+    certificate number, and the reference would vanish off the
+    declaration with nothing to show it had ever been there.
+    """
+    sheet = ("Commodity Code,Taric,Description,"
+             "[2/3] Documents - Code (01),[2/3] Documents - Status (01),"
+             "[2/3] Documents - ID (01),[2/3] Documents - Reason (01)\r\n"
+             "84139100,90,PUMP,C644,,GB-ORG-CERT-0099123,\r\n"
+             "84139100,90,PUMP PARTS,C644,CERTIFICATE HELD ON FILE,,\r\n")
+    [e], _ = cl.read_code_list(write_list(tmp_path, sheet))
+    [doc] = e["documents"]
+    assert doc["id"] == "GB-ORG-CERT-0099123"       # the reference, not the prose
+    assert doc["reason"] == "CERTIFICATE HELD ON FILE"
+    assert doc["status"] == ""
+
+
+def test_the_reference_wins_whichever_row_carries_it(tmp_path):
+    """Same two rows the other way round: still the reference."""
+    sheet = ("Commodity Code,Taric,Description,"
+             "[2/3] Documents - Code (01),[2/3] Documents - Status (01),"
+             "[2/3] Documents - ID (01),[2/3] Documents - Reason (01)\r\n"
+             "84139100,90,PUMP PARTS,C644,CERTIFICATE HELD ON FILE,,\r\n"
+             "84139100,90,PUMP,C644,,GB-ORG-CERT-0099123,\r\n")
+    [e], _ = cl.read_code_list(write_list(tmp_path, sheet))
+    [doc] = e["documents"]
+    assert doc["id"] == "GB-ORG-CERT-0099123"
+    assert doc["reason"] == "CERTIFICATE HELD ON FILE"
+
+
+def test_a_status_the_first_row_lacks_is_picked_up(tmp_path):
+    """Merging is per field: a two-letter status on the later row counts."""
+    sheet = ("Commodity Code,Taric,Description,"
+             "[2/3] Documents - Code (01),[2/3] Documents - Status (01),"
+             "[2/3] Documents - ID (01),[2/3] Documents - Reason (01)\r\n"
+             "84139100,90,PUMP,C085,,,\r\n"
+             "84139100,90,PUMP PARTS,C085,AE,REF-7,\r\n")
+    [e], _ = cl.read_code_list(write_list(tmp_path, sheet))
+    [doc] = e["documents"]
+    assert (doc["id"], doc["status"]) == ("REF-7", "AE")
 
 
 def test_a_real_two_letter_status_is_kept(tmp_path):
