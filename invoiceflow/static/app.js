@@ -863,6 +863,7 @@ document.getElementById('btn-code-import')?.addEventListener('click', async () =
     if (r.already_present) bits.push(`${r.already_present} unchanged`);
     if (r.rejected) bits.push(`${r.rejected} description${r.rejected === 1 ? '' : 's'} refused (looks like a code, not goods)`);
     if (r.skipped) bits.push(`${r.skipped} row${r.skipped === 1 ? '' : 's'} without a usable code`);
+    if (r.merged) bits.push(`${r.merged} repeat row${r.merged === 1 ? '' : 's'} merged into the code above`);
     _clientsMsg('codes-msg', `✓ ${bits.join(', ')} — the list now holds ${r.total}.`, true);
     input.value = '';
     await refreshCodesPage();

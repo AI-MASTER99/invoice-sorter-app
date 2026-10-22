@@ -2504,9 +2504,12 @@ def build_items_xlsx(final_rows: list[dict], totals: dict | None = None) -> byte
         # only (ch. 01-24) — it used to go on every item, which put it on
         # the ~65% of the list that is not food (operator correction,
         # 2026-10: "remove VATZ … as this is only for food stuffs").
-        # A per-code nat_add_code from the commodity-code list still wins,
-        # which is how a food-chapter line that must NOT be zero-rated
-        # (chapter 22 alcohol) or needs another code (X570, 4605) is fixed.
+        # Chapter 22 (drinks) is out of that range from 2026-10 — see
+        # tariff_rules.vatz_applies. A per-code nat_add_code from the
+        # commodity-code list still wins, which is how a line needing a
+        # different code (X570, 4605) is set. Note it can only SUBSTITUTE
+        # a value: a blank cell means "use the VATZ default", so there is
+        # no way to say "no national additional code on this line".
         put(out_row, "[6/17] National Additional Codes - Code (01)",
             cds.get("nat_add_code")
             or ("VATZ" if tariff_rules.vatz_applies(g["c8"]) else ""),
@@ -3923,6 +3926,10 @@ async def api_import_commodity_codes(file: UploadFile = File(...),
         "rejected": len(rejected),
         "rejected_codes": rejected[:20],
         "skipped": stats["skipped_no_code"],
+        # A sheet that lists one code on several rows yields fewer entries
+        # than it has rows. Reported so the difference is visible rather
+        # than looking like rows went missing.
+        "merged": stats.get("merged_duplicate_rows", 0),
         "total": db.count_commodity_codes(ctx["company_id"]),
     }
 

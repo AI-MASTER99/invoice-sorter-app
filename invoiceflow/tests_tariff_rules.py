@@ -174,6 +174,17 @@ def test_vatz_boundary_is_chapter_24():
     assert not tr.vatz_applies("25010010")      # ch. 25 — out
 
 
-def test_vatz_chapter_22_is_in_range_and_needs_a_per_code_override():
-    """Documents the known gap: alcohol sits in a food chapter."""
-    assert tr.vatz_applies("22042166")          # wine — chapter test says yes
+def test_vatz_is_excluded_for_the_whole_of_chapter_22():
+    """Customs specialist, 2026-10: leave the beverages chapter out."""
+    assert not tr.vatz_applies("22042166")      # sparkling wine
+    assert not tr.vatz_applies("22011011")      # bottled water, same chapter
+    assert tr.vatz_applies("21069098")          # ch. 21 — neighbour still in
+    assert tr.vatz_applies("23099096")          # ch. 23 — other side still in
+
+
+def test_y929_still_applies_to_chapter_22():
+    """VATZ left the chapter; the organic exemption did not. Wine is within
+    Reg. 834/2007, so narrowing y929_applies alongside VATZ would be wrong."""
+    assert tr.y929_applies("22042166")
+    docs, _ = tr.resolve_line_docs(code8="22042166", is_eu_origin=False)
+    assert any(d["code"] == "Y929" for d in docs)

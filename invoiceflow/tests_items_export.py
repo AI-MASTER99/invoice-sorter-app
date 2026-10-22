@@ -110,13 +110,17 @@ def test_each_line_is_judged_on_its_own_code():
     assert _cell(ws, col, 5, _NAC).value in (None, "")
 
 
-def test_a_list_national_additional_code_overrides_the_default():
-    """How a chapter-22 wine line, or an X570 product, is corrected."""
+def test_chapter_22_gets_no_vatz_by_default():
+    """Drinks are out of VATZ even though ch. 22 sits inside 01-24."""
     wine = _row(code="22042166")
     wine["_cds"] = {"nat_add_code": "", "documents": []}
     ws, col = _items([wine])
-    assert _cell(ws, col, 4, _NAC).value == "VATZ"   # chapter test alone
+    assert _cell(ws, col, 4, _NAC).value in (None, "")
 
+
+def test_a_list_national_additional_code_overrides_the_default():
+    """How an X570 product is corrected. Note the list can only SUBSTITUTE
+    a value here: a blank cell means "use the VATZ default"."""
     grease = _row(code="27101999")
     grease["_cds"] = {"nat_add_code": "X570", "documents": []}
     ws, col = _items([grease])

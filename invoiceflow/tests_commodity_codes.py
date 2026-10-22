@@ -192,7 +192,7 @@ def test_import_adds_only_the_codes_not_already_there(monkeypatch):
     out = asyncio.run(m.api_import_commodity_codes(file=_Upload(SHEET), ctx=CTX))
     assert out == {"added": 1, "updated": 0, "already_present": 1,
                    "rejected": 0, "rejected_codes": [], "skipped": 1,
-                   "total": 2}
+                   "merged": 0, "total": 2}
     # Only the new code is written, in the commodity_codes column shape.
     assert written == [{"general_code": "02013000", "full_code": "0201300090",
                         "taric_code": "90", "description": "TARTARE DI FASONA",
@@ -477,7 +477,7 @@ def test_re_importing_a_document_sheet_changes_nothing(monkeypatch):
         {"general_code": "29035100", "full_code": "2903510090",
          "taric_code": "90", "description": "DRY COOLANT SPRAY",
          "nat_add_code": "",
-         "documents": [{"code": "Y926", "id": "",
+         "documents": [{"code": "Y926", "id": "EXCLUDED FROM PROHIBITION",
                         "status": "", "reason": "EXCLUDED FROM PROHIBITION"}]}])
     out = asyncio.run(m.api_import_commodity_codes(file=_Upload(DOCS_SHEET), ctx=CTX))
     assert (out["added"], out["updated"]) == (0, 0)
