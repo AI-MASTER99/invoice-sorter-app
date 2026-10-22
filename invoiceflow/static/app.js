@@ -1176,7 +1176,14 @@ async function handleBulkUpload(files) {
   const allowed = ['.pdf','.jpg','.jpeg','.png','.docx','.xlsx','.xlsm','.csv'];
   const valid = files.filter(f => {
     const ext = f.name.substring(f.name.lastIndexOf('.')).toLowerCase();
-    if (!allowed.includes(ext)) { toast(`Skipped ${f.name} — unsupported type`, 'error'); return false; }
+    if (!allowed.includes(ext)) {
+      // .xls is the one rejection with a one-click remedy, and the whole
+      // point of accepting workbooks is that a spreadsheet beats a
+      // printout of it — so say how to get there.
+      const hint = ext === '.xls' ? ' — open it and save as .xlsx first' : ' — unsupported type';
+      toast(`Skipped ${f.name}${hint}`, 'error');
+      return false;
+    }
     return true;
   });
   if (valid.length === 0) return;
