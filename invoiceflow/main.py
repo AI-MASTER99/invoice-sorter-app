@@ -2496,6 +2496,7 @@ def _ensure_document_slots(ws, want: int = 6) -> None:
     src_start = headers.get("[2/3] Documents - Code (03)")
     if not src_start:
         return  # unexpected template layout — leave untouched
+    data_src = headers.get("[2/3] Documents - Code (01)") or src_start
     block = len(_DOC_SLOT_FIELDS)                 # 9 columns per slot
     added = want - 3
     # Anchor on the slot-03 Code column, never on its last header: the
@@ -2521,6 +2522,21 @@ def _ensure_document_slots(ws, want: int = 6) -> None:
             dst.fill = _copy(src_c.fill)
             dst.border = _copy(src_c.border)
             dst.alignment = _copy(src_c.alignment)
+            # The data cells too, not just the header: the template boxes
+            # every line in with a thin border (and types it as text), and
+            # without this slots 04-06 were the only borderless columns.
+            # Styled after slot 01, not 03: the template leaves slot 03's ID
+            # and Reason cells on line 4 without a border of their own.
+            for r in range(4, _ITEMS_MAX_ROW + 1):
+                src_d = ws._cells.get((r, data_src + f))
+                if src_d is None or not src_d.has_style:
+                    continue
+                dst_d = ws.cell(row=r, column=dst_col)
+                dst_d.font = _copy(src_d.font)
+                dst_d.fill = _copy(src_d.fill)
+                dst_d.border = _copy(src_d.border)
+                dst_d.alignment = _copy(src_d.alignment)
+                dst_d.number_format = src_d.number_format
             src_letter = get_column_letter(src_start + f)
             if src_letter in ws.column_dimensions:
                 nd = ws.column_dimensions[get_column_letter(dst_col)]

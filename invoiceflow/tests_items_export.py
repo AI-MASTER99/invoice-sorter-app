@@ -203,6 +203,26 @@ def test_the_new_slots_are_not_hidden():
     assert hidden == []
 
 
+def test_the_new_slots_are_boxed_in_like_slot_01():
+    """Every line is boxed in with a thin border; 04-06 must be too.
+
+    Checked on a written line and on an empty one below it: the template
+    borders the whole data block, not just the lines the export fills.
+    """
+    ws, col = _items([_row()])
+    first = col["[2/3] Documents - Code (04)"]
+    slot01 = col["[2/3] Documents - Code (01)"]
+    for r in (4, 50):
+        for c in range(first, first + 27):
+            src = ws.cell(row=r, column=slot01 + (c - first) % 9)
+            dst = ws.cell(row=r, column=c)
+            for side in ("left", "right", "top", "bottom"):
+                got = getattr(dst.border, side)
+                assert got.style == "thin", (r, c, side)
+                assert got == getattr(src.border, side), (r, c, side)
+            assert dst.number_format == src.number_format == "@", (r, c)
+
+
 def test_shifted_hidden_bands_moved_with_their_columns():
     """insert_cols moves cells only — the width/hidden bands are hand-shifted."""
     ws, col = _items([_row()])
