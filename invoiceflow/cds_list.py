@@ -468,13 +468,40 @@ def _row_documents(row, doc_cols: dict, cell) -> list[dict]:
     return docs
 
 
-def _doc_detail(doc: dict) -> int:
-    """How much of a document row is actually filled in (0-3)."""
-    return sum(1 for k in ("id", "status", "reason") if (doc.get(k) or "").strip())
+def _id_rank(doc: dict) -> int:
+    """How much the identifier is worth: 2 a reference, 1 a statement, 0 none.
+
+    `_row_documents` falls back to the statement text when the sheet leaves
+    the ID cell empty, which makes the identifier equal to the reason. That
+    fallback must never outrank a genuine document reference — a CHED or
+    certificate number — carried by another row for the same code.
+    """
+    ident = (doc.get("id") or "").strip()
+    if not ident:
+        return 0
+    return 1 if ident == (doc.get("reason") or "").strip() else 2
+
+
+def _merge_one_document(held: dict, extra: dict) -> dict:
+    """Two rows declaring the SAME document code, as one document.
+
+    Field by field, not whole-row: each cell the first row left blank is
+    filled from the second, and the better identifier wins outright. Where
+    both rows fill the same cell with different wording the first row's
+    text stands — the rows describe one commodity code, and choosing
+    between two human-written sentences is not the parser's call.
+    """
+    merged = dict(held)
+    for field in ("status", "reason"):
+        merged[field] = ((held.get(field) or "").strip()
+                         or (extra.get(field) or "").strip())
+    best = extra if _id_rank(extra) > _id_rank(held) else held
+    merged["id"] = (best.get("id") or "").strip()
+    return merged
 
 
 def merge_documents(held: list[dict], extra: list[dict]) -> list[dict]:
-    """The documents of two rows for the SAME code, as one ordered list.
+    """The documents of two rows for the SAME commodity code, as one list.
 
     A supplier sheet repeats a code when the same product ships under
     different descriptions, and the rows are rarely filled in equally: in
@@ -484,19 +511,19 @@ def merge_documents(held: list[dict], extra: list[dict]) -> list[dict]:
     second — what this function replaces — silently dropped a prohibition
     exemption from the declaration.
 
-    So the documents are the UNION, keyed by document code, and for a code
-    declared twice the more complete row wins. First-seen order is kept,
-    because that is the slot order the sheet asks for.
+    So the documents are the UNION, keyed by document code, each one merged
+    per `_merge_one_document`. First-seen order is kept, because that is
+    the slot order the sheet asks for.
     """
     by_code: dict[str, dict] = {}
     order: list[str] = []
     for doc in list(held) + list(extra):
         code = doc.get("code") or ""
         if code not in by_code:
-            by_code[code] = doc
+            by_code[code] = dict(doc)
             order.append(code)
-        elif _doc_detail(doc) > _doc_detail(by_code[code]):
-            by_code[code] = doc
+        else:
+            by_code[code] = _merge_one_document(by_code[code], doc)
     return [by_code[c] for c in order]
 
 

@@ -144,9 +144,12 @@ def vatz_applies(code: str) -> bool:
     knowing before this is widened or narrowed again:
 
       * the genuinely zero-rated minority of the chapter (vinegar 2209,
-        plant-milk drinks) loses VATZ with it, and cannot get it back by
-        leaving the list blank — a blank `nat_add_code` MEANS "use this
-        default". Only a different value substitutes, see
+        plant-milk drinks) loses VATZ with it. Leaving the list blank does
+        NOT give it back — a blank `nat_add_code` means "use this default",
+        and for chapter 22 the default is now nothing. Only a value in the
+        cell is written, so those codes need the literal "VATZ" typed into
+        the list's National Additional Codes column, through the sheet
+        import (the single-code form does not carry the field). See
         `_items_workbook` in main.py.
       * he also wrote "we have very few VATZ on our imports … VATZ is not
         required", which reads wider than one chapter. That is a separate,
