@@ -6,6 +6,7 @@ runs dual-verification, looks up UK Trade Tariff, exports to Excel.
 
 import asyncio
 import base64
+import csv
 import io
 import ipaddress
 import itertools
@@ -1618,6 +1619,143 @@ def extract_pdf_text(file_bytes: bytes) -> str:
         return ""
 
 
+# ── Spreadsheets as a source document ──────────────────────────────────
+# A supplier who sends the invoice as a spreadsheet is the best case there
+# is: the cells are already apart, so nothing can run into the column
+# beside it. Printing it to PDF first is what loses goods lines — on a real
+# entry the description column was too narrow, and "NICKEL CLIPS WHITE"
+# with net weight 86.40 beside it came out of the PDF text layer as
+# "NI8168.I4C0 L4PS WHITE86.40". The line was never extracted and the entry
+# under-declared the import. Reading the workbook removes that whole class
+# of failure, so an operator who HAS the spreadsheet should never print it.
+_SPREADSHEET_MIMES = frozenset({
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",  # .xlsx
+    "application/vnd.ms-excel.sheet.macroEnabled.12",                     # .xlsm
+    "text/csv",
+})
+
+# Guard rails on the rendered text: an invoice is tens of rows, and a
+# runaway sheet must not become a megabyte of prompt.
+_SHEET_MAX_ROWS = 2000
+_SHEET_MAX_COLS = 80
+_CELL_SEPARATOR = " | "
+
+
+def is_spreadsheet(mime: str) -> bool:
+    """Is this upload a workbook or CSV rather than a PDF/image?"""
+    return mime in _SPREADSHEET_MIMES
+
+
+class UnreadableUpload(Exception):
+    """The upload carried nothing the pipeline can read.
+
+    Raised instead of falling through to the raw-file path, which labels
+    whatever it is given as a PDF: a workbook sent that way is rejected by
+    the model with an error that says nothing useful to the operator.
+    """
+
+
+def _sheet_cell_text(value) -> str:
+    """One cell as the text the model should read.
+
+    openpyxl hands back Python types, so a commodity code held as a number
+    arrives as 2922498590.0 and a quantity as 1080.0. Writing those
+    verbatim would put a decimal point inside a customs code, so a whole
+    float is rendered as the integer it is.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    return str(value).strip()
+
+
+def _render_sheet_rows(label: str, rows) -> str:
+    """Rows of one sheet as text: one line per row, cells kept apart."""
+    out: list[str] = []
+    for row in rows:
+        if len(out) >= _SHEET_MAX_ROWS:
+            out.append(f"--- TRUNCATED at {_SHEET_MAX_ROWS} rows ---")
+            break
+        cells = [_sheet_cell_text(c) for c in list(row)[:_SHEET_MAX_COLS]]
+        while cells and not cells[-1]:          # drop the trailing empties
+            cells.pop()
+        if not cells:
+            continue
+        out.append(_CELL_SEPARATOR.join(cells))
+    if not out:
+        return ""
+    header = (f"--- SHEET: {label} (one row per line, cells separated by"
+              f' "{_CELL_SEPARATOR.strip()}") ---')
+    return header + "\n" + "\n".join(out)
+
+
+def extract_spreadsheet_text(file_bytes: bytes, mime: str) -> str:
+    """Render an uploaded workbook or CSV as text, one line per row.
+
+    The result goes down exactly the same path as pdfplumber's text, so
+    every downstream reader — both extraction prompts, the totals
+    reconciliation, review.codes_in_text — works unchanged. Cells are
+    separated by a pipe rather than a space precisely because a space is
+    what fails in a printed PDF.
+    """
+    blocks: list[str] = []
+    try:
+        if mime == "text/csv":
+            text = file_bytes.decode("utf-8-sig", errors="replace")
+            try:
+                dialect = csv.Sniffer().sniff(text[:4096], delimiters=",;\t|")
+            except csv.Error:
+                dialect = csv.excel
+            block = _render_sheet_rows(
+                "CSV", csv.reader(io.StringIO(text, newline=""), dialect))
+            if block:
+                blocks.append(block)
+        else:
+            wb = openpyxl.load_workbook(io.BytesIO(file_bytes),
+                                        read_only=True, data_only=True)
+            try:
+                for ws in wb.worksheets:
+                    block = _render_sheet_rows(ws.title,
+                                               ws.iter_rows(values_only=True))
+                    if block:
+                        blocks.append(block)
+            finally:
+                wb.close()
+    except UnreadableUpload:
+        raise
+    except Exception as exc:
+        raise UnreadableUpload(
+            "That spreadsheet could not be opened. Save it again as .xlsx "
+            "or .csv and upload it once more."
+        ) from exc
+    return "\n\n".join(blocks)
+
+
+def _require_spreadsheet_text(file_bytes: bytes, mime: str) -> str:
+    """The sheet's text, or a message the operator can act on."""
+    text = extract_spreadsheet_text(file_bytes, mime)
+    if not text.strip():
+        raise UnreadableUpload(
+            "That spreadsheet has no rows to read. Check the goods lines "
+            "are in the file you uploaded and not in a linked one."
+        )
+    return text
+
+
+def _document_text(file_bytes: bytes, mime: str) -> str:
+    """Text for any upload we can read locally; "" when there is none."""
+    if mime == "application/pdf":
+        return extract_pdf_text(file_bytes)
+    if is_spreadsheet(mime):
+        return extract_spreadsheet_text(file_bytes, mime)
+    return ""
+
+
 # REX numbers have an unmistakable shape — a 2-letter country code, the literal
 # "REX", then an identifier (e.g. ITREXIT06167560157). They're printed in the
 # statement-on-origin / "REGISTRAZIONE DOGANALE" block, not in a labelled field,
@@ -1706,7 +1844,17 @@ async def run_extraction(client: anthropic.AsyncAnthropic, file_bytes: bytes, mi
     model = model or AI_MODEL_PRIMARY
     content_blocks: list = []
 
-    if mime == "application/pdf":
+    if is_spreadsheet(mime):
+        # A workbook has no visual fallback — there is nothing to OCR, and
+        # the raw-file branch below would label it a PDF. Its text is the
+        # whole document, so an empty render is a hard error.
+        content_blocks.append({
+            "type": "text",
+            "text": _untrusted_invoice_block(
+                _require_spreadsheet_text(file_bytes, mime)),
+            "cache_control": {"type": "ephemeral"},
+        })
+    elif mime == "application/pdf":
         pdf_text = extract_pdf_text(file_bytes)
         meaningful = re.sub(r"[\s\-]|PAGE\s*BREAK", "", pdf_text or "")
         if len(meaningful) >= 100:
@@ -1815,7 +1963,14 @@ async def run_extraction_structured(
     model = model or AI_MODEL_PRIMARY
     content_blocks: list = []
 
-    if mime == "application/pdf":
+    if is_spreadsheet(mime):
+        content_blocks.append({
+            "type": "text",
+            "text": _untrusted_invoice_block(
+                _require_spreadsheet_text(file_bytes, mime)),
+            "cache_control": {"type": "ephemeral"},
+        })
+    elif mime == "application/pdf":
         pdf_text = extract_pdf_text(file_bytes)
         meaningful = re.sub(r"[\s\-]|PAGE\s*BREAK", "", pdf_text or "")
         if len(meaningful) >= 100:
@@ -2668,6 +2823,9 @@ def _user_facing_job_error(exc: Exception) -> str:
     operator-actionable cases keep a specific hint; everything else is
     generic — the full traceback is in the server log.
     """
+    if isinstance(exc, UnreadableUpload):
+        # Authored here, no internals in it, and the operator can act on it.
+        return str(exc)
     if isinstance(exc, anthropic.AuthenticationError):
         return "AI service rejected the API key — check the ANTHROPIC_API_KEY setting."
     if isinstance(exc, anthropic.RateLimitError):
@@ -2701,16 +2859,21 @@ async def _process_invoice(job_id: str, company_id: str, file_path: Path, origin
     try:
         file_bytes = file_path.read_bytes()
 
-        # PDF → local text extraction for cheaper API calls
-        if mime == "application/pdf":
-            pdf_text = extract_pdf_text(file_bytes)
-        else:
-            pdf_text = ""
+        # PDF or spreadsheet → local text extraction for cheaper API calls
+        pdf_text = _document_text(file_bytes, mime)
 
         # Scanned / image-based PDFs: pdfplumber returns only page breaks
         # and whitespace. Don't send that to Claude — fall back to vision.
         meaningful = re.sub(r"[\s\-]|PAGE\s*BREAK", "", pdf_text or "")
         has_usable_text = len(meaningful) >= 100
+        if is_spreadsheet(mime) and not has_usable_text:
+            # There is no vision fallback for a workbook, and the raw-file
+            # path would send it labelled as a PDF. Stop with something the
+            # operator can act on instead.
+            raise UnreadableUpload(
+                "That spreadsheet has no rows to read. Check the goods "
+                "lines are in the file you uploaded and not in a linked one."
+            )
 
         update(10, "Extracting data (Run A)…")
         if has_usable_text:
@@ -3265,6 +3428,13 @@ MIME_MAP = {
     ".jpeg": "image/jpeg",
     ".png": "image/png",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    # A supplier's own spreadsheet beats the PDF it would be printed to:
+    # see extract_spreadsheet_text. .xls (the pre-2007 binary format) is
+    # deliberately absent — openpyxl cannot read it, so accepting it would
+    # fail after the upload rather than at it.
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12",
+    ".csv":  "text/csv",
 }
 
 # Hard upload size cap (defends the single worker's RAM/disk against an

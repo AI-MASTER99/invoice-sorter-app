@@ -1173,7 +1173,7 @@ dropZone.addEventListener('drop', e => {
 });
 
 async function handleBulkUpload(files) {
-  const allowed = ['.pdf','.jpg','.jpeg','.png','.docx'];
+  const allowed = ['.pdf','.jpg','.jpeg','.png','.docx','.xlsx','.xlsm','.csv'];
   const valid = files.filter(f => {
     const ext = f.name.substring(f.name.lastIndexOf('.')).toLowerCase();
     if (!allowed.includes(ext)) { toast(`Skipped ${f.name} — unsupported type`, 'error'); return false; }
