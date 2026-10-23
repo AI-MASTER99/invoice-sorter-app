@@ -25,6 +25,8 @@ import os
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Optional
+
+import httpx
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env", override=True)
@@ -67,6 +69,12 @@ def _client() -> Client:
     return c if c is not None else _sb_service
 
 
+# One pool for every per-request user client — see make_user_client.
+# Mirrors what postgrest builds for itself when handed none (120 s
+# timeout, redirects, HTTP/2), minus the per-client headers.
+_user_http = httpx.Client(timeout=120, follow_redirects=True, http2=True)
+
+
 def make_user_client(jwt: str) -> Client:
     """Build a per-request user-scoped Supabase client.
 
@@ -75,14 +83,23 @@ def make_user_client(jwt: str) -> Client:
     Postgres role (per the JWT's `role` claim) and evaluates RLS policies
     against the JWT's other claims (company_id, app_role, etc.).
 
-    PERF NOTE: this constructs a fresh httpx.Client. If staging
-    measurement shows >50ms p95 added to request latency, switch to a
-    pooled-client pattern. See docs/archive/PHASE_B_PLAN.md §8.4 (H3).
+    The HTTP connection pool is shared (_user_http). Without it every
+    request built its own httpx.Client for PostgREST and another for auth,
+    each loading the CA bundle into a fresh SSL context, and none was ever
+    closed. They sit in reference cycles, so only the cyclic GC frees them:
+    1000 requests cost >2 min of CPU and ~75 MB of garbage waiting for a
+    collection — on a 512 MB instance where every open tab polls /stats
+    and /jobs. That was the Render "exceeded its memory limit" restart.
+
+    Sharing is safe across tenants: the JWT stays in this client's own
+    headers, which postgrest sends per request; nothing user-specific is
+    set on the shared httpx.Client.
     """
     return create_client(
         _url, _anon_key,
         options=ClientOptions(
             headers={"Authorization": f"Bearer {jwt}"},
+            httpx_client=_user_http,
         ),
     )
 
