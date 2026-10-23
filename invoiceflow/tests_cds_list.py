@@ -538,6 +538,27 @@ def test_a_sheet_with_no_document_columns_has_no_documents(tmp_path):
     assert all(e["documents"] == [] for e in entries)
 
 
+def test_a_row_naming_only_automatic_documents_still_declares_them(tmp_path):
+    """N935 alone carries no list document but is a statement about the
+    code; a blank cell is not. The import keys off the difference."""
+    sheet = ("Commodity Code,Taric,Description,"
+             "[2/3] Documents - Code (01),[2/3] Documents - Code (02)\r\n"
+             "84831050,90,SHAFT DRIVES,N935,\r\n"
+             "84139100,90,PUMP PARTS,,\r\n")
+    entries, stats = cl.read_code_list(write_list(tmp_path, sheet))
+    by = {e["full_code"]: e for e in entries}
+    assert by["8483105090"]["documents"] == []
+    assert stats["documents_declared"] == {"8483105090"}
+
+
+def test_a_repeated_code_declares_documents_if_any_row_does(tmp_path):
+    sheet = ("Commodity Code,Taric,Description,[2/3] Documents - Code (01)\r\n"
+             "84831050,90,SHAFT DRIVES,\r\n"
+             "84831050,90,SHAFT DRIVES,N935\r\n")
+    _, stats = cl.read_code_list(write_list(tmp_path, sheet))
+    assert stats["documents_declared"] == {"8483105090"}
+
+
 def test_document_slots_are_read_in_order(tmp_path):
     sheet = ("Commodity Code,Taric,Description,"
              "[2/3] Documents - Code (02),[2/3] Documents - Code (01)\r\n"

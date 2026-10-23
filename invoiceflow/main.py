@@ -4161,7 +4161,10 @@ async def api_import_commodity_codes(file: UploadFile = File(...),
 
     On an existing code the sheet is treated as the operator's own
     wording and a NON-EMPTY cell wins — a blank cell never wipes what is
-    held, so re-importing a partly-filled sheet is safe. Two guards: a
+    held, so re-importing a partly-filled sheet is safe. Documents follow
+    the same rule per row: a row that fills in any document code (N935
+    alone included) sets the code's documents, a row that leaves them
+    blank keeps what is held. Two guards: a
     "description" with no letter in it is a commodity code typed into the
     wrong column (three such cells came in the 2026-10 sheet) and is
     refused rather than written to a customs declaration, and TARIC is
@@ -4218,11 +4221,17 @@ async def api_import_commodity_codes(file: UploadFile = File(...),
                 rejected.append(entry["full_code"])
         if payload["nat_add_code"]:
             new_vals["nat_add_code"] = payload["nat_add_code"]
-        # The DE 2/3 documents the sheet declares for this code. A sheet
-        # listing none leaves what is held alone, so a sheet that only
-        # covers codes never wipes another's documents.
+        # The DE 2/3 documents the sheet declares for this code replace what
+        # is held whenever the row fills in any document code — N935 alone
+        # included, which is how the sheet says "nothing beyond the
+        # automatic ones" (2026-10: 84831050 "only needs a N935") and the
+        # only way a stale document ever leaves the list. A row with its
+        # document cells blank, or a sheet with no such columns, leaves what
+        # is held alone, so a codes-only sheet never wipes another's.
         kept["documents"] = row.get("documents") or []
-        new_vals["documents"] = payload["documents"] or kept["documents"]
+        new_vals["documents"] = (payload["documents"]
+                                 if entry["full_code"] in stats["documents_declared"]
+                                 else kept["documents"])
         # TARIC can't disagree for the same full code, so it is only ever
         # filled when missing.
         new_vals["taric_code"] = kept["taric_code"] or payload["taric_code"]

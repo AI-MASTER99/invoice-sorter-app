@@ -468,6 +468,20 @@ def _row_documents(row, doc_cols: dict, cell) -> list[dict]:
     return docs
 
 
+def _row_names_documents(row, doc_cols: dict, cell) -> bool:
+    """Does this sheet row fill in ANY document code, an automatic one included?
+
+    `_row_documents` drops N935/Y929/U116, so a row reading only "N935" and
+    a row with its document cells left blank both come back as no list
+    documents. They do not mean the same thing. The blank row says nothing
+    about documents; the N935-only row says this code needs nothing beyond
+    the automatic ones — which is how the customs specialist answered for
+    84831050 (2026-10: "only needs a N935"). The import uses this to tell
+    "leave the held documents alone" from "this code has none".
+    """
+    return any(cell(row, f.get("code", -1)).strip() for f in doc_cols.values())
+
+
 def _id_rank(doc: dict) -> int:
     """How much the identifier is worth: 2 a reference, 1 a statement, 0 none.
 
@@ -535,7 +549,11 @@ def read_code_list(source) -> tuple[list[dict], dict]:
     that a code is used, not any declaration it came from. A National
     Additional Codes column is read when present (it overrides the export's
     VATZ default for that code); it is "" when the sheet has no such
-    column. The header row
+    column. `stats['documents_declared']` holds the full codes whose row
+    filled in any document code at all, an automatic one included, so the
+    import can tell a code with no extra documents from a row that left
+    them blank. It sits in the stats, not on the entry, because it says
+    something about this sheet rather than about the code. The header row
     is searched for rather than assumed to be row 1, since exported sheets
     often carry a title or blank rows above it. Rows whose code
     is not a full 8-digit one (a 6-digit stub such as '852910') are counted
@@ -545,7 +563,7 @@ def read_code_list(source) -> tuple[list[dict], dict]:
     """
     rows = _list_rows(source)
     stats = {"rows": 0, "skipped_no_code": 0, "skipped": [],
-             "merged_duplicate_rows": 0}
+             "merged_duplicate_rows": 0, "documents_declared": set()}
     if not rows:
         stats["entries"] = 0
         return [], stats
@@ -574,6 +592,7 @@ def read_code_list(source) -> tuple[list[dict], dict]:
         return str(v)
 
     seen: dict[str, dict] = {}
+    declared = stats["documents_declared"]
     for row in body:
         if not any(str(c or "").strip() for c in row):
             continue
@@ -588,6 +607,9 @@ def read_code_list(source) -> tuple[list[dict], dict]:
         full = general + taric
         nac = cell(row, i_nac).strip().upper()
         docs = _row_documents(row, doc_cols, cell)
+        named = _row_names_documents(row, doc_cols, cell)
+        if named:
+            declared.add(full)
         held = seen.get(full)
         if held is None:
             seen[full] = {

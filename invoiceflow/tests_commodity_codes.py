@@ -472,6 +472,58 @@ def test_a_sheet_without_document_columns_keeps_the_documents_held(monkeypatch):
             assert w["documents"] == held
 
 
+def _held(full, docs, desc="SHAFT DRIVES"):
+    return [{"general_code": full[:8], "full_code": full, "taric_code": full[8:],
+             "description": desc, "nat_add_code": "", "documents": docs}]
+
+
+_STALE = [{"code": "Y902", "id": "Not in footnote list", "status": "",
+           "reason": "Not in footnote list"}]
+
+
+def test_an_n935_only_row_clears_the_documents_held(monkeypatch):
+    """2026-10, customs specialist: 84831050 "only needs a N935". N935 is
+    added by the export itself, so the row carries no list document — and
+    that must clear a stale one, not be read as a blank to skip."""
+    written = _stub_list(monkeypatch, rows=_held("8483105090", _STALE))
+    sheet = (b"Commodity Code,Taric,Description,"
+             b"[2/3] Documents - Code (01),[2/3] Documents - Status (01)\r\n"
+             b"84831050,90,SHAFT DRIVES,N935,JE\r\n")
+    out = asyncio.run(m.api_import_commodity_codes(file=_Upload(sheet), ctx=CTX))
+    assert out["updated"] == 1
+    [patched] = written
+    assert patched["documents"] == []
+
+
+def test_blank_document_cells_keep_the_documents_held(monkeypatch):
+    """Document columns present but left empty on the row: no statement
+    about documents, so the held ones stay."""
+    written = _stub_list(monkeypatch, rows=_held("8483105090", _STALE))
+    sheet = (b"Commodity Code,Taric,Description,"
+             b"[2/3] Documents - Code (01),[2/3] Documents - Status (01)\r\n"
+             b"84831050,90,SHAFT DRIVES,,\r\n")
+    out = asyncio.run(m.api_import_commodity_codes(file=_Upload(sheet), ctx=CTX))
+    assert (out["added"], out["updated"]) == (0, 0)
+    assert written == []
+
+
+def test_the_sheets_documents_replace_stale_ones(monkeypatch):
+    """2026-10: 2710 19 99 90 needs Y917 only; the Y902 an older sheet
+    carried must not survive the re-import beside it."""
+    written = _stub_list(monkeypatch,
+                         rows=_held("2710199990", _STALE, "MULTIPURPOSE GREASE"))
+    sheet = (b"Commodity Code,Taric,Description,National Additional Codes,"
+             b"[2/3] Documents - Code (01),[2/3] Documents - Status (01),"
+             b"[2/3] Documents - ID (01),[2/3] Documents - Reason (01)\r\n"
+             b"27101999,90,MULTIPURPOSE GREASE,X570,Y917,,"
+             b"Not Produced from Russian crude oil,"
+             b"Not Produced from Russian crude oil\r\n")
+    asyncio.run(m.api_import_commodity_codes(file=_Upload(sheet), ctx=CTX))
+    [patched] = written
+    assert [d["code"] for d in patched["documents"]] == ["Y917"]
+    assert patched["nat_add_code"] == "X570"
+
+
 def test_re_importing_a_document_sheet_changes_nothing(monkeypatch):
     written = _stub_list(monkeypatch, rows=[
         {"general_code": "29035100", "full_code": "2903510090",
